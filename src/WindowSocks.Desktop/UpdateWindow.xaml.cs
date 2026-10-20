@@ -21,6 +21,7 @@ public partial class UpdateWindow : Window
     private Uri? checkedSource;
     private string? localManifest;
     private bool working;
+    private bool initialCheckStarted;
     public bool ReadyToExit { get; private set; }
     public UpdateWindow() : this(new ReleaseClient()) { }
     public UpdateWindow(ReleaseClient client, string? preferencesFile = null)
@@ -32,10 +33,16 @@ public partial class UpdateWindow : Window
         try {
             string file = File.Exists(this.preferencesFile) ? this.preferencesFile : Path.Combine(AppContext.BaseDirectory, "update-source.json");
             if (File.Exists(file)) SourceText.Text = JsonSerializer.Deserialize<SourcePreference>(File.ReadAllText(file), Json.Options)?.ManifestUrl ?? "";
+            else SourceText.Text = ReleaseClient.DefaultSource;
             if (SourceText.Text.Equals(ReleaseClient.LegacyDefaultSource, StringComparison.OrdinalIgnoreCase)) SourceText.Text = ReleaseClient.DefaultSource;
         } catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { UpdateStatus.Text = "無法讀取更新來源，請在下方重新設定。"; }
         Closing += (_, e) => { if (working) { cancellation?.Cancel(); e.Cancel = true; UpdateStatus.Text = "正在取消準備，請稍候…"; } };
         Closed += (_, _) => { cancellation?.Dispose(); client.Dispose(); };
+        Loaded += async (_, _) => {
+            if (initialCheckStarted) return;
+            initialCheckStarted = true;
+            await CheckForUpdates();
+        };
         UpdateImpact();
     }
     private void ServiceSelectionChanged(object sender, RoutedEventArgs e) { if (ImpactText is not null) UpdateImpact(); }
@@ -63,7 +70,8 @@ public partial class UpdateWindow : Window
         catch (Exception ex) { candidate = null; AvailableVersionText.Text = "未取得"; UpdateStatus.Text = ex is System.Net.Http.HttpRequestException ? "無法連線發布來源，請確認網路與發布網址後重試。" : ex.Message; }
         finally { SetWorking(false); }
     }
-    private async void CheckClick(object sender, RoutedEventArgs e) => await Operation(async ct => {
+    private async void CheckClick(object sender, RoutedEventArgs e) => await CheckForUpdates();
+    private Task CheckForUpdates() => Operation(async ct => {
         candidate = null; localManifest = null; ReleaseNotes.Visibility = Visibility.Collapsed; ReleaseDetails.Text = ""; UpdateStatus.Text = "正在檢查最新發布版本…"; AvailableVersionText.Text = "檢查中";
         var source = ReleaseClient.SourceUri(SourceText.Text); var release = await client.CheckAsync(source, ct); checkedSource = source;
         Directory.CreateDirectory(Path.GetDirectoryName(preferencesFile)!); File.WriteAllText(preferencesFile, JsonSerializer.Serialize(new SourcePreference(source.AbsoluteUri), Json.Options)); DisplayRelease(release);

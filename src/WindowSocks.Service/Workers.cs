@@ -7,15 +7,16 @@ public sealed class PipeWorker(Controller controller, ILogger<PipeWorker> logger
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var pending = new HashSet<Task>();
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            var pipe = PipeTransport.CreateServer(controller.OwnerSid);
-            try { await pipe.WaitForConnectionAsync(stoppingToken); }
-            catch { pipe.Dispose(); throw; }
-            var task = Handle(pipe, stoppingToken); pending.RemoveWhere(t => t.IsCompleted); pending.Add(task);
-            if (pending.Count >= 7) await Task.WhenAny(pending);
-        }
-        await Task.WhenAll(pending);
+        try {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                var pipe = PipeTransport.CreateServer(controller.OwnerSid);
+                try { await pipe.WaitForConnectionAsync(stoppingToken); }
+                catch { pipe.Dispose(); throw; }
+                var task = Handle(pipe, stoppingToken); pending.RemoveWhere(t => t.IsCompleted); pending.Add(task);
+                if (pending.Count >= 7) await Task.WhenAny(pending);
+            }
+        } finally { await Task.WhenAll(pending); }
     }
     private async Task Handle(System.IO.Pipes.NamedPipeServerStream pipe, CancellationToken stoppingToken)
     {

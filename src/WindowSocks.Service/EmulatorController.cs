@@ -76,7 +76,7 @@ public sealed partial class Controller
         // from CLI-discovered, owner-validated headless PIDs; ambiguity never falls back to launch order.
         var names = bindings.Where(b => b.EmulatorProcessPath.Length > 0).Select(b => Path.GetFileName(b.EmulatorProcessPath)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var found = new List<(ProcessIdentity Identity, string Path, string Hash)>();
-        if (names.Length > 0) {
+        if (names.Length > 0 && EmulatorProcessesPresent(names)) {
             using var searcher = new ManagementObjectSearcher("SELECT ProcessId,ExecutablePath,CommandLine FROM Win32_Process WHERE " + string.Join(" OR ", names.Select(n => "Name='" + n.Replace("'", "''") + "'")));
             using var rows = searcher.Get();
             foreach (ManagementObject row in rows) using (row) {

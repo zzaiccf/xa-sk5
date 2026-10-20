@@ -15,6 +15,9 @@ public class Backend
     private readonly SavedConfig config;
     private readonly Func<Command, CancellationToken, Task<Reply>>? serviceTransport;
     private readonly Dictionary<Guid, ProbeResult> probes = new();
+    private bool supportsTcpFirst;
+    private readonly SemaphoreSlim supplementalGate = new(ProbeTiming.MaxSupplementalProbes, ProbeTiming.MaxSupplementalProbes);
+    private CancellationTokenSource supplementalLifetime = new();
     public bool Online { get; protected set; }
     public bool HasLocalProxies => config.Proxies.Count > 0;
     public string ConsolePath { get => config.LdConsole; set { config.LdConsole = value; store.Save(config); } }
@@ -37,7 +40,9 @@ public class Backend
     {
         try
         {
-            var snapshot = await Call<Snapshot>(Command.Create("snapshot", new { })); Online = true;
+            var snapshot = await Call<Snapshot>(Command.Create("snapshot", new { }));
+            if (!Online) StopProbes();
+            Online = true; supportsTcpFirst = snapshot.SupportsTcpFirstProbes;
             await Call<bool>(Command.Create("syncTargets", snapshot.SupportsFixedEmulators ? targets : targets.Where(t => t.Kind != "MuMu").ToArray()));
             return snapshot with { Proxies = ProxyExpirationMetadata.Apply(snapshot.Proxies, config.ServiceProxyExpirations), Targets = targets.Concat(snapshot.Targets).DistinctBy(t => t.Key).ToArray(),
                 AutoProxy = PendingForService(snapshot.Proxies) ?? snapshot.AutoProxy,
@@ -75,12 +80,33 @@ public class Backend
     }
     public virtual async Task<ProbeResult> Probe(Guid id, CancellationToken ct = default)
     {
-        if (Online) return await Call<ProbeResult>(Command.Create("probe", new ProxyRequest(id)), ct);
-        var profile = config.Proxies.First(p => p.Id == id);
-        var result = await ProxyProbe.RunAsync(profile, ct: ct); ct.ThrowIfCancellationRequested();
-        result = await IpLocationLookup.EnrichAsync(profile, result, ct); ct.ThrowIfCancellationRequested();
+        if (Online) return await Call<ProbeResult>(Command.Create(supportsTcpFirst ? "probeTcp" : "probe", new ProxyRequest(id)), ct);
+        var profile = config.Proxies.First(p => p.Id == id) with { };
+        var result = await ProxyProbe.RunTcpAsync(profile, ct: ct); ct.ThrowIfCancellationRequested();
         if (config.Proxies.Any(p => p.Id == id)) { probes[id] = result; config.LastProbes = probes.Values.ToList(); store.Save(config); }
+        if (result.UdpPending) _ = SupplementLocal(profile, result, supplementalLifetime.Token);
         return result;
+    }
+    public void StopProbes()
+    {
+        supplementalLifetime.Cancel(); supplementalLifetime.Dispose(); supplementalLifetime = new();
+    }
+    private bool CurrentLocal(ProxyProfile profile, ProbeResult tcp) =>
+        probes.GetValueOrDefault(profile.Id)?.CheckId == tcp.CheckId && config.Proxies.Any(p => p.Id == profile.Id && ProxyImport.SameProxy(p, profile));
+    private async Task SupplementLocal(ProxyProfile profile, ProbeResult tcp, CancellationToken ct)
+    {
+        bool entered = false;
+        try {
+            await Task.Yield(); await supplementalGate.WaitAsync(ct); entered = true;
+            if (!CurrentLocal(profile, tcp)) return;
+            var result = await ProxyProbe.SupplementAsync(profile, tcp, ct: ct); ct.ThrowIfCancellationRequested();
+            if (CurrentLocal(profile, tcp) && DateTimeOffset.UtcNow - tcp.At < ProbeTiming.HealthValidity) {
+                probes[profile.Id] = result; config.LastProbes = probes.Values.ToList(); store.Save(config);
+            }
+        } catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception ex) when (ex is not OutOfMemoryException) {
+            if (CurrentLocal(profile, tcp)) probes[profile.Id] = tcp with { UdpPending = false, At = DateTimeOffset.UtcNow, Message = "UDP／所在地補測未完成，可手動重試。" };
+        } finally { if (entered) supplementalGate.Release(); }
     }
     public async Task<string> Export()
     {

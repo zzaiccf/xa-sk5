@@ -2,6 +2,8 @@ namespace WindowSocks.Core;
 
 public static class ProbeTiming
 {
+    public const int MaxConcurrentProbes = 5;
+    public const int MaxSupplementalProbes = 2;
     public static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(30);
     public static readonly TimeSpan RetryInterval = TimeSpan.FromMinutes(5);
     // Keep verified routes alive through one failed scheduled check and its retry, without a direct fallback.

@@ -30,6 +30,9 @@ internal static partial class Program
             }
             int ownerIndex = Array.IndexOf(args, "--owner-sid");
             if (ownerIndex >= 0) { if (ownerIndex + 1 >= args.Length) throw new ArgumentException("缺少安裝使用者。"); var owner = new SecurityIdentifier(args[ownerIndex + 1]); if (!owner.IsAccountSid()) throw new ArgumentException("無效安裝使用者。"); _ = owner.Translate(typeof(NTAccount)); installOwnerSid = owner.Value; }
+            if (args.Contains("--set-startup") || args.Contains("--start-service")) {
+                RunStartupCommand(args); return 0;
+            }
             if (args.Contains("--uninstall")) { Uninstall(); return 0; }
             if (args.Contains("--install-components") || Assembly.GetExecutingAssembly().GetName().Name == "WindowSocks.Maintenance") return RunComponentInstaller(args);
             bool update = args.Contains("--update");
@@ -40,22 +43,44 @@ internal static partial class Program
             if (!update) MessageBox.Show("安裝完成。請從開始功能表開啟「xa sk5」。\n\n" + (driver ? "請先檢測代理，再分配實例。" : "請到「診斷與設定 → 安裝／修復代理元件」下載及安裝官方驅動，並完成載入測試。") + "\n\n若已有離線代理設定，可在診斷頁移交至背景服務。", "xa sk5", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return 0;
         }
-        catch (Exception ex) { if (args.Contains("--verify-payload")) Console.Error.WriteLine(ex.Message); else MessageBox.Show(ex.Message, "xa sk5 安裝未完成", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1; }
+        catch (Exception ex) {
+            if (args.Contains("--set-startup") || args.Contains("--start-service")) { Console.Error.WriteLine(ex.Message); return ex is AggregateException ? 6 : 5; }
+            if (args.Contains("--verify-payload")) Console.Error.WriteLine(ex.Message); else MessageBox.Show(ex.Message, "xa sk5 安裝未完成", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1;
+        }
+    }
+    private static void RunStartupCommand(string[] args)
+    {
+        string ownerFile = Path.Combine(DataDirectory, "owner.sid");
+        if (File.Exists(ownerFile) && File.ReadAllText(ownerFile).Trim() != installOwnerSid) throw new IOException("請由安裝使用者變更開機設定。");
+        var service = new WindowsStartupService();
+        if (args.Length == 3 && args[0] == "--start-service" && args[1] == "--owner-sid") { service.Start(); return; }
+        if (args.Length != 4 || args[0] != "--set-startup" || args[2] != "--owner-sid" || !bool.TryParse(args[1], out bool enabled)) throw new ArgumentException("開機設定參數無效。");
+        string exe = Path.Combine(AppContext.BaseDirectory, File.Exists(Path.Combine(AppContext.BaseDirectory, "xa sk5.exe")) ? "xa sk5.exe" : "WindowSocks.exe");
+        if (!File.Exists(exe)) throw new IOException("找不到主程式，請保留完整程式資料夾。");
+        using var user = Registry.Users.OpenSubKey(installOwnerSid, true) ?? throw new IOException("找不到安裝使用者的登入設定。");
+        StartupConfiguration.Apply(new StartupRegistry(user), service, exe, enabled);
     }
     private static void RegisterServiceAndShell(string uninstall)
     {
-            Run("sc.exe", ["create", "WindowSocks", "binPath=", $"\"{Path.Combine(InstallDirectory, "WindowSocks.Service.exe")}\"", "start=", "delayed-auto", "DisplayName=", "xa sk5 SOCKS5 背景服務"], false);
-            Run("sc.exe", ["config", "WindowSocks", "binPath=", $"\"{Path.Combine(InstallDirectory, "WindowSocks.Service.exe")}\"", "start=", "delayed-auto", "DisplayName=", "xa sk5 SOCKS5 背景服務"]);
+            string ownerFile = Path.Combine(DataDirectory, "owner.sid");
+            string startupOwner = File.Exists(ownerFile) ? new SecurityIdentifier(File.ReadAllText(ownerFile).Trim()).Value : installOwnerSid;
+            using var user = Registry.Users.OpenSubKey(startupOwner, true) ?? throw new IOException("找不到安裝使用者的登入設定，未改寫開機偏好。");
+            var startup = new StartupRegistry(user); bool autoStart = startup.Read().Enabled ?? true;
+            string startType = autoStart ? "delayed-auto" : "demand";
+            Run("sc.exe", ["create", "WindowSocks", "binPath=", $"\"{Path.Combine(InstallDirectory, "WindowSocks.Service.exe")}\"", "start=", startType, "DisplayName=", "xa sk5 SOCKS5 背景服務"], false);
+            Run("sc.exe", ["config", "WindowSocks", "binPath=", $"\"{Path.Combine(InstallDirectory, "WindowSocks.Service.exe")}\"", "start=", startType, "DisplayName=", "xa sk5 SOCKS5 背景服務"]);
             Run("sc.exe", ["description", "WindowSocks", "xa sk5：程序級 SOCKS5 TCP／UDP 代理。"]);
             Run("sc.exe", ["failure", "WindowSocks", "reset=", "86400", "actions=", "restart/5000/restart/15000/restart/60000"]);
             Run("netsh.exe", ["advfirewall", "firewall", "delete", "rule", "name=WindowSocks relay"], false);
             foreach (var protocol in new[] { "TCP", "UDP" }) Run("netsh.exe", ["advfirewall", "firewall", "add", "rule", "name=WindowSocks relay", "dir=in", "action=allow", "program=" + Path.Combine(InstallDirectory, "WindowSocks.Service.exe"), "protocol=" + protocol, "profile=any"]);
             string shortcuts = Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms);
-            string shortcut = Path.Combine(shortcuts, "xa sk5.lnk");
             string oldShortcut = Path.Combine(shortcuts, "窗流 WindowSocks.lnk");
-            Type? shellType = Type.GetTypeFromProgID("WScript.Shell"); if (shellType is not null) { dynamic shell = Activator.CreateInstance(shellType)!; dynamic link = shell.CreateShortcut(shortcut); link.TargetPath = Path.Combine(InstallDirectory, File.Exists(Path.Combine(InstallDirectory, "xa sk5.exe")) ? "xa sk5.exe" : "WindowSocks.exe"); link.WorkingDirectory = InstallDirectory; link.Save(); Marshal.FinalReleaseComObject(link); Marshal.FinalReleaseComObject(shell); if (File.Exists(oldShortcut)) File.Delete(oldShortcut); }
+            string mainExecutable = Path.Combine(InstallDirectory, File.Exists(Path.Combine(InstallDirectory, "xa sk5.exe")) ? "xa sk5.exe" : "WindowSocks.exe");
+            WindowsShortcuts.Initialize(user, mainExecutable, WindowsShortcuts.DesktopForUser(user), shortcuts);
+            if (File.Exists(oldShortcut)) File.Delete(oldShortcut);
             using var key = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\WindowSocks");
             key.SetValue("DisplayName", "xa sk5"); key.SetValue("DisplayVersion", ProductVersion); key.SetValue("Publisher", "xa sk5 local build"); key.SetValue("InstallLocation", InstallDirectory); key.SetValue("UninstallString", $"\"{uninstall}\" --uninstall"); key.SetValue("NoModify", 1); key.SetValue("NoRepair", 1);
+            StartupConfiguration.Initialize(startup, Path.Combine(InstallDirectory, File.Exists(Path.Combine(InstallDirectory, "xa sk5.exe")) ? "xa sk5.exe" : "WindowSocks.exe"));
     }
     private static Stream Payload() => Assembly.GetExecutingAssembly().GetManifestResourceStream("payload.zip") ?? throw new InvalidDataException("安裝包缺少 payload.zip，請使用 scripts/Build.ps1 產生安裝包。");
     private static Process[] DesktopProcesses() => new[] { "WindowSocks", "xa sk5" }.SelectMany(Process.GetProcessesByName).ToArray();
@@ -109,6 +134,9 @@ internal static partial class Program
     {
         if (MessageBox.Show("解除安裝將停止代理服務並恢復原有連線。\n請先關閉受管遊戲／模擬器。加密設定將保留。", "解除安裝 xa sk5", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
         if (DesktopRunning()) throw new InvalidOperationException("請先從系統匣結束 xa sk5。");
+        string ownerFile = Path.Combine(DataDirectory, "owner.sid");
+        string ownerSid = File.Exists(ownerFile) ? new SecurityIdentifier(File.ReadAllText(ownerFile).Trim()).Value : installOwnerSid;
+        using (var user = Registry.Users.OpenSubKey(ownerSid, true)) { if (user is not null) { new StartupRegistry(user).RemoveForDirectory(InstallDirectory); WindowsShortcuts.RemoveDesktopForDirectory(user, InstallDirectory); } }
         Run("sc.exe", ["stop", "WindowSocks"], false); WaitForServiceStop(); Run("sc.exe", ["delete", "WindowSocks"], false);
         Run("netsh.exe", ["advfirewall", "firewall", "delete", "rule", "name=WindowSocks relay"], false);
         Registry.LocalMachine.DeleteSubKeyTree(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\WindowSocks", false);

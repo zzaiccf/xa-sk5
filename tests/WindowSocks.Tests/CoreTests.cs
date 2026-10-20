@@ -124,5 +124,32 @@ public sealed class CoreTests
     {
         for (int i = 0; i < 3; i++) { Assert.Equal(0, NativeEngine.Core_Start(Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".dll"))); Assert.Equal(0, NativeEngine.Core_IsRunning()); Assert.NotEqual(0u, NativeEngine.Core_LastError()); }
     }
+    [Fact] public async Task UdpRunsWhileTcpResponseIsPendingAndLatencySeparatesConnectionFromHttp()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var fixture = new SocksFixture(tcpResponseRelease: release.Task);
+        try {
+            var probe = ProxyProbe.RunAsync(fixture.Profile, new("http://127.0.0.1:8080", "127.0.0.1", 3478, 5));
+            await Task.WhenAll(fixture.TcpRequestReceived.Task, fixture.UdpRequestReceived.Task).WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.False(probe.IsCompleted); await Task.Delay(150); release.TrySetResult();
+            var result = await probe; Assert.True(result.Ready); Assert.NotNull(result.ConnectLatencyMs);
+            Assert.True(result.LatencyMs >= result.ConnectLatencyMs + 100);
+            Assert.Equal($"{result.ConnectLatencyMs} ms", result.LatencyLabel); Assert.NotNull(result.TotalDurationMs);
+            Assert.NotNull(result.UdpLatencyMs);
+        } finally { release.TrySetResult(); }
+    }
+    [Fact] public async Task TcpFirstReturnsAnIpBeforeUdpStartsAndPendingIsNotAFailure()
+    {
+        await using var fixture = new SocksFixture(udpReplies: false);
+        var options = new ProbeOptions("http://127.0.0.1:8080", "127.0.0.1", 3478, 1);
+        var tcp = await ProxyProbe.RunTcpAsync(fixture.Profile, options);
+        Assert.True(tcp.Tcp); Assert.NotNull(tcp.TcpExit); Assert.True(tcp.UdpPending); Assert.False(tcp.UdpChecked);
+        Assert.False(tcp.Ready); Assert.Equal("背景檢測中", tcp.UdpLabel); Assert.False(fixture.UdpRequestReceived.Task.IsCompleted);
+        Assert.False(ProxyHealth.CanRoute(tcp, null, 0, DateTimeOffset.UtcNow));
+        var supplemental = ProxyProbe.SupplementAsync(fixture.Profile, tcp, options);
+        await fixture.UdpRequestReceived.Task.WaitAsync(TimeSpan.FromSeconds(3)); Assert.False(supplemental.IsCompleted);
+        var result = await supplemental; Assert.True(result.Tcp); Assert.False(result.UdpPending); Assert.True(result.UdpChecked);
+        Assert.False(result.Udp); Assert.Equal(tcp.CheckId, result.CheckId); Assert.Equal(tcp.TcpExit, result.TcpExit);
+    }
     [Fact] public void StunRejectsMismatchedTransaction() { Assert.Throws<IOException>(() => ProxyProbe.ParseStun(new byte[32], new byte[12])); }
 }

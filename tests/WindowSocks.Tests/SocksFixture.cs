@@ -18,11 +18,14 @@ internal sealed class SocksFixture : IAsyncDisposable
     private readonly bool downgradeAuth;
     private readonly bool closeAfterConnect;
     private readonly bool echoTcp, closeEchoAfterFirst;
+    private readonly Task? tcpResponseRelease;
+    public TaskCompletionSource TcpRequestReceived { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource UdpRequestReceived { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public ProxyProfile Profile { get; }
     public string? LastUdpDomain { get; private set; }
-    public SocksFixture(string exit = "198.51.100.7", bool udpEnabled = true, bool udpReplies = true, bool downgradeAuth = false, bool closeAfterConnect = false, bool echoTcp = false, bool closeEchoAfterFirst = false)
+    public SocksFixture(string exit = "198.51.100.7", bool udpEnabled = true, bool udpReplies = true, bool downgradeAuth = false, bool closeAfterConnect = false, bool echoTcp = false, bool closeEchoAfterFirst = false, Task? tcpResponseRelease = null)
     {
-        this.exit = exit; this.udpEnabled = udpEnabled; this.udpReplies = udpReplies; this.downgradeAuth = downgradeAuth; this.closeAfterConnect = closeAfterConnect; this.echoTcp = echoTcp; this.closeEchoAfterFirst = closeEchoAfterFirst; listener.Start();
+        this.exit = exit; this.udpEnabled = udpEnabled; this.udpReplies = udpReplies; this.downgradeAuth = downgradeAuth; this.closeAfterConnect = closeAfterConnect; this.echoTcp = echoTcp; this.closeEchoAfterFirst = closeEchoAfterFirst; this.tcpResponseRelease = tcpResponseRelease; listener.Start();
         Profile = new() { Host = "127.0.0.1", Port = ((IPEndPoint)listener.LocalEndpoint).Port, Username = "測試,user", Password = "p:/@,word", Name = "本機測試" };
         loop = Accept();
     }
@@ -61,6 +64,8 @@ internal sealed class SocksFixture : IAsyncDisposable
                     return;
                 }
                 var buffer = new byte[8192]; _ = await stream.ReadAsync(buffer, ct);
+                TcpRequestReceived.TrySetResult();
+                if (tcpResponseRelease is not null) await tcpResponseRelease.WaitAsync(ct);
                 var response = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {exit.Length}\r\nConnection: close\r\n\r\n{exit}");
                 await stream.WriteAsync(response, ct);
             }
@@ -72,7 +77,7 @@ internal sealed class SocksFixture : IAsyncDisposable
                 using var done = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 var receive = Task.Run(async () => {
                     try { while (!done.IsCancellationRequested) {
-                        var message = await udp.ReceiveAsync(done.Token); var b = message.Buffer; if (b.Length < 5 || !udpReplies) continue;
+                        var message = await udp.ReceiveAsync(done.Token); UdpRequestReceived.TrySetResult(); var b = message.Buffer; if (b.Length < 5 || !udpReplies) continue;
                         int offset = b[3] == 1 ? 10 : b[3] == 3 ? 7 + b[4] : 0;
                         if (offset == 0 || b.Length < offset + 20) continue;
                         byte[] response = new byte[42]; response[3] = 1;

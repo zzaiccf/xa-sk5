@@ -19,6 +19,8 @@ public sealed partial class Controller : IDisposable
     private readonly SavedConfig config;
     private readonly Dictionary<string, TargetInstance> targets = [];
     private readonly Dictionary<Guid, ProbeResult> probes = [];
+    // TCP previews are for display; routing continues to use fully validated health.
+    private readonly Dictionary<Guid, ProbeResult> probeViews = [];
     private readonly Dictionary<Guid, uint> nativeIds = [];
     private readonly Dictionary<Guid, (DateTimeOffset At, int Failures)> retries = [];
     private readonly Dictionary<Guid, DateTimeOffset> lastReady = [];
@@ -34,10 +36,27 @@ public sealed partial class Controller : IDisposable
     private bool childrenDirty;
     private readonly ProxySessionTracker sessions = new();
     private readonly RemoteDesktopListener remoteDesktop = new();
+    private readonly SemaphoreSlim probeGate = new(ProbeTiming.MaxConcurrentProbes, ProbeTiming.MaxConcurrentProbes);
+    private readonly Dictionary<Guid, Task<ProbeResult>> activeProbes = [];
+    private readonly Func<ProxyProfile, bool, CancellationToken, Task<ProbeResult>> measureProxy;
+    private readonly Dictionary<Guid, Task<ProbeResult>> tcpProbes = [];
+    private readonly HashSet<Task> supplementalTasks = [];
+    private readonly Dictionary<Guid, long> epochs = [];
+    private readonly Dictionary<Guid, long> supplementalChecks = [];
+    private long epoch;
+    private readonly CancellationTokenSource supplementalLifetime = new();
+    private readonly SemaphoreSlim supplementalGate = new(ProbeTiming.MaxSupplementalProbes, ProbeTiming.MaxSupplementalProbes);
+    private readonly Func<ProxyProfile, bool, CancellationToken, Task<ProbeResult>> measureTcp;
+    private readonly Func<ProxyProfile, ProbeResult, bool, CancellationToken, Task<ProbeResult>> supplementProxy;
 
     public Controller() : this(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "WindowSocks")) { }
-    public Controller(string configurationDirectory)
+    public Controller(string configurationDirectory, Func<ProxyProfile, bool, CancellationToken, Task<ProbeResult>>? measureProxy = null,
+        Func<ProxyProfile, bool, CancellationToken, Task<ProbeResult>>? measureTcp = null,
+        Func<ProxyProfile, ProbeResult, bool, CancellationToken, Task<ProbeResult>>? supplementProxy = null)
     {
+        this.measureProxy = measureProxy ?? MeasureProxy;
+        this.measureTcp = measureTcp ?? ((profile, remote, ct) => ProxyProbe.RunTcpAsync(profile, new(RemoteStunDns: remote), ct));
+        this.supplementProxy = supplementProxy ?? ((profile, result, remote, ct) => ProxyProbe.SupplementAsync(profile, result, new(RemoteStunDns: remote), ct));
         directory = configurationDirectory;
         var sidFile = Path.Combine(directory, "owner.sid");
         if (!File.Exists(sidFile)) throw new InvalidOperationException("尚未安裝服務，缺少 owner.sid。");
@@ -64,6 +83,14 @@ public sealed partial class Controller : IDisposable
     }
     public async Task<Reply> Dispatch(Command cmd, CancellationToken ct)
     {
+        // Network checks must not hold the configuration lock: imports and snapshots
+        // remain available even when an upstream takes the full timeout to respond.
+        if (cmd.Action is "probe" or "probeTcp") {
+            try { return Reply.Success(await ProbeInBackground(Json.Read<ProxyRequest>(cmd.Data).ProxyId, ct, tcpFirst: cmd.Action == "probeTcp")); }
+            catch (Exception ex) when (ex is not OutOfMemoryException) {
+                return Reply.Failure(ex is OperationCanceledException ? "操作逾時或已取消。" : ex.Message);
+            }
+        }
         await Gate.WaitAsync(ct);
         try
         {
@@ -85,19 +112,20 @@ public sealed partial class Controller : IDisposable
                     if (config.Bindings.Any(x => x.ProxyId == delId)) throw new InvalidOperationException("請先解除使用此代理的綁定。");
                     if (config.AutoProxy.EmulatorAssignments.Any(x => x.ProxyId == delId)) throw new InvalidOperationException("請先在固定窗口配置中移除此代理。");
                     if (config.GlobalProxy.Enabled && config.GlobalProxy.ProxyId == delId) throw new InvalidOperationException("請先停用使用此節點的全局代理。");
-                    config.Proxies.RemoveAll(x => x.Id == delId); probes.Remove(delId); store.Save(config); return Reply.Success(true);
-                case "probe":
-                    var profile = FindProxy(Json.Read<ProxyRequest>(cmd.Data).ProxyId);
-                    var probe = await Probe(profile, ct); ApplyRules(); return Reply.Success(probe);
+                    config.Proxies.RemoveAll(x => x.Id == delId); probes.Remove(delId); probeViews.Remove(delId); store.Save(config); return Reply.Success(true);
                 case "syncTargets":
                     var discovered = Json.Read<TargetInstance[]>(cmd.Data);
                     if (discovered.Length > 500) throw new InvalidDataException("實例數超出限制。");
+                    bool targetsChanged = false;
                     foreach (var target in discovered)
                     {
                         ValidateTarget(target);
-                        targets[target.Key] = CaptureEmulatorIdentity(target);
+                        var captured = CaptureEmulatorIdentity(target);
+                        targetsChanged |= !targets.TryGetValue(target.Key, out var previous) ||
+                            !previous.Processes.SequenceEqual(captured.Processes) || (previous with { Processes = captured.Processes }) != captured;
+                        targets[target.Key] = captured;
                     }
-                    ApplyRules(); return Reply.Success(true);
+                    if (targetsChanged) ApplyRules(); return Reply.Success(true);
                 case "bind":
                     var binding = Json.Read<BindRequest>(cmd.Data); Bind(binding.TargetKey, binding.ProxyId); return Reply.Success(true);
                 case "bindBatch":
@@ -339,13 +367,124 @@ public sealed partial class Controller : IDisposable
     }
     private async Task<ProbeResult> Probe(ProxyProfile p, CancellationToken ct)
     {
+        epochs[p.Id] = ++epoch;
         var endpoint = config.GlobalProxy.Enabled && p.Id == config.GlobalProxy.ProxyId ? p with { Host = config.GlobalProxy.ResolvedHost } : p;
-        var result = await ProxyProbe.RunAsync(endpoint, new(RemoteStunDns: config.GlobalProxy.Enabled), ct);
-        result = await IpLocationLookup.EnrichAsync(endpoint, result, ct); probes[p.Id] = result;
+        var result = await measureProxy(endpoint, config.GlobalProxy.Enabled, ct);
+        RecordProbe(p, result); return result;
+    }
+    private static async Task<ProbeResult> MeasureProxy(ProxyProfile endpoint, bool remoteStunDns, CancellationToken ct)
+    {
+        var result = await ProxyProbe.RunAsync(endpoint, new(RemoteStunDns: remoteStunDns), ct);
+        return await IpLocationLookup.EnrichAsync(endpoint, result, ct);
+    }
+    private async Task<ProbeResult> ProbeInBackground(Guid id, CancellationToken ct, bool onlyIfDue = false, bool tcpFirst = false)
+    {
+        Task<ProbeResult> work; bool created = false;
+        await Gate.WaitAsync(ct);
+        try {
+            var profile = FindProxy(id) with { };
+            if (onlyIfDue && retries.TryGetValue(id, out var retry) && retry.At > DateTimeOffset.UtcNow && probes.TryGetValue(id, out var fresh)) return fresh;
+            var active = tcpFirst ? tcpProbes : activeProbes;
+            if (!active.TryGetValue(id, out work!)) {
+                created = true;
+                long check = ++epoch; epochs[id] = check;
+                work = MeasureInBackground(profile, config.GlobalProxy, check, tcpFirst, ct);
+                active.Add(id, work);
+            }
+        } finally { Gate.Release(); }
+        // A duplicate request shares the running measurement. Cancelling a joiner
+        // cannot cancel the original caller's measurement.
+        return created ? await work : await work.WaitAsync(ct);
+    }
+    private async Task<ProbeResult> MeasureInBackground(ProxyProfile profile, GlobalProxySettings policy, long check, bool tcpFirst, CancellationToken ct)
+    {
+        bool entered = false, removed = false;
+        try {
+            await probeGate.WaitAsync(ct); entered = true;
+            var endpoint = policy.Enabled && profile.Id == policy.ProxyId ? profile with { Host = policy.ResolvedHost } : profile;
+            var result = await (tcpFirst ? measureTcp : measureProxy)(endpoint, policy.Enabled, ct);
+            await Gate.WaitAsync(CancellationToken.None);
+            try {
+                ct.ThrowIfCancellationRequested();
+                // A deleted/replaced node or changed global route invalidates this check.
+                var current = config.Proxies.FirstOrDefault(p => p.Id == profile.Id);
+                if (current is null || !CurrentCheck(profile, policy, check))
+                    throw new InvalidOperationException("節點或全局代理設定已變更，請重新檢測。");
+                if (result.UdpPending) {
+                    probeViews[profile.Id] = result;
+                    supplementalChecks[profile.Id] = check;
+                    supplementalTasks.RemoveWhere(task => task.IsCompleted);
+                    supplementalTasks.Add(Task.Run(() => SupplementInBackground(profile, endpoint, policy, check, result)));
+                } else { RecordProbe(current, result); ApplyProbeRules(profile.Id); }
+                return result;
+            } finally {
+                (tcpFirst ? tcpProbes : activeProbes).Remove(profile.Id); removed = true;
+                Gate.Release();
+            }
+        } finally {
+            if (entered) probeGate.Release();
+            // This method starts while Gate is held by ProbeInBackground, so even
+            // synchronous completion cannot remove the entry before it is added.
+            if (!removed) {
+                await Gate.WaitAsync(CancellationToken.None);
+                try { (tcpFirst ? tcpProbes : activeProbes).Remove(profile.Id); } finally { Gate.Release(); }
+            }
+        }
+    }
+    private bool CurrentCheck(ProxyProfile profile, GlobalProxySettings policy, long check) =>
+        epochs.GetValueOrDefault(profile.Id) == check && policy == config.GlobalProxy &&
+        config.Proxies.Any(p => p.Id == profile.Id && ProxyImport.SameProxy(p, profile));
+    private async Task SupplementInBackground(ProxyProfile profile, ProxyProfile endpoint, GlobalProxySettings policy, long check, ProbeResult tcp)
+    {
+        bool entered = false; var ct = supplementalLifetime.Token;
+        try {
+            // Separate capacity keeps slow UDP/location work out of the TCP queue.
+            await supplementalGate.WaitAsync(ct); entered = true;
+            await Gate.WaitAsync(ct);
+            try { if (!CurrentCheck(profile, policy, check)) return; } finally { Gate.Release(); }
+            var result = await supplementProxy(endpoint, tcp, policy.Enabled, ct);
+            await Gate.WaitAsync(ct);
+            try {
+                if (!CurrentCheck(profile, policy, check) || DateTimeOffset.UtcNow - tcp.At >= ProbeTiming.HealthValidity) return;
+                RecordProbe(profile, result); ApplyProbeRules(profile.Id);
+            } finally { Gate.Release(); }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception ex) when (ex is not OutOfMemoryException) {
+            await Gate.WaitAsync(CancellationToken.None);
+            try {
+                if (CurrentCheck(profile, policy, check)) {
+                    probeViews[profile.Id] = tcp with { UdpPending = false, At = DateTimeOffset.UtcNow, Message = "UDP／所在地補測未完成，可手動重試。" };
+                    retries[profile.Id] = (DateTimeOffset.UtcNow.Add(ProbeTiming.RetryInterval), retries.GetValueOrDefault(profile.Id).Failures);
+                }
+            } finally { Gate.Release(); }
+        }
+        finally {
+            if (entered) supplementalGate.Release();
+            await Gate.WaitAsync(CancellationToken.None);
+            try {
+                if (supplementalChecks.GetValueOrDefault(profile.Id) == check) supplementalChecks.Remove(profile.Id);
+                if (!ct.IsCancellationRequested && probeViews.TryGetValue(profile.Id, out var pending) && pending.CheckId == tcp.CheckId && pending.UdpPending) {
+                    probeViews[profile.Id] = pending with { UdpPending = false, At = DateTimeOffset.UtcNow, Message = "補測已取消或設定變更，請重新檢測。" };
+                    retries[profile.Id] = (DateTimeOffset.UtcNow.Add(ProbeTiming.RetryInterval), retries.GetValueOrDefault(profile.Id).Failures);
+                }
+            } finally { Gate.Release(); }
+        }
+    }
+    private void RecordProbe(ProxyProfile p, ProbeResult result)
+    {
+        probes[p.Id] = result;
+        probeViews.Remove(p.Id);
         if (result.Ready) lastReady[p.Id] = result.At;
         int failures = result.Ready ? 0 : retries.GetValueOrDefault(p.Id).Failures + 1;
         retries[p.Id] = (DateTimeOffset.UtcNow.Add(ProbeTiming.NextInterval(result.Ready)), failures);
-        Log($"代理「{p.Name}」檢測：TCP {result.TcpLabel}，UDP {result.UdpLabel}。"); return result;
+        Log($"代理「{p.Name}」檢測：TCP {result.TcpLabel}，UDP {result.UdpLabel}。");
+    }
+    private void ApplyProbeRules(Guid id)
+    {
+        // An unused pool node cannot change live process/global routing. Rebuilding
+        // all emulator rules here would hold up unrelated TCP result delivery.
+        if (config.Bindings.Any(b => b.ProxyId == id) || config.GlobalProxy.Enabled && config.GlobalProxy.ProxyId == id) ApplyRules();
     }
     private bool DuplicateExit(Guid id)
     {
@@ -459,6 +598,7 @@ public sealed partial class Controller : IDisposable
     }
     public async Task Tick(CancellationToken ct)
     {
+        Guid due = Guid.Empty;
         await Gate.WaitAsync(ct);
         try
         {
@@ -472,12 +612,18 @@ public sealed partial class Controller : IDisposable
             ReconcileAutomaticBindings();
             if ((config.GlobalProxy.Enabled || config.Bindings.Count > 0 || config.AutoProxy.Enabled) && NativeEngine.DriverPresent && (!started || NativeEngine.Core_IsRunning() == 0)) { try { EnsureEngine(); } catch (Exception ex) { engineError = ex.Message; } }
             ApplyRules();
-            var due = config.Bindings.Where(b => b.Enabled).Select(b => b.ProxyId).Concat(config.GlobalProxy.Enabled ? [config.GlobalProxy.ProxyId] : []).Distinct().FirstOrDefault(id => !retries.TryGetValue(id, out var r) || r.At <= DateTimeOffset.UtcNow);
-            if (due != Guid.Empty) { await Probe(FindProxy(due), ct); ApplyRules(); }
+            due = config.Bindings.Where(b => b.Enabled).Select(b => b.ProxyId).Concat(config.GlobalProxy.Enabled ? [config.GlobalProxy.ProxyId] : []).Distinct().FirstOrDefault(id => !tcpProbes.ContainsKey(id) && !supplementalChecks.ContainsKey(id) && (!retries.TryGetValue(id, out var r) || r.At <= DateTimeOffset.UtcNow));
             if (childrenDirty) { store.Save(config); childrenDirty = false; }
         }
         catch (Exception ex) when (ex is not OperationCanceledException) { autoStatus = "自動分配／監測失敗：" + ex.Message; Log("監測失敗：" + ex.Message); }
         finally { Gate.Release(); }
+        if (due != Guid.Empty) {
+            try { await ProbeInBackground(due, ct, onlyIfDue: true); }
+            catch (Exception ex) when (ex is not OperationCanceledException and not OutOfMemoryException) {
+                await Gate.WaitAsync(ct);
+                try { Log("背景檢測未完成：" + ex.Message); } finally { Gate.Release(); }
+            }
+        }
     }
     private void PruneExitedProcesses()
     {
@@ -493,15 +639,16 @@ public sealed partial class Controller : IDisposable
         var ldBindings = config.Bindings.Where(b => b.Kind == "LDPlayer").Concat(targets.Values.Where(t => t.Kind == "LDPlayer" && config.AutoProxy.Enabled &&
             (config.AutoProxy.Kind == "LDPlayer" || config.AutoProxy.Kind == "EmulatorSequence" && SequentialEmulatorPlanner.Matches(t, config.AutoProxy))).Select(t => new InstanceBinding { TargetKey = t.Key, Name = t.Name, Kind = t.Kind, Path = t.Path, Index = t.Index, Processes = t.Processes })).DistinctBy(b => b.TargetKey).ToArray(); if (ldBindings.Length == 0) return;
         // Do not execute a user's ldconsole.exe as LocalSystem. Read-only WMI and .vbox UUIDs support discovery while the UI is absent.
-        using var searcher = new ManagementObjectSearcher("SELECT ProcessId,ExecutablePath,CommandLine FROM Win32_Process WHERE Name='Ld9BoxHeadless.exe' OR Name='LdVBoxHeadless.exe'");
-        using var collection = searcher.Get();
+        using var searcher = EmulatorProcessesPresent(["Ld9BoxHeadless.exe", "LdVBoxHeadless.exe"])
+            ? new ManagementObjectSearcher("SELECT ProcessId,ExecutablePath,CommandLine FROM Win32_Process WHERE Name='Ld9BoxHeadless.exe' OR Name='LdVBoxHeadless.exe'") : null;
+        using var collection = searcher?.Get();
         foreach (var b in ldBindings)
         {
             string vmFolder = Path.Combine(Path.GetDirectoryName(b.Path)!, "vms", $"leidian{b.Index}");
             var xmlFile = Directory.Exists(vmFolder) ? Directory.EnumerateFiles(vmFolder, "*.vbox").FirstOrDefault() : null;
             string uuid = xmlFile is null ? "" : System.Xml.Linq.XDocument.Load(xmlFile).Descendants().FirstOrDefault(x => x.Name.LocalName == "Machine")?.Attribute("uuid")?.Value.Trim('{', '}') ?? "";
             var found = new List<ProcessIdentity>();
-            foreach (ManagementObject process in collection)
+            if (collection is not null) foreach (ManagementObject process in collection)
             {
                 string path = (string?)process["ExecutablePath"] ?? "", command = (string?)process["CommandLine"] ?? "";
                 string boxRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "ldplayer9box") + Path.DirectorySeparatorChar;
@@ -513,6 +660,13 @@ public sealed partial class Controller : IDisposable
             if (found.Count == 1) targets[b.TargetKey] = new(b.TargetKey, b.Name, b.Kind, b.Path, b.Index, true, found.ToArray());
             else if (!b.Processes.Any(p => LdPlayer.Identity(p.Pid) == p)) targets[b.TargetKey] = new(b.TargetKey, b.Name, b.Kind, b.Path, b.Index, false, [], found.Count > 1 ? "無法唯一辨識實例" : "未執行或等待辨識");
         }
+    }
+    private static bool EmulatorProcessesPresent(IEnumerable<string> names)
+    {
+        bool present = false;
+        foreach (string name in names) foreach (var process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(name)))
+            using (process) { present = true; }
+        return present;
     }
     private Snapshot GetSnapshot()
     {
@@ -528,9 +682,10 @@ public sealed partial class Controller : IDisposable
         }).ToArray();
         var visibleTargets = targets.Values.Concat(config.Bindings.Select(b => new TargetInstance(b.TargetKey, b.Name, b.Kind, b.Path, b.Index,
             b.Processes.Concat(b.IncludeChildren ? b.Descendants : []).Any(p => LdPlayer.Identity(p.Pid) == p), b.Processes))).DistinctBy(t => t.Key).ToArray();
-        return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), visibleTargets, probes.Values.ToArray(), statuses,
+        var visibleProbes = probes.Values.Where(p => !probeViews.ContainsKey(p.ProxyId)).Concat(probeViews.Values).ToArray();
+        return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), visibleTargets, visibleProbes, statuses,
             new(true, NativeEngine.DriverPresent, NativeEngine.Present, running, AppReleasePackage.CurrentVersion + " 預覽版", NativeEngine.DriverPresent ? engineError : "缺少 WinDivert 驅動，未啟用攔截。", logs.ToArray()))
-            { SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
+            { SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
     }
     private string GlobalStatus()
     {
@@ -618,5 +773,9 @@ public sealed partial class Controller : IDisposable
         try { if (!OpenProcessToken(process, 8, out var token)) return false; try { using var identity = new WindowsIdentity(token); return identity.User?.Value == OwnerSid; } finally { CloseHandle(token); } }
         finally { CloseHandle(process); }
     }
-    public void Dispose() { gameObserver.Dispose(); if (NativeEngine.Present && started) NativeEngine.Core_Stop(); Gate.Dispose(); }
+    public void Dispose() {
+        supplementalLifetime.Cancel(); Task.WhenAll(supplementalTasks).GetAwaiter().GetResult();
+        gameObserver.Dispose(); if (NativeEngine.Present && started) NativeEngine.Core_Stop();
+        supplementalLifetime.Dispose(); supplementalGate.Dispose(); probeGate.Dispose(); Gate.Dispose();
+    }
 }

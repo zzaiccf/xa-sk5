@@ -19,24 +19,34 @@ namespace WindowSocks.Desktop;
 public partial class MainWindow : Window
 {
     private readonly Backend backend;
+    private readonly IDesktopStartupController startup;
+    private readonly bool integrateShell;
+    private bool startupChanging;
     private Snapshot? snapshot;
     private TargetInstance[] targets = [];
     private bool busy, quitting, picking;
     private readonly AutomaticProbeSchedule probeSchedule = new();
     private readonly CancellationTokenSource lifetime = new();
-    private CancellationTokenSource? probeRequest;
+    private readonly Dictionary<ProbeJob, CancellationTokenSource> probeRequests = [];
     private bool probeWorkerRunning;
+    private bool probeStatusPending, probeStatusIncomplete;
     private readonly System.Windows.Forms.NotifyIcon tray;
     private readonly System.Drawing.Icon trayIcon;
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(5) };
     private readonly DispatcherTimer durationTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private DateTimeOffset lastDiscovery = DateTimeOffset.MinValue;
+    private Task? discovery;
+    private bool taskbarReading, taskbarRequesting;
     private readonly List<TargetInstance> extraTargets = [];
-    public MainWindow() : this(new Backend()) { }
-    public MainWindow(Backend backend)
+    public MainWindow() : this(new Backend(), new DesktopStartupController(), true) { }
+    public MainWindow(Backend backend, IDesktopStartupController? startup = null, bool integrateShell = false)
     {
+        this.integrateShell = integrateShell;
         this.backend = backend ?? throw new ArgumentNullException(nameof(backend));
+        this.startup = startup ?? new PreviewStartupController();
         InitializeComponent(); LdPath.Text = backend.ConsolePath; ProductVersionText.Text = AboutVersionText.Text = AppReleasePackage.CurrentVersion + " · 預覽版";
+        RenderStartup();
+        Activated += async (_, _) => { if (this.integrateShell && !taskbarRequesting) await RefreshTaskbar(); };
         trayIcon = LoadTrayIcon();
         tray = new() { Icon = trayIcon, Visible = true, Text = "xa sk5" };
         var menu = new System.Windows.Forms.ContextMenuStrip();
@@ -45,6 +55,12 @@ public partial class MainWindow : Window
         tray.ContextMenuStrip = menu; tray.DoubleClick += (_, _) => Dispatcher.Invoke(Restore);
         Loaded += async (_, _) => {
             await Run("正在讀取節點並自動檢測實際 IP…", () => Refresh(false, skipDiscovery: true));
+            if (this.integrateShell) {
+                try {
+                    WindowsShortcuts.Initialize(Registry.CurrentUser, DesktopExecutable);
+                    _ = RefreshTaskbar();
+                } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or COMException) { ShellHint.Text = "捷徑設定未完成：" + ex.Message; }
+            }
             string[] arguments = Environment.GetCommandLineArgs(); int index = Array.IndexOf(arguments, "--update-result");
             if (index >= 0 && index + 1 < arguments.Length) try {
                 string path = Path.GetFullPath(arguments[index + 1]);
@@ -59,16 +75,69 @@ public partial class MainWindow : Window
         Closing += OnClosing;
     }
     private void Restore() { Show(); WindowState = WindowState.Normal; Activate(); }
+    private void RenderStartup()
+    {
+        if (startupChanging) return;
+        var state = startup.Read(); StartWithWindows.IsChecked = state.Enabled; StartupHint.Text = state.Message;
+        StartBackgroundService.Visibility = state.ServiceInstalled && !backend.Online ? Visibility.Visible : Visibility.Collapsed;
+    }
+    private async void StartWithWindowsClick(object sender, RoutedEventArgs e)
+    {
+        bool enabled = StartWithWindows.IsChecked == true;
+        await Run("正在更新開機啟動設定…", async () => {
+            startupChanging = true; StartWithWindows.IsEnabled = false;
+            try { await startup.SetEnabledAsync(enabled); }
+            finally { startupChanging = false; StartWithWindows.IsEnabled = true; RenderStartup(); }
+        });
+    }
+    private async void StartBackgroundServiceClick(object sender, RoutedEventArgs e) => await Run("正在啟動背景服務…", async () => {
+        StartBackgroundService.IsEnabled = false;
+        try { await startup.StartServiceAsync(); await Refresh(false); }
+        finally { StartBackgroundService.IsEnabled = true; RenderStartup(); }
+    });
     private void CheckUpdatesClick(object sender, RoutedEventArgs e)
     {
         var dialog = new UpdateWindow { Owner = this };
         dialog.ShowDialog();
         if (dialog.ReadyToExit) { quitting = true; Close(); }
     }
+    private static string DesktopExecutable => Path.Combine(AppContext.BaseDirectory, File.Exists(Path.Combine(AppContext.BaseDirectory, "xa sk5.exe")) ? "xa sk5.exe" : "WindowSocks.exe");
+    private void CreateDesktopShortcutClick(object sender, RoutedEventArgs e)
+    {
+        try { WindowsShortcuts.CreateDesktop(DesktopExecutable); ShellHint.Text = "已建立桌面捷徑。"; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or COMException) { ShellHint.Text = "無法建立捷徑：" + ex.Message; }
+    }
+    private async Task RefreshTaskbar()
+    {
+        if (taskbarReading || taskbarRequesting) return;
+        taskbarReading = true;
+        try {
+            var state = await TaskbarPinning.ReadAsync();
+            PinTaskbar.IsEnabled = state.Supported && state.Allowed && !state.Pinned;
+            PinTaskbar.Content = state.Pinned ? "已釘選工作列" : "釘選工作列";
+            ShellHint.Text = state.Pinned ? "已釘選工作列；桌面捷徑預設建立一次。" : state.Supported && state.Allowed ? "桌面捷徑預設建立；工作列釘選需在 Windows 提示中確認。" : "桌面捷徑已就緒；請在工作列圖示按右鍵，選擇「釘選到工作列」。";
+        } catch (Exception ex) when (ex is COMException or UnauthorizedAccessException or TimeoutException) {
+            PinTaskbar.IsEnabled = false; ShellHint.Text = "請在工作列圖示按右鍵，選擇「釘選到工作列」。";
+        }
+        finally { taskbarReading = false; }
+    }
+    private async void PinTaskbarClick(object sender, RoutedEventArgs e)
+    {
+        if (taskbarRequesting) return;
+        taskbarRequesting = true;
+        PinTaskbar.IsEnabled = false;
+        try {
+            bool pinned = await TaskbarPinning.RequestAsync();
+            taskbarRequesting = false;
+            await RefreshTaskbar();
+            if (!pinned) ShellHint.Text = "尚未釘選；可再次按下釘選，或在工作列圖示按右鍵操作。";
+        } catch (Exception ex) when (ex is COMException or NotSupportedException or TimeoutException) { ShellHint.Text = "請在工作列圖示按右鍵，選擇「釘選到工作列」。"; }
+        finally { taskbarRequesting = false; }
+    }
     private void OnClosing(object? sender, CancelEventArgs e)
     {
         if (!quitting) { e.Cancel = true; Hide(); tray.ShowBalloonTip(1800, "xa sk5 仍在系統匣", "背景服務不受主視窗關閉影響。", System.Windows.Forms.ToolTipIcon.Info); }
-        else { timer.Stop(); durationTimer.Stop(); probeSchedule.Stop(); lifetime.Cancel(); tray.Dispose(); trayIcon.Dispose(); }
+        else { timer.Stop(); durationTimer.Stop(); probeSchedule.Stop(); lifetime.Cancel(); backend.StopProbes(); tray.Dispose(); trayIcon.Dispose(); }
     }
     private static System.Drawing.Icon LoadTrayIcon()
     {
@@ -85,7 +154,7 @@ public partial class MainWindow : Window
             while (busy) await Task.Delay(50);
         }
         busy = true; if (message.Length > 0) StatusText.Text = message;
-        try { await action(); if (message.Length > 0) StatusText.Text = "完成 · " + DateTime.Now.ToString("HH:mm:ss") + (probeSchedule.Active is null ? "" : $" · 實際 IP 自動檢測中（等待 {probeSchedule.PendingCount} 個）"); }
+        try { await action(); if (message.Length > 0) StatusText.Text = "完成 · " + DateTime.Now.ToString("HH:mm:ss") + (probeSchedule.ActiveCount == 0 ? "" : $" · 實際 IP 自動檢測中（{probeSchedule.ActiveCount} 條並行）"); }
         catch (Exception ex) { StatusText.Text = ex.Message; if (showError) MessageBox.Show(this, ex.Message, "xa sk5", MessageBoxButton.OK, MessageBoxImage.Information); }
         finally { busy = false; }
     }
@@ -93,11 +162,36 @@ public partial class MainWindow : Window
     {
         if (!skipDiscovery && (discover || DateTimeOffset.Now - lastDiscovery > TimeSpan.FromSeconds(20)))
         {
+            if (discovery is null || discovery.IsCompleted) {
+                discovery = DiscoverTargets();
+                if (!discover) _ = RefreshAfterDiscovery(discovery);
+            }
+            if (discover) await discovery;
+        }
+        var previous = snapshot;
+        snapshot = await backend.Snapshot(targets);
+        if (previous is not null && previous.Diagnostics.ServiceOnline == snapshot.Diagnostics.ServiceOnline) {
+            var latest = previous.Probes.Concat(snapshot.Probes).GroupBy(p => p.ProxyId).ToDictionary(group => group.Key, group => group.MaxBy(p => p.At)!);
+            snapshot = snapshot with { Probes = snapshot.Proxies.Where(p => latest.ContainsKey(p.Id)).Select(p => latest[p.Id]).ToArray() };
+        }
+        probeSchedule.ObserveResults(snapshot.Probes);
+        if (probeSchedule.Synchronize(backend.Online ? "service" : "local", snapshot.Proxies.Select(p => p.Id), DateTimeOffset.UtcNow))
+            foreach (var request in probeRequests.Where(pair => !probeSchedule.IsCurrent(pair.Key)).ToArray()) request.Value.Cancel();
+        RenderSnapshot(); StartProbeWorker();
+    }
+    private async Task RefreshAfterDiscovery(Task pending)
+    {
+        try { await pending; if (!lifetime.IsCancellationRequested) await Run("", () => Refresh(false, skipDiscovery: true), false); }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
+    }
+    private async Task DiscoverTargets()
+    {
+            await Task.Yield();
             TargetInstance[] ld = [];
             if (File.Exists(backend.ConsolePath))
             {
                 try {
-                    var output = await LdPlayer.RunAsync(backend.ConsolePath, ["list2"], CancellationToken.None);
+                    var output = await LdPlayer.RunAsync(backend.ConsolePath, ["list2"], lifetime.Token);
                     ld = LdPlayer.Parse(output, backend.ConsolePath, LdPlayer.Identity);
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException) { StatusText.Text = "模擬器探索未完成；繼續讀取節點與自動檢測實際 IP。"; }
@@ -108,14 +202,11 @@ public partial class MainWindow : Window
                 catch (Exception ex) when (ex is not OutOfMemoryException) { StatusText.Text = "MuMu 清單暫時無法讀取；固定配置仍保留。"; }
             }
             targets = ld.Concat(mumu).Concat(extraTargets.Where(t => t.Processes.All(p => LdPlayer.Identity(p.Pid) == p))).DistinctBy(t => t.Key).ToArray(); lastDiscovery = DateTimeOffset.Now;
-        }
-        snapshot = await backend.Snapshot(targets);
-        if (probeSchedule.Synchronize(backend.Online ? "service" : "local", snapshot.Proxies.Select(p => p.Id), DateTimeOffset.UtcNow)) probeRequest?.Cancel();
-        RenderSnapshot(); StartProbeWorker();
     }
     private void RenderSnapshot()
     {
         if (snapshot is null) return;
+        RenderStartup();
         var selectedTarget = TargetGrid.SelectedItems.Cast<TargetRow>().Select(x => x.Target.Key).ToHashSet();
         var selectedProxy = ProxyGrid.SelectedItems.Cast<ProxyRow>().Select(x => x.Profile.Id).ToHashSet();
         TargetGrid.ItemsSource = snapshot.Targets.Select(t => {
@@ -124,7 +215,7 @@ public partial class MainWindow : Window
             return new TargetRow(t, t.Name + (EmulatorCatalog.IsEmulator(t.Kind) ? $"  #{t.Index}" : t.Kind == "GameGroup" ? $"（{t.Processes.Length} 個成員）" : b?.IncludeChildren == true ? $"（含 {b.Descendants.Length} 個子程序）" : ""), p is null ? "尚未分配" : p.Name + (count > 1 ? $"（共用 {count}）" : ""), result?.ExitLabel ?? "未驗證", status?.State ?? (t.Kind is "GameGroup" or "GameOrphan" ? "未分配 · 已封鎖" : snapshot.GlobalProxy.Enabled ? "依全局代理規則" : t.Running ? "執行中 · 未代理" : "未啟動"), status is null ? "—" : $"{Size(status.Sent)} / {Size(status.Received)}", result is null ? "未檢測" : $"{(result.Tcp ? "通過" : "失敗")} / {(result.Udp ? "通過" : "失敗")}") { ConnectedAt = status?.ConnectedAt, Connections = status is null ? "—" : $"{status.TcpConnections} / {status.UdpAssociations}", Members = t.Detail, Node = p is null ? null : new ProxyNodeDisplay(p, result), AccountPort = p is null ? "尚未分配" : new ProxyNodeDisplay(p, result).AccountPort, EntryIp = p?.Host ?? "—" };
         }).ToArray();
         var query = ProxySearch.Text.Trim();
-        var rows = snapshot.Proxies.Select(p => new ProxyRow(p, snapshot.Probes.FirstOrDefault(x => x.ProxyId == p.Id), snapshot.Bindings.Count(b => b.ProxyId == p.Id), string.Join("、", snapshot.Bindings.Where(b => b.ProxyId == p.Id).Select(b => b.Name)), p.Id == probeSchedule.Active, probeSchedule.IsQueued(p.Id))).ToArray();
+        var rows = snapshot.Proxies.Select(p => new ProxyRow(p, snapshot.Probes.FirstOrDefault(x => x.ProxyId == p.Id), snapshot.Bindings.Count(b => b.ProxyId == p.Id), string.Join("、", snapshot.Bindings.Where(b => b.ProxyId == p.Id).Select(b => b.Name)), probeSchedule.IsActive(p.Id), probeSchedule.IsQueued(p.Id))).ToArray();
         ProxyGrid.ItemsSource = rows.Where(r => query.Length == 0 || new[] { r.Name, r.EntryIp, r.Profile.Username, r.Probe?.TcpExit, r.Probe?.UdpExit }.Any(value => value?.Contains(query, StringComparison.OrdinalIgnoreCase) == true)).ToArray();
         foreach (TargetRow row in TargetGrid.Items) if (selectedTarget.Contains(row.Target.Key)) TargetGrid.SelectedItems.Add(row);
         foreach (ProxyRow row in ProxyGrid.Items) if (selectedProxy.Contains(row.Profile.Id)) ProxyGrid.SelectedItems.Add(row);
@@ -159,7 +250,17 @@ public partial class MainWindow : Window
         if (ProxyGrid.SelectedItems.Count > 0) ProxyListSummary.Text += $" · 已選 {ProxyGrid.SelectedItems.Count}";
         ManualProbe.IsEnabled = snapshot.Proxies.Length > 0;
         MainRefresh.ToolTip = Pages.SelectedIndex == 1 ? "立即檢測並更新節點" : "重新整理";
-        ProbeStateText.Text = probeSchedule.Active is not null ? $"檢測中 · 等待 {probeSchedule.PendingCount}" : probeSchedule.Paused ? "自動檢測已暫停" : "每 30 分鐘複測";
+        int supplemental = snapshot.Probes.Count(p => p.UdpPending);
+        ProbeStateText.Text = probeSchedule.ActiveCount > 0 || probeSchedule.PendingCount > 0 ? $"TCP 檢測中 · {probeSchedule.ActiveCount} 條並行 · 等待 {probeSchedule.PendingCount}" : supplemental > 0 ? $"TCP 已完成 · 背景補測 {supplemental} 條" : probeSchedule.Paused ? "自動檢測已暫停" : "每 30 分鐘複測";
+        if (probeStatusPending) {
+            if (probeSchedule.ActiveCount > 0 || probeSchedule.PendingCount > 0)
+                StatusText.Text = $"TCP 檢測中 · {probeSchedule.ActiveCount} 條並行 · 等待 {probeSchedule.PendingCount} 條";
+            else if (supplemental > 0) StatusText.Text = $"TCP 已完成 · 背景補測中（{supplemental} 條）";
+            else {
+                StatusText.Text = probeStatusIncomplete ? "檢測完成 · 部分節點未完成，可重新檢測。" : "檢測完成";
+                probeStatusPending = false;
+            }
+        }
         ProbeStateText.ToolTip = backend.Online && !snapshot.SupportsLowFrequencyProbes
             ? "清單成功後每 30 分鐘複測、失敗後 5 分鐘重試。目前舊版背景服務仍有較頻繁的健康檢查，更新至 0.1.12 後會同步降低頻率。"
             : "開啟與匯入時檢測一次；成功後 30 分鐘複測，失敗後 5 分鐘重試。需要最新結果可按「立即檢測」。";
@@ -196,7 +297,7 @@ public partial class MainWindow : Window
     }
     private async Task ImportAndProbe(string text)
     {
-        var ids = await backend.Import(text); await Refresh(false);
+        var ids = await backend.Import(text); await Refresh(false, skipDiscovery: true);
         probeSchedule.Request(ids); RenderSnapshot(); StartProbeWorker();
     }
     private async void ExportClick(object sender, RoutedEventArgs e)
@@ -213,36 +314,48 @@ public partial class MainWindow : Window
     }
     private async Task ProcessProbeQueue()
     {
+        var running = new HashSet<Task>();
         try {
-            while (!lifetime.IsCancellationRequested && probeSchedule.TryStart(out var job)) {
-                using var request = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-                probeRequest = request;
-                bool ready = false;
-                try {
-                    StopProbe.IsEnabled = true;
-                    StatusText.Text = $"檢測實際 IP：{snapshot?.Proxies.FirstOrDefault(p => p.Id == job.ProxyId)?.Name ?? "節點"} · 等待 {probeSchedule.PendingCount} 個";
-                    RenderSnapshot();
-                    var result = await backend.Probe(job.ProxyId, request.Token);
-                    request.Token.ThrowIfCancellationRequested();
-                    ready = result.Ready;
-                    if (probeSchedule.IsCurrent(job) && snapshot is not null) {
-                        snapshot = snapshot with { Probes = snapshot.Probes.Where(p => p.ProxyId != job.ProxyId).Append(result).ToArray() };
-                        StatusText.Text = result.Tcp ? $"實際 IP 已更新：{result.ExitLabel}" : probeSchedule.Paused ? "節點檢測未通過，可按「立即檢測」重試。" : "節點檢測未通過，5 分鐘後自動重試。";
-                    }
-                }
-                catch (OperationCanceledException) when (request.IsCancellationRequested) { }
-                catch (Exception ex) when (ex is not OutOfMemoryException) { StatusText.Text = probeSchedule.Paused ? "節點檢測未完成，可按「立即檢測」重試。" : "節點檢測未完成，5 分鐘後自動重試；繼續檢測其他節點。"; }
-                finally {
-                    probeRequest = null;
-                    probeSchedule.Complete(job, ready, DateTimeOffset.UtcNow);
-                }
-                if (!lifetime.IsCancellationRequested) { RenderSnapshot(); await Task.Yield(); }
+            while (!lifetime.IsCancellationRequested) {
+                while (running.Count < probeSchedule.MaxConcurrent && probeSchedule.TryStart(out var job)) running.Add(CheckProxy(job));
+                if (running.Count == 0) break;
+                var completed = await Task.WhenAny(running); running.Remove(completed); await completed;
+                await Task.Yield();
             }
         }
         finally {
+            await Task.WhenAll(running);
             probeWorkerRunning = false;
             StopProbe.IsEnabled = !probeSchedule.Paused && snapshot?.Proxies.Length > 0;
+            if (!lifetime.IsCancellationRequested && probeSchedule.PendingCount > 0) StartProbeWorker();
         }
+    }
+    private async Task CheckProxy(ProbeJob job)
+    {
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        probeRequests.Add(job, request);
+        bool ready = false;
+        ProbeResult? measured = null;
+        try {
+            StopProbe.IsEnabled = true;
+            if (!probeStatusPending) probeStatusIncomplete = false;
+            probeStatusPending = true;
+            RenderSnapshot();
+            var result = await backend.Probe(job.ProxyId, request.Token);
+            measured = result;
+            request.Token.ThrowIfCancellationRequested();
+            ready = result.UdpPending ? result.Tcp : result.Ready;
+            if (probeSchedule.IsCurrent(job) && snapshot is not null) {
+                snapshot = snapshot with { Probes = snapshot.Probes.Where(p => p.ProxyId != job.ProxyId).Append(result).ToArray() };
+            }
+        }
+        catch (OperationCanceledException) when (request.IsCancellationRequested) { }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { probeStatusIncomplete = true; }
+        finally {
+            probeRequests.Remove(job);
+            probeSchedule.Complete(job, ready, DateTimeOffset.UtcNow, measured?.CheckId ?? Guid.Empty, measured?.UdpPending ?? false);
+        }
+        if (!lifetime.IsCancellationRequested) RenderSnapshot();
     }
     private void StopProbeClick(object sender, RoutedEventArgs e) { probeSchedule.Stop(); RenderSnapshot(); StatusText.Text = "自動檢測已暫停；目前檢測完成後停止，仍可按「立即檢測」。"; }
     private void ResumeProbeClick(object sender, RoutedEventArgs e)
@@ -297,7 +410,8 @@ public partial class MainWindow : Window
         ProxyFacts.ItemsSource = new[] {
             new DetailFact("TCP 實際 IP", p?.TcpExit ?? "未驗證"), new DetailFact("UDP 實際 IP", row.UdpExit), new DetailFact("連接帳號／端口", row.AccountPort),
             new DetailFact("連入 IP", row.EntryIp), new DetailFact("到期時間", row.Expiration), new DetailFact("檢測時間", row.CheckedAt.Length == 0 ? "—" : row.CheckedAt),
-            new DetailFact("連線／驗證", $"{row.Reachable} / {row.Auth}"), new DetailFact("TCP / UDP", $"{row.Tcp} / {row.Udp}"), new DetailFact("連線／UDP 延遲", $"{Ms(p?.ConnectLatencyMs)} / {Ms(p?.UdpLatencyMs)}"),
+            new DetailFact("連線／驗證", $"{row.Reachable} / {row.Auth}"), new DetailFact("TCP / UDP", $"{row.Tcp} / {row.Udp}"),
+            new DetailFact("入口 TCP 連線", Ms(p?.ConnectLatencyMs)), new DetailFact("TCP 檢測耗時", Ms(p?.LatencyMs)), new DetailFact("UDP 往返", Ms(p?.UdpLatencyMs)),
             new DetailFact("名稱", row.Name), new DetailFact("所在地／業者", p?.Location is { } location ? $"{location.Label} · {location.Isp}" : "—"), new DetailFact("已分配窗口", row.Count == 0 ? "—" : row.Owners)
         };
         ProxyDetails.Text = p?.Message ?? "尚未檢測；此節點已加入自動檢測佇列。";
@@ -376,8 +490,8 @@ public partial class MainWindow : Window
     private void ManualProbeClick(object sender, RoutedEventArgs e) => RequestManualProbe();
     private void RequestManualProbe()
     {
-        var selected = ProxyGrid.SelectedItems.Cast<ProxyRow>().Select(r => r.Profile.Id).ToArray();
-        var ids = selected.Length > 0 ? selected : snapshot?.Proxies.Select(p => p.Id).ToArray() ?? [];
+        var ids = ProxyGrid.SelectedItems.Cast<ProxyRow>().Select(row => row.Profile.Id).ToArray();
+        if (ids.Length == 0) ids = snapshot?.Proxies.Select(p => p.Id).ToArray() ?? [];
         probeSchedule.Request(ids); RenderSnapshot(); StartProbeWorker();
     }
     private async void BindClick(object sender, RoutedEventArgs e)
@@ -543,15 +657,15 @@ public partial class MainWindow : Window
         public string UdpExit => Probe?.UdpExit ?? "未驗證";
         public string CheckedAt => Probe?.At.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "";
         public string Message => Probe?.Message ?? "尚未檢測";
-        public string Status => Probing ? "檢測中…" : Queued ? "等待檢測" : Probe is null ? "未檢測" : ProbeTiming.IsStale(Probe.At, DateTimeOffset.UtcNow) ? "待自動複測" : Probe.StatusLabel;
-        public string StateLabel => Probing ? "檢測中" : Queued ? "待檢測" : Probe is null ? "未檢測" : ProbeTiming.IsStale(Probe.At, DateTimeOffset.UtcNow) ? "待複測" : Probe.Ready ? "可用" : Probe.Tcp ? "僅 TCP" : !Probe.Reachable ? "無法連線" : !Probe.Authenticated ? "驗證失敗" : "檢測失敗";
-        public string Tone => Probing ? "busy" : Queued || Probe is null ? "neutral" : ProbeTiming.IsStale(Probe.At, DateTimeOffset.UtcNow) ? "warning" : Probe.Ready ? "success" : Probe.Tcp ? "warning" : "danger";
-        public string ProtocolSummary => Probe is null ? "TCP —   UDP —" : $"TCP {(Probe.Tcp ? "✓" : "×")}   UDP {(Probe.Udp ? "✓" : "×")}";
+        public string Status => Probing ? "檢測中…" : Queued ? "檢測中…（等待空位）" : Probe is null ? "未檢測" : ProbeTiming.IsStale(Probe.At, DateTimeOffset.UtcNow) ? "待自動複測" : Probe.StatusLabel;
+        public string StateLabel => Probing || Queued ? "檢測中" : Probe is null ? "未檢測" : ProbeTiming.IsStale(Probe.At, DateTimeOffset.UtcNow) ? "待複測" : Probe.UdpPending ? "TCP 通過" : Probe.Ready ? "可用" : Probe.Tcp ? "僅 TCP" : !Probe.Reachable ? "無法連線" : !Probe.Authenticated ? "驗證失敗" : "檢測失敗";
+        public string Tone => Probing || Queued || Probe?.UdpPending == true ? "busy" : Probe is null ? "neutral" : ProbeTiming.IsStale(Probe.At, DateTimeOffset.UtcNow) ? "warning" : Probe.Ready ? "success" : Probe.Tcp ? "warning" : "danger";
+        public string ProtocolSummary => Probe is null ? "TCP —   UDP —" : $"TCP {(Probe.Tcp ? "✓" : "×")}   UDP {(Probe.UdpPending ? "待測" : !Probe.UdpChecked ? "—" : Probe.Udp ? "✓" : "×")}";
         public string Tcp => Probe is null ? "—" : Probe.Tcp ? "通過" : "失敗";
-        public string Udp => Probe is null ? "—" : Probe.Udp ? "通過" : "失敗";
+        public string Udp => Probe is null ? "—" : Probe.UdpPending ? "背景檢測中" : !Probe.UdpChecked ? "未檢測" : Probe.Udp ? "通過" : "失敗";
         public string Exit => Probe?.TcpExit ?? "—";
         public string Location => Probe?.Location?.Label ?? "";
-        public string Latency => Probe?.LatencyLabel ?? "—";
+        public string Latency => Probing || Queued ? "—" : Probe?.LatencyLabel ?? "—";
         public string Usage => Count == 0 ? "—" : Count.ToString();
     }
 }

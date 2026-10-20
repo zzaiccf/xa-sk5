@@ -73,9 +73,47 @@ public sealed class UdpAssociation(Socket control, UdpClient udp) : IDisposable
 public sealed record ProbeOptions(string TcpUrl = "https://api.ipify.org", string StunHost = "stun.cloudflare.com", int StunPort = 3478, int TimeoutSeconds = 12, bool RemoteStunDns = false);
 public static class ProxyProbe
 {
+    public static async Task<ProbeResult> RunTcpAsync(ProxyProfile profile, ProbeOptions? options = null, CancellationToken ct = default)
+    {
+        var tcp = await CheckTcp(profile, options ?? new(), ct); ct.ThrowIfCancellationRequested();
+        return new(profile.Id, tcp.Reachable, tcp.Success, tcp.Success, false, tcp.Exit, null, tcp.DurationMs,
+            tcp.Success ? "TCP 實際 IP 已取得；UDP 與所在地將於背景補測。" : tcp.Message, DateTimeOffset.UtcNow) {
+            CheckId = Guid.NewGuid(), UdpPending = tcp.Success, UdpChecked = false,
+            ConnectLatencyMs = tcp.ConnectMs, TotalDurationMs = tcp.DurationMs,
+            LocationMessage = tcp.Success ? "等待背景查詢" : "未取得 TCP 實際 IP，未查詢所在地"
+        };
+    }
+    public static async Task<ProbeResult> SupplementAsync(ProxyProfile profile, ProbeResult tcp, ProbeOptions? options = null, CancellationToken ct = default)
+    {
+        if (!tcp.Tcp || !tcp.UdpPending) return tcp;
+        var timer = Stopwatch.StartNew();
+        var udpTask = CheckUdp(profile, options ?? new(), ct);
+        var locationTask = IpLocationLookup.EnrichAsync(profile, tcp, ct);
+        var udp = await udpTask; long communicationMs = tcp.LatencyMs + timer.ElapsedMilliseconds;
+        var location = await locationTask; ct.ThrowIfCancellationRequested();
+        return tcp with {
+            Udp = udp.Success, UdpPending = false, UdpChecked = true, UdpExit = udp.Exit, UdpLatencyMs = udp.LatencyMs,
+            Location = location.Location, LocationMessage = location.LocationMessage, TotalDurationMs = communicationMs,
+            At = DateTimeOffset.UtcNow, Message = udp.Success ? "TCP／UDP 出口皆已實測；仍須從受管窗口確認實際出口。" : udp.Message
+        };
+    }
     public static async Task<ProbeResult> RunAsync(ProxyProfile profile, ProbeOptions? options = null, CancellationToken ct = default)
     {
-        options ??= new(); var timer = Stopwatch.StartNew(); bool reachable = false, authenticated = false, tcp = false, udp = false; string? tcpExit = null, udpExit = null; long? connectLatency = null, udpLatency = null; List<string> notes = [];
+        options ??= new(); ct.ThrowIfCancellationRequested(); var timer = Stopwatch.StartNew();
+        var tcpTask = CheckTcp(profile, options, ct);
+        var udpTask = CheckUdp(profile, options, ct);
+        await Task.WhenAll(tcpTask, udpTask); ct.ThrowIfCancellationRequested();
+        var tcp = await tcpTask; var udp = await udpTask;
+        string message = tcp.Success && udp.Success ? "TCP／UDP 出口皆已實測；仍須從受管窗口確認實際出口。" : string.Join(' ', new[] { tcp.Message, udp.Message }.Where(s => s.Length > 0));
+        return new(profile.Id, tcp.Reachable || udp.Authenticated, tcp.Success || udp.Authenticated, tcp.Success, udp.Success,
+            tcp.Exit, udp.Exit, tcp.DurationMs, message, DateTimeOffset.UtcNow)
+            { ConnectLatencyMs = tcp.ConnectMs, UdpLatencyMs = udp.LatencyMs, TotalDurationMs = timer.ElapsedMilliseconds };
+    }
+    private sealed record TcpCheck(bool Reachable, bool Success, string? Exit, long? ConnectMs, long DurationMs, string Message);
+    private sealed record UdpCheck(bool Authenticated, bool Success, string? Exit, long? LatencyMs, string Message);
+    private static async Task<TcpCheck> CheckTcp(ProxyProfile profile, ProbeOptions options, CancellationToken ct)
+    {
+        var timer = Stopwatch.StartNew(); bool reachable = false; long? connectLatency = null;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct); timeout.CancelAfter(TimeSpan.FromSeconds(options.TimeoutSeconds));
         try
         {
@@ -92,11 +130,14 @@ public static class ProxyProbe
             if (length > 128) throw new IOException("出口檢測回覆過長。");
             var text = System.Text.Encoding.UTF8.GetString(bytes, 0, length).Trim();
             if (!IPAddress.TryParse(text, out var ip)) throw new IOException("出口檢測未回覆 IP。");
-            tcpExit = ip.ToString(); tcp = authenticated = true;
+            return new(reachable, true, ip.ToString(), connectLatency, timer.ElapsedMilliseconds, "");
         }
         catch (Exception ex) when (ex is IOException or SocketException or HttpRequestException or OperationCanceledException or ObjectDisposedException)
-        { notes.Add("TCP 檢測失敗（連線、驗證、TLS 或出口服務），未切換直連。"); }
-        var latency = timer.ElapsedMilliseconds;
+        { return new(reachable, false, null, connectLatency, timer.ElapsedMilliseconds, "TCP 檢測失敗（連線、驗證、TLS 或出口服務），未切換直連。"); }
+    }
+    private static async Task<UdpCheck> CheckUdp(ProxyProfile profile, ProbeOptions options, CancellationToken ct)
+    {
+        bool authenticated = false;
         try
         {
             using var udpTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct); udpTimeout.CancelAfter(TimeSpan.FromSeconds(options.TimeoutSeconds));
@@ -111,12 +152,11 @@ public static class ProxyProbe
             else await assoc.SendAsync(dest, options.StunPort, request, udpTimeout.Token);
             var reply = await assoc.ReceiveAsync(udpTimeout.Token);
             if (dest is not null && !reply.Source.Address.Equals(dest) || reply.Source.Port != options.StunPort) throw new IOException("UDP 來源不符。");
-            udpExit = ParseStun(reply.Payload, request.AsSpan(8, 12)); udpLatency = udpTimer.ElapsedMilliseconds; udp = true;
+            string exit = ParseStun(reply.Payload, request.AsSpan(8, 12));
+            return new(authenticated, true, exit, udpTimer.ElapsedMilliseconds, "");
         }
         catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException or ObjectDisposedException or InvalidOperationException)
-        { notes.Add("UDP 未完成實際 STUN 收發，不視為可用。"); }
-        return new(profile.Id, reachable, authenticated, tcp, udp, tcpExit, udpExit, latency, notes.Count == 0 ? "TCP／UDP 出口皆已實測；仍須從受管窗口確認實際出口。" : string.Join(' ', notes), DateTimeOffset.UtcNow)
-            { ConnectLatencyMs = connectLatency, UdpLatencyMs = udpLatency };
+        { return new(authenticated, false, null, null, "UDP 未完成實際 STUN 收發，不視為可用。"); }
     }
     public static string ParseStun(ReadOnlySpan<byte> response, ReadOnlySpan<byte> transaction)
     {

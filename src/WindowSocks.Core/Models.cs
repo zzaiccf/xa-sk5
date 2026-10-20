@@ -48,11 +48,15 @@ public sealed record ProbeResult(Guid ProxyId, bool Reachable, bool Authenticate
     public string LocationMessage { get; init; } = "尚未查詢";
     public long? ConnectLatencyMs { get; init; }
     public long? UdpLatencyMs { get; init; }
-    public string StatusLabel => Ready ? "TCP／UDP 可用" : Tcp ? "僅 TCP 可用" : !Reachable ? "無法連線" : !Authenticated ? "驗證未通過" : "出口檢測失敗";
-    public string LatencyLabel => Tcp ? $"{LatencyMs} ms" : "—";
-    public bool Ready => Tcp && Udp;
+    public long? TotalDurationMs { get; init; }
+    public Guid CheckId { get; init; }
+    public bool UdpPending { get; init; }
+    public bool UdpChecked { get; init; } = true;
+    public string StatusLabel => UdpPending ? "TCP 通過 · UDP 背景檢測中" : Ready ? "TCP／UDP 可用" : Tcp ? "僅 TCP 可用" : !Reachable ? "無法連線" : !Authenticated ? "驗證未通過" : "出口檢測失敗";
+    public string LatencyLabel => ConnectLatencyMs is { } connected ? $"{connected} ms" : "—";
+    public bool Ready => Tcp && Udp && !UdpPending;
     public string TcpLabel => Tcp ? "通過" : "未通過";
-    public string UdpLabel => Udp ? "實際收發通過" : "未通過";
+    public string UdpLabel => UdpPending ? "背景檢測中" : !UdpChecked ? "未檢測" : Udp ? "實際收發通過" : "未通過";
     public string ExitLabel => TcpExit is null ? "未驗證" : TcpExit;
 }
 public sealed record RuntimeStatus(string TargetKey, string State, string Detail, long Sent, long Received)
@@ -71,6 +75,7 @@ public sealed record Snapshot(ProxyProfile[] Proxies, InstanceBinding[] Bindings
     public bool SupportsSequentialEmulators { get; init; }
     public bool SupportsRemoteControlBypass { get; init; }
     public bool SupportsLowFrequencyProbes { get; init; }
+    public bool SupportsTcpFirstProbes { get; init; }
     public bool HasPendingEmulatorConfiguration { get; init; }
     public AutoProxyRule AutoProxy { get; init; } = new();
     public string AutoProxyStatus { get; init; } = "尚未啟用自動分配";
