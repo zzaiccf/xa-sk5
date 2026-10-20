@@ -1,0 +1,5 @@
+<Project>
+  <ItemGroup Condition="Exists('$(MSBuildThisFileDirectory)artifacts/native/WindowSocksNative.dll')">
+    <None Include="$(MSBuildThisFileDirectory)artifacts/native/WindowSocksNative.dll" Link="WindowSocksNative.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

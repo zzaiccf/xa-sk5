@@ -1,0 +1,410 @@
+#include "pb_internal.h"
+#include <tlhelp32.h>
+
+// Process resolution: src-port -> PID lookups and the PID cache.
+
+// Reusable grow-only scratch buffer for the TCP/UDP owner-PID tables. These lookups run
+// only on the single packet-processor thread (NUM_PACKET_THREADS == 1) and each call
+// finishes scanning before the next one, so one shared buffer is safe and lets us skip a
+// malloc/free of the (potentially tens-of-KB) table on every new connection. Freed in Stop.
+
+void *pidtbl_reserve(DWORD need)
+{
+    if (need > g_pidtbl_cap)
+    {
+        DWORD newcap = g_pidtbl_cap ? g_pidtbl_cap : 16384;
+        while (newcap < need)
+        {
+            if (newcap > (0xFFFFFFFFu / 2)) { newcap = need; break; }
+            newcap *= 2;
+        }
+        char *nb = (char *)realloc(g_pidtbl_buf, newcap);
+        if (nb == NULL) return NULL;   // keep the old buffer intact on failure
+        g_pidtbl_buf = nb;
+        g_pidtbl_cap = newcap;
+    }
+    return g_pidtbl_buf;
+}
+
+// Fetches an owner-PID table into the shared scratch buffer. The table can grow between the
+// size query and the fetch (busy machine, many sockets); a single-shot size-then-fetch then
+// fails with ERROR_INSUFFICIENT_BUFFER, the lookup returns PID 0 and the connection is
+// silently treated as unowned (DIRECT, not logged). Add headroom and retry instead.
+static void *owner_table_fetch(BOOL udp, ULONG af)
+{
+    DWORD size = 0, rc;
+#define OWNER_CALL(buf, szp) (udp ? GetExtendedUdpTable((buf), (szp), FALSE, af, UDP_TABLE_OWNER_PID, 0) \
+                                  : GetExtendedTcpTable((buf), (szp), FALSE, af, TCP_TABLE_OWNER_PID_ALL, 0))
+    if (g_pidtbl_buf != NULL)
+    {
+        // Fast path: the scratch buffer from the previous lookup is normally big enough, which
+        // saves the separate sizing call (it walks the whole table too, so it costs about as
+        // much as the fetch itself).
+        size = g_pidtbl_cap;
+        rc = OWNER_CALL(g_pidtbl_buf, &size);
+        if (rc == NO_ERROR) return g_pidtbl_buf;
+        if (rc != ERROR_INSUFFICIENT_BUFFER) return NULL;
+    }
+    else
+    {
+        rc = OWNER_CALL(NULL, &size);
+        if (rc != ERROR_INSUFFICIENT_BUFFER && rc != NO_ERROR) return NULL;
+    }
+    for (int attempt = 0; attempt < 4; attempt++)
+    {
+        size += size / 4 + 4096;
+        void *t = pidtbl_reserve(size);
+        if (t == NULL) return NULL;
+        DWORD got = size;
+        rc = OWNER_CALL(t, &got);
+        if (rc == NO_ERROR) return t;
+        if (rc != ERROR_INSUFFICIENT_BUFFER) return NULL;
+        size = got;   // grew again: retry with the size it asked for
+    }
+    return NULL;
+#undef OWNER_CALL
+}
+
+DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port)
+{
+    // check cache first
+    DWORD cached_pid = get_cached_pid(src_ip, src_port, FALSE);
+    if (cached_pid != 0)
+        return cached_pid;
+
+    DWORD pid = sockmap_lookup_tcp(src_port);
+    if (pid != 0)
+    {
+        cache_pid(src_ip, src_port, pid, FALSE);
+        return pid;
+    }
+    sockmap_note_scan();
+
+    MIB_TCPTABLE_OWNER_PID *tcp_table = (MIB_TCPTABLE_OWNER_PID *)owner_table_fetch(FALSE, AF_INET);
+    if (tcp_table == NULL)
+    {
+        return 0;
+    }
+
+    for (DWORD i = 0; i < tcp_table->dwNumEntries; i++)
+    {
+        MIB_TCPROW_OWNER_PID *row = &tcp_table->table[i];
+
+        // Skip rows with no owner. A closed connection in TIME_WAIT keeps its local
+        // address:port with PID 0; when Windows reuses that ephemeral port for a new
+        // connection both rows are listed, and taking the TIME_WAIT one made the new
+        // connection look unowned (-> DIRECT, never logged).
+        if (row->dwOwningPid == 0)
+            continue;
+
+        if (row->dwLocalAddr == src_ip &&
+            ntohs((UINT16)row->dwLocalPort) == src_port)
+        {
+            pid = row->dwOwningPid;
+            break;
+        }
+    }
+
+    // store cache the result
+    if (pid != 0)
+        cache_pid(src_ip, src_port, pid, FALSE);
+
+    return pid;
+}
+
+// Get process ID for UDP connection
+DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port)
+{
+    DWORD cached_pid = get_cached_pid(src_ip, src_port, TRUE);
+    if (cached_pid != 0)
+        return cached_pid;
+
+    DWORD pid = 0;
+
+    MIB_UDPTABLE_OWNER_PID *udp_table = (MIB_UDPTABLE_OWNER_PID *)owner_table_fetch(TRUE, AF_INET);
+    if (udp_table == NULL)
+    {
+        return 0;
+    }
+
+    // First pass: Try exact match (IP + port)
+    for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
+    {
+        MIB_UDPROW_OWNER_PID *row = &udp_table->table[i];
+
+        if (row->dwLocalAddr == src_ip &&
+            ntohs((UINT16)row->dwLocalPort) == src_port)
+        {
+            pid = row->dwOwningPid;
+            break;
+        }
+    }
+
+    // Second pass: If not found, try matching port on 0.0.0.0 (INADDR_ANY)
+    // Many UDP applications bind to 0.0.0.0:port instead of specific IP
+    if (pid == 0)
+    {
+        for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
+        {
+            MIB_UDPROW_OWNER_PID *row = &udp_table->table[i];
+
+            if (row->dwLocalAddr == 0 &&  // 0.0.0.0 (INADDR_ANY)
+                ntohs((UINT16)row->dwLocalPort) == src_port)
+            {
+                pid = row->dwOwningPid;
+                break;
+            }
+        }
+    }
+
+    if (pid != 0)
+        cache_pid(src_ip, src_port, pid, TRUE);
+
+    return pid;
+}
+
+DWORD get_process_id_from_connection_v6(const UINT8 src_ip6[16], UINT16 src_port)
+{
+    DWORD pid = sockmap_lookup_tcp(src_port);
+    if (pid != 0) return pid;
+    sockmap_note_scan();
+
+    MIB_TCP6TABLE_OWNER_PID *tcp_table = (MIB_TCP6TABLE_OWNER_PID *)owner_table_fetch(FALSE, AF_INET6);
+    if (!tcp_table) return 0;
+    for (DWORD i = 0; i < tcp_table->dwNumEntries; i++)
+    {
+        MIB_TCP6ROW_OWNER_PID *row = &tcp_table->table[i];
+        if (row->dwOwningPid == 0) continue;   // TIME_WAIT leftover of a reused port (see IPv4)
+        if (ntohs((UINT16)row->dwLocalPort) == src_port &&
+            memcmp(row->ucLocalAddr, src_ip6, 16) == 0)
+        {
+            pid = row->dwOwningPid;
+            break;
+        }
+    }
+    return pid;   // buffer is reused, not freed
+}
+
+DWORD get_process_id_from_udp_connection_v6(const UINT8 src_ip6[16], UINT16 src_port)
+{
+    DWORD pid = 0;
+
+    MIB_UDP6TABLE_OWNER_PID *udp_table = (MIB_UDP6TABLE_OWNER_PID *)owner_table_fetch(TRUE, AF_INET6);
+    if (udp_table)
+    {
+        for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
+        {
+            MIB_UDP6ROW_OWNER_PID *row = &udp_table->table[i];
+            if (ntohs((UINT16)row->dwLocalPort) == src_port &&
+                (memcmp(row->ucLocalAddr, src_ip6, 16) == 0 ||
+                 memcmp(row->ucLocalAddr, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0))
+            {
+                pid = row->dwOwningPid;
+                break;
+            }
+        }
+    }
+    return pid;   // buffer is reused, not freed
+}
+
+// Basename of a running process from a toolhelp snapshot. Used when the process cannot be
+// opened (access denied, protected process) so the rule engine can still match it by name
+// instead of letting the connection fall through as DIRECT.
+static BOOL process_basename_from_snapshot(DWORD pid, char *name, DWORD name_size)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return FALSE;
+    PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
+    BOOL found = FALSE;
+    if (Process32FirstW(snap, &pe))
+    {
+        do {
+            if (pe.th32ProcessID == pid)
+            {
+                found = WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, name, (int)name_size, NULL, NULL) > 0;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size)
+{
+    HANDLE hProcess;
+    WCHAR full_path_w[MAX_PATH];
+    DWORD path_len = MAX_PATH;
+
+    if (pid == 0)
+    {
+        return FALSE;
+    }
+
+    // ERROR in getting process name for PID 4 reserved by system
+    // SMB is managed by system process
+    if (pid == 4)
+    {
+        strncpy_s(name, name_size, "System", _TRUNCATE);
+        return TRUE;
+    }
+
+    hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess == NULL)
+    {
+        return process_basename_from_snapshot(pid, name, name_size);
+    }
+
+    if (QueryFullProcessImageNameW(hProcess, 0, full_path_w, &path_len))
+    {
+        // Convert wide string to UTF-8 so Chinese/non-ASCII paths are preserved
+        int converted = WideCharToMultiByte(CP_UTF8, 0, full_path_w, -1, name, (int)name_size, NULL, NULL);
+        CloseHandle(hProcess);
+        return converted > 0;
+    }
+
+    CloseHandle(hProcess);
+    return process_basename_from_snapshot(pid, name, name_size);
+}
+
+//  cache pid
+// This can be imprroved
+// Need to work on this before releease for potential collusion
+// need to remove unwanted entires from table
+UINT32 pid_cache_hash(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
+{
+    UINT32 hash = src_ip ^ ((UINT32)src_port << 16) ^ (is_udp ? 0x80000000 : 0);
+    return hash % PID_CACHE_SIZE;
+}
+
+DWORD get_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
+{
+    UINT32 hash = pid_cache_hash(src_ip, src_port, is_udp);
+    ULONGLONG current_time = GetTickCount64();
+    DWORD pid = 0;
+
+    AcquireSRWLockShared(&lock);
+
+    PID_CACHE_ENTRY *entry = pid_cache[hash];
+    while (entry != NULL)
+    {
+        if (entry->src_ip == src_ip &&
+            entry->src_port == src_port &&
+            entry->is_udp == is_udp)
+        {
+            pid = (current_time - entry->timestamp < PID_CACHE_TTL_MS) ? entry->pid : 0;
+            break;
+        }
+        entry = entry->next;
+    }
+
+    ReleaseSRWLockShared(&lock);
+    return pid;
+}
+
+void cache_pid(UINT32 src_ip, UINT16 src_port, DWORD pid, BOOL is_udp)
+{
+    UINT32 hash = pid_cache_hash(src_ip, src_port, is_udp);
+    ULONGLONG current_time = GetTickCount64();
+
+    AcquireSRWLockExclusive(&lock);
+
+    PID_CACHE_ENTRY *entry = pid_cache[hash];
+    while (entry != NULL)
+    {
+        if (entry->src_ip == src_ip &&
+            entry->src_port == src_port &&
+            entry->is_udp == is_udp)
+        {
+            entry->pid = pid;
+            entry->timestamp = current_time;
+            ReleaseSRWLockExclusive(&lock);
+            return;
+        }
+        entry = entry->next;
+    }
+
+    PID_CACHE_ENTRY *new_entry = (PID_CACHE_ENTRY *)malloc(sizeof(PID_CACHE_ENTRY));
+    if (new_entry != NULL)
+    {
+        new_entry->src_ip = src_ip;
+        new_entry->src_port = src_port;
+        new_entry->pid = pid;
+        new_entry->timestamp = current_time;
+        new_entry->is_udp = is_udp;
+        new_entry->next = pid_cache[hash];
+        pid_cache[hash] = new_entry;
+    }
+
+    ReleaseSRWLockExclusive(&lock);
+}
+
+void clear_pid_cache(void)
+{
+    AcquireSRWLockExclusive(&lock);
+
+    for (int i = 0; i < PID_CACHE_SIZE; i++)
+    {
+        while (pid_cache[i] != NULL)
+        {
+            PID_CACHE_ENTRY *to_free = pid_cache[i];
+            pid_cache[i] = pid_cache[i]->next;
+            free(to_free);
+        }
+    }
+
+    ReleaseSRWLockExclusive(&lock);
+}
+
+// Evict the cached PID for a specific (src_ip, src_port). Called when a new TCP
+// connection begins (fresh SYN) on a port: Windows reuses ephemeral ports, so any
+// PID cached for that port may belong to the previous, now-closed process. Without
+// this, a reused port could be matched against the wrong application's rule for up to
+// PID_CACHE_TTL_MS. Forcing a re-lookup here keeps the decision correct.
+void remove_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
+{
+    UINT32 hash = pid_cache_hash(src_ip, src_port, is_udp);
+
+    AcquireSRWLockExclusive(&lock);
+    PID_CACHE_ENTRY **pp = &pid_cache[hash];
+    while (*pp != NULL)
+    {
+        if ((*pp)->src_ip == src_ip && (*pp)->src_port == src_port && (*pp)->is_udp == is_udp)
+        {
+            PID_CACHE_ENTRY *to_free = *pp;
+            *pp = (*pp)->next;
+            free(to_free);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+// Prune expired PID-cache entries so the table doesn't grow without bound over a long
+// session (entries were previously only ignored on lookup, never freed).
+void cleanup_stale_pid_cache(void)
+{
+    ULONGLONG now = GetTickCount64();
+
+    AcquireSRWLockExclusive(&lock);
+    for (int i = 0; i < PID_CACHE_SIZE; i++)
+    {
+        PID_CACHE_ENTRY **pp = &pid_cache[i];
+        while (*pp != NULL)
+        {
+            if (now - (*pp)->timestamp >= PID_CACHE_TTL_MS)
+            {
+                PID_CACHE_ENTRY *to_free = *pp;
+                *pp = (*pp)->next;
+                free(to_free);
+            }
+            else
+            {
+                pp = &(*pp)->next;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+

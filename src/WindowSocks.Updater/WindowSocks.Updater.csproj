@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+ <PropertyGroup><OutputType>WinExe</OutputType><UseWindowsForms>true</UseWindowsForms><ApplicationManifest>app.manifest</ApplicationManifest></PropertyGroup>
+ <ItemGroup><ProjectReference Include="../WindowSocks.Core/WindowSocks.Core.csproj"/><PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.0"/></ItemGroup>
+</Project>

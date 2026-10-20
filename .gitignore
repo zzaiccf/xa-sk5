@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+artifacts/
+.vs/
+third_party/*.zip
+third_party/WinDivert-2.2.2-A/
+*.user
+*.log
+*.pfx
+*.secrets.json

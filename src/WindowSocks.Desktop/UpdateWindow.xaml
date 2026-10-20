@@ -1,0 +1,16 @@
+<Window x:Class="WindowSocks.Desktop.UpdateWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="xa sk5 · 檢查更新" Width="700" Height="650" MinWidth="610" MinHeight="520" WindowStartupLocation="CenterOwner" Style="{StaticResource {x:Type Window}}">
+ <Grid Margin="26"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <StackPanel><TextBlock Text="軟體更新" FontSize="23" FontWeight="SemiBold"/><TextBlock Text="手動檢查，確認後才下載及安裝。" Foreground="{StaticResource Muted}" Margin="0,7,0,18"/></StackPanel>
+  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto"><StackPanel>
+   <Border Style="{StaticResource Card}" Padding="18"><Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions><StackPanel><TextBlock Text="目前版本" Style="{StaticResource FieldLabel}"/><TextBlock x:Name="CurrentVersionText" FontSize="20"/></StackPanel><StackPanel Grid.Column="1"><TextBlock Text="發布版本" Style="{StaticResource FieldLabel}"/><TextBlock x:Name="AvailableVersionText" Text="尚未檢查" FontSize="20"/></StackPanel></Grid></Border>
+   <TextBlock x:Name="UpdateStatus" Text="按「檢查最新版本」取得發布資訊。" TextWrapping="Wrap" Margin="0,18,0,8" AutomationProperties.LiveSetting="Polite"/>
+   <ProgressBar x:Name="DownloadProgress" Height="5" Minimum="0" Maximum="100" Visibility="Collapsed" Margin="0,0,0,12"/>
+   <TextBlock x:Name="ReleaseDetails" TextWrapping="Wrap" Foreground="{StaticResource Muted}" FontSize="12"/>
+   <TextBox x:Name="ReleaseNotes" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" MinHeight="90" MaxHeight="180" Margin="0,12,0,12" Visibility="Collapsed"/>
+   <Border Background="#FFF6E7" CornerRadius="8" Padding="13" Margin="0,6,0,14"><TextBlock x:Name="ImpactText" TextWrapping="Wrap" FontSize="12" Text="升級會關閉並重新開啟 xa sk5。替換前會備份原程式；代理與模擬器配置會保留。"/></Border>
+   <CheckBox x:Name="UpdateService" Content="一併更新已安裝的背景服務（需要 Windows 管理員授權）" Checked="ServiceSelectionChanged" Unchecked="ServiceSelectionChanged" Margin="0,0,0,14"/>
+   <Expander Header="更新來源與離線更新"><StackPanel Margin="2,12,2,2"><TextBlock Text="HTTPS 版本資訊網址" Style="{StaticResource FieldLabel}"/><TextBox x:Name="SourceText" TextChanged="SourceChanged" ToolTip="只接受 HTTPS；請只使用你信任的發布者網址。"/><TextBlock Text="變更來源後須重新檢查。離線更新請選擇與 ZIP 放在一起的 latest.json。" FontSize="11" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,7,0,10"/><WrapPanel><Button x:Name="LocalCheck" Content="從檔案檢查…" Click="LocalCheckClick"/><Button x:Name="RecoverButton" Content="回復上次更新" Click="RecoverClick"/></WrapPanel></StackPanel></Expander>
+  </StackPanel></ScrollViewer>
+  <WrapPanel Grid.Row="2" HorizontalAlignment="Right" Margin="0,20,0,0"><Button x:Name="CancelDownload" Content="取消下載" Click="CancelClick" Visibility="Collapsed"/><Button x:Name="CheckButton" Content="檢查最新版本" Click="CheckClick"/><Button x:Name="UpgradeButton" Content="升級" Click="UpgradeClick" IsEnabled="False" Style="{StaticResource PrimaryButton}" Margin="0"/></WrapPanel>
+ </Grid>
+</Window>

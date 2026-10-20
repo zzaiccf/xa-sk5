@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>WinExe</OutputType><UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><AssemblyName>WindowSocks</AssemblyName><ImplicitUsings>disable</ImplicitUsings></PropertyGroup>
+  <PropertyGroup><ApplicationIcon>Assets\Brand\xa-sk5.ico</ApplicationIcon></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../WindowSocks.Core/WindowSocks.Core.csproj" /></ItemGroup>
+  <ItemGroup><Resource Include="Assets\Brand\xa-sk5.ico" /></ItemGroup>
+</Project>

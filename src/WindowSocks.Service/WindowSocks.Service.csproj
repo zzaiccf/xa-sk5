@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup><OutputType>Exe</OutputType><AssemblyName>WindowSocks.Service</AssemblyName></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../WindowSocks.Core/WindowSocks.Core.csproj" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.0" />
+    <PackageReference Include="System.Management" Version="10.0.0" />
+  </ItemGroup>
+</Project>

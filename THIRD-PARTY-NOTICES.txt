@@ -1,0 +1,36 @@
+WindowSocks 0.1.2 — Third-party notices
+
+ProxyBridge
+https://github.com/InterceptSuite/ProxyBridge
+Pinned commit: d697164b836f0d3f897128774d3cb72e54770e74
+MIT license. Copyright notice and full license are preserved in
+third_party/ProxyBridge/LICENSE (source) or licenses/ProxyBridge-MIT.txt (package).
+The native library incorporates pb_util.c and pb_socks5.c with modifications.
+See docs/UPSTREAM-CHANGES.md in the supplied source.
+
+WinDivert 2.2.2
+https://github.com/basil00/WinDivert/tree/v2.2.2
+Public header copyright: (C) 2019, all rights reserved (as supplied upstream).
+WinDivert is dual licensed LGPLv3 / GPLv2. This application chooses LGPLv3.
+Full LGPLv3, GPLv3 and GPLv2 texts accompany this package in
+licenses/WinDivert-LICENSE.txt (source: native/include/WinDivert-LICENSE.txt).
+The unmodified public header is used to define the dynamically loaded ABI.
+The present preview package does NOT contain WinDivert.dll or WinDivert64.sys.
+An interface-compatible DLL can be used without relinking the application.
+No restriction is imposed on modification or reverse engineering for debugging
+modifications to the LGPL-covered library. The original source is available at
+the pinned upstream link above.
+
+.NET 10, Windows Desktop Runtime, Microsoft.Extensions.*, System.Management,
+System.Security.Cryptography.ProtectedData, System.IO.Pipes.AccessControl
+Microsoft and .NET Foundation contributors — MIT license and respective notices.
+https://github.com/dotnet/runtime/blob/v10.0.0/LICENSE.TXT
+https://github.com/dotnet/runtime/blob/v10.0.0/THIRD-PARTY-NOTICES.TXT
+Runtime, WPF and Windows Forms license/third-party notices are supplied in
+licenses/DotNet-*, licenses/WPF-* and licenses/WinForms-*.
+
+Development-only dependencies: xUnit.net (Apache-2.0), Visual Studio xUnit runner
+(Apache-2.0), Microsoft.NET.Test.Sdk (MIT). Test binaries are not installed.
+
+LDPlayer is a third-party product. This project is not affiliated with its vendor.
+Only its installed command-line interface and read-only configuration are used.
