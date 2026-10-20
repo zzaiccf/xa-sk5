@@ -25,7 +25,6 @@ try {
         $verify = Start-Process -FilePath $setup -ArgumentList '--verify-payload' -Wait -PassThru -WindowStyle Hidden
         if ($verify.ExitCode) { throw 'Final installer embedded payload verification failed.' }
     }
-    & "$PSScriptRoot/Export-ReleaseSource.ps1" -Destination (Join-Path $release "xa-sk5-$version-source.zip")
     $manifest = [ordered]@{
         schemaVersion = 1; version = $version; publishedAt = [DateTimeOffset]::UtcNow.ToString('O')
         notes = [IO.File]::ReadAllText((Join-Path $repoRoot "release/notes-$version.txt"))

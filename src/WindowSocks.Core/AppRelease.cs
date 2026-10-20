@@ -129,6 +129,8 @@ public static class AppReleasePackage
 
 public sealed class ReleaseClient : IDisposable
 {
+    public const string DefaultSource = "https://api.github.com/repos/zzaiccf/xa-sk5/releases/latest";
+    public const string LegacyDefaultSource = "https://github.com/zzaiccf/xa-sk5/releases/latest/download/latest.json";
     private readonly HttpClient client;
     public ReleaseClient(HttpMessageHandler? handler = null)
     {
@@ -145,8 +147,40 @@ public sealed class ReleaseClient : IDisposable
     {
         var uri = new Uri(source, url); if (!AllowedLocation(source, uri)) throw new InvalidDataException("下載網址不在此發布來源的允許主機。"); return uri;
     }
-    public static bool AllowedLocation(Uri source, Uri uri) => AllowedHttps(uri) && (uri.Host.Equals(source.Host, StringComparison.OrdinalIgnoreCase) ||
-        (source.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) && new[] { "release-assets.githubusercontent.com", "objects.githubusercontent.com" }.Contains(uri.Host, StringComparer.OrdinalIgnoreCase)));
+    private static string? GitHubRepository(Uri source)
+    {
+        var parts = source.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return source.Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase) && parts.Length == 5 && parts[0] == "repos" && parts[3] == "releases" && parts[4] == "latest"
+            ? parts[1] + "/" + parts[2] : null;
+    }
+    public static bool AllowedLocation(Uri source, Uri uri)
+    {
+        if (!AllowedHttps(uri)) return false;
+        if (uri.Host.Equals(source.Host, StringComparison.OrdinalIgnoreCase)) return true;
+        string? repository = GitHubRepository(source);
+        if (repository is not null && uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
+            return uri.AbsolutePath.StartsWith("/" + repository + "/releases/download/", StringComparison.OrdinalIgnoreCase);
+        return (source.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) || repository is not null) &&
+            new[] { "release-assets.githubusercontent.com", "objects.githubusercontent.com" }.Contains(uri.Host, StringComparer.OrdinalIgnoreCase);
+    }
+    private static AppRelease ReadGitHubRelease(string json)
+    {
+        try {
+            using var document = JsonDocument.Parse(json); var root = document.RootElement;
+            if (root.GetProperty("draft").GetBoolean() || root.GetProperty("prerelease").GetBoolean()) throw new InvalidDataException("此發布尚未公開或屬於測試版。");
+            string tag = root.GetProperty("tag_name").GetString() ?? "";
+            string version = tag.StartsWith('v') ? tag[1..] : tag; _ = AppReleasePackage.ParseVersion(version);
+            string filename = $"xa-sk5-{version}-win-x64.zip";
+            var assets = root.GetProperty("assets").EnumerateArray().Where(asset => asset.GetProperty("name").GetString() == filename).ToArray();
+            if (assets.Length != 1 || assets[0].GetProperty("state").GetString() != "uploaded") throw new InvalidDataException("發布缺少完整的可攜更新檔案。");
+            var asset = assets[0]; string digest = asset.GetProperty("digest").GetString() ?? "";
+            if (!digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("GitHub 發布缺少 SHA-256，沒有下載或安裝。");
+            var release = new AppRelease(1, version, root.GetProperty("published_at").GetDateTimeOffset(), root.GetProperty("body").GetString() ?? "",
+                new(asset.GetProperty("browser_download_url").GetString() ?? "", asset.GetProperty("size").GetInt64(), digest[7..]));
+            return AppReleasePackage.Read(JsonSerializer.Serialize(release, Json.Options));
+        }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or FormatException) { throw new InvalidDataException("GitHub 發布資訊不完整，請稍後重新檢查。", ex); }
+    }
     private async Task<HttpResponseMessage> Get(Uri source, Uri uri, CancellationToken ct)
     {
         for (int i = 0; i < 6; i++) {
@@ -164,7 +198,9 @@ public sealed class ReleaseClient : IDisposable
         using var data = new MemoryStream(); await using var input = await response.Content.ReadAsStreamAsync(ct);
         byte[] buffer = new byte[16384];
         while (true) { int read = await input.ReadAsync(buffer, ct); if (read == 0) break; if (data.Length + read > 128 * 1024) throw new InvalidDataException("版本資訊超過大小限制。"); data.Write(buffer, 0, read); }
-        var release = AppReleasePackage.Read(System.Text.Encoding.UTF8.GetString(data.ToArray()).TrimStart('\uFEFF')); _ = AssetUri(source, release.Portable.Url); return release;
+        string json = System.Text.Encoding.UTF8.GetString(data.ToArray()).TrimStart('\uFEFF');
+        var release = GitHubRepository(source) is not null ? ReadGitHubRelease(json) : AppReleasePackage.Read(json);
+        _ = AssetUri(source, release.Portable.Url); return release;
     }
     public async Task DownloadAsync(Uri source, AppRelease release, string destination, IProgress<UpdateProgress>? progress, CancellationToken ct)
     {

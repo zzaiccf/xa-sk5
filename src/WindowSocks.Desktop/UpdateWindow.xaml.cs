@@ -32,6 +32,7 @@ public partial class UpdateWindow : Window
         try {
             string file = File.Exists(this.preferencesFile) ? this.preferencesFile : Path.Combine(AppContext.BaseDirectory, "update-source.json");
             if (File.Exists(file)) SourceText.Text = JsonSerializer.Deserialize<SourcePreference>(File.ReadAllText(file), Json.Options)?.ManifestUrl ?? "";
+            if (SourceText.Text.Equals(ReleaseClient.LegacyDefaultSource, StringComparison.OrdinalIgnoreCase)) SourceText.Text = ReleaseClient.DefaultSource;
         } catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { UpdateStatus.Text = "無法讀取更新來源，請在下方重新設定。"; }
         Closing += (_, e) => { if (working) { cancellation?.Cancel(); e.Cancel = true; UpdateStatus.Text = "正在取消準備，請稍候…"; } };
         Closed += (_, _) => { cancellation?.Dispose(); client.Dispose(); };

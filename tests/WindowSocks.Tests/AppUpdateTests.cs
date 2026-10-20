@@ -75,6 +75,33 @@ public sealed class AppUpdateTests : IDisposable
         await Assert.ThrowsAsync<IOException>(() => client.CheckAsync(new("https://updates.example/latest.json"), default));
         using var offline = new ReleaseClient(new Handler(_ => throw new HttpRequestException("synthetic network outage"))); await Assert.ThrowsAsync<HttpRequestException>(() => offline.CheckAsync(new("https://updates.example/latest.json"), default));
     }
+    [Fact] public async Task GitHubReleaseProvidesVersionDigestAndPortableWithoutJsonAsset()
+    {
+        byte[] bytes = [1, 2, 3];
+        using var client = new ReleaseClient(new Handler(uri => uri.Host == "api.github.com" ? new(GitHubRelease(bytes)) : new(bytes)));
+        var source = ReleaseClient.SourceUri(ReleaseClient.DefaultSource);
+        var release = await client.CheckAsync(source, default); Assert.Equal("0.1.16", release.Version); Assert.Equal(Convert.ToHexString(SHA256.HashData(bytes)), release.Portable.Sha256);
+        string destination = Path.Combine(root, "github.zip"); await client.DownloadAsync(source, release, destination, null, default); Assert.Equal(bytes, File.ReadAllBytes(destination));
+    }
+    [Theory] [InlineData(null)] [InlineData("md5:123")] [InlineData("sha256:bad")]
+    public async Task GitHubReleaseRequiresSha256(string? digest)
+    {
+        using var client = new ReleaseClient(new Handler(_ => new(GitHubRelease([1, 2, 3], digest, overrideDigest: true))));
+        await Assert.ThrowsAsync<InvalidDataException>(() => client.CheckAsync(ReleaseClient.SourceUri(ReleaseClient.DefaultSource), default));
+    }
+    [Theory] [InlineData(true, false)] [InlineData(false, true)]
+    public async Task GitHubDraftsAndPrereleasesAreRejected(bool draft, bool prerelease)
+    {
+        using var client = new ReleaseClient(new Handler(_ => new(GitHubRelease([1, 2, 3], draft: draft, prerelease: prerelease))));
+        await Assert.ThrowsAsync<InvalidDataException>(() => client.CheckAsync(ReleaseClient.SourceUri(ReleaseClient.DefaultSource), default));
+    }
+    [Fact] public void GitHubApiSourceRestrictsDownloadRepositoryAndTransport()
+    {
+        var source = ReleaseClient.SourceUri(ReleaseClient.DefaultSource);
+        Assert.True(ReleaseClient.AllowedLocation(source, new("https://github.com/zzaiccf/xa-sk5/releases/download/v0.1.16/update.zip")));
+        Assert.True(ReleaseClient.AllowedLocation(source, new("https://release-assets.githubusercontent.com/file")));
+        foreach (string url in new[] { "https://github.com/other/xa-sk5/releases/download/v0.1.16/update.zip", "https://github.com/zzaiccf/other/releases/download/v0.1.16/update.zip", "http://github.com/zzaiccf/xa-sk5/releases/download/v0.1.16/update.zip", "https://evil.example/file" }) Assert.False(ReleaseClient.AllowedLocation(source, new(url)));
+    }
     [Theory] [InlineData("../outside.exe")] [InlineData("settings.dpapi")] [InlineData("owner.sid")] [InlineData("nested/test.exe")]
     public void InvalidZipIsRejectedBeforeExtraction(string name)
     {
@@ -153,6 +180,13 @@ public sealed class AppUpdateTests : IDisposable
     }
     private string Target() { string path = Path.Combine(root, "target"); Directory.CreateDirectory(path); File.WriteAllText(Path.Combine(path, "WindowSocks.exe"), "old"); return path; }
     private static AppRelease Release(byte[]? bytes = null) { bytes ??= [1, 2, 3]; return new(1, "0.1.15", DateTimeOffset.Parse("2026-10-20T00:00:00Z"), "Synthetic update", new("update.zip", bytes.Length, Convert.ToHexString(SHA256.HashData(bytes)))); }
+    private static string GitHubRelease(byte[] bytes, string? digest = null, bool overrideDigest = false, bool draft = false, bool prerelease = false) => JsonSerializer.Serialize(new {
+        tag_name = "v0.1.16", published_at = DateTimeOffset.Parse("2026-10-20T00:00:00Z"), body = "Two binary assets", draft, prerelease,
+        assets = new object[] {
+            new { name = "xa-sk5-0.1.16-win-x64.zip", state = "uploaded", digest = overrideDigest ? digest : "sha256:" + Convert.ToHexString(SHA256.HashData(bytes)), size = bytes.Length, browser_download_url = "https://github.com/zzaiccf/xa-sk5/releases/download/v0.1.16/xa-sk5-0.1.16-win-x64.zip" },
+            new { name = "xa-sk5-Setup-0.1.16.exe", state = "uploaded" }
+        }
+    });
     private sealed record Content
     {
         public byte[] Bytes { get; } = [];

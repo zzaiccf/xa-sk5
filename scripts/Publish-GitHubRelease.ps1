@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $version = ([xml](Get-Content -LiteralPath "$repoRoot/Directory.Build.props" -Raw)).Project.PropertyGroup.Version
 $release = if ($ReleaseDirectory) { [IO.Path]::GetFullPath($ReleaseDirectory, $repoRoot) } else { Join-Path $repoRoot "artifacts/release/$version" }
-$expected = @("xa-sk5-$version-win-x64.zip","xa-sk5-Setup-$version.exe","xa-sk5-$version-source.zip",'latest.json','SHA256SUMS.txt')
+$expected = @("xa-sk5-$version-win-x64.zip","xa-sk5-Setup-$version.exe")
 foreach ($name in $expected) { if (!(Test-Path -LiteralPath (Join-Path $release $name))) { throw "Missing release asset: $name" } }
 $manifest = Get-Content -LiteralPath (Join-Path $release 'latest.json') -Raw | ConvertFrom-Json
 if ($manifest.version -ne $version) { throw 'Manifest version mismatch.' }
