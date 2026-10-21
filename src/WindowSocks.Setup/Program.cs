@@ -21,6 +21,11 @@ internal static partial class Program
         try
         {
             if (args.Contains("--verify-payload")) { VerifyEmbeddedPayload(); return 0; }
+            bool maintenance = Assembly.GetExecutingAssembly().GetName().Name == "WindowSocks.Maintenance";
+            if (!maintenance && !args.Any(a => a is "--setup-worker" or "--uninstall" or "--set-startup" or "--start-service" or "--install-components")) {
+                using var wizard = new SetupWizardForm(args.Contains("--update"));
+                Application.Run(wizard); return wizard.Result;
+            }
             if (!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator)) {
                 var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = true, Verb = "runas" };
                 foreach (string argument in args) start.ArgumentList.Add(argument);
@@ -30,22 +35,17 @@ internal static partial class Program
             }
             int ownerIndex = Array.IndexOf(args, "--owner-sid");
             if (ownerIndex >= 0) { if (ownerIndex + 1 >= args.Length) throw new ArgumentException("缺少安裝使用者。"); var owner = new SecurityIdentifier(args[ownerIndex + 1]); if (!owner.IsAccountSid()) throw new ArgumentException("無效安裝使用者。"); _ = owner.Translate(typeof(NTAccount)); installOwnerSid = owner.Value; }
+            if (args.Contains("--setup-worker")) return RunSetupWorker(args);
             if (args.Contains("--set-startup") || args.Contains("--start-service")) {
                 RunStartupCommand(args); return 0;
             }
             if (args.Contains("--uninstall")) { Uninstall(); return 0; }
             if (args.Contains("--install-components") || Assembly.GetExecutingAssembly().GetName().Name == "WindowSocks.Maintenance") return RunComponentInstaller(args);
-            bool update = args.Contains("--update");
-            if (update && !File.Exists(Path.Combine(InstallDirectory, "WindowSocks.Service.exe"))) throw new InvalidOperationException("找不到可更新的安裝，請執行一般安裝模式。");
-            if (MessageBox.Show($"將{(update ? "更新" : "安裝")}「xa sk5」{ProductVersion} 與背景服務。\n\n更新前請從系統匣結束已安裝的 xa sk5。程式會先備份再替換，加密設定與各項配置會保留。\n\n背景服務會暫停及重啟，代理連線將中斷，遊戲可能需要自行重新連線。遊戲、模擬器及遠控程式會繼續執行。", "xa sk5 安裝", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return 0;
-            InstallEmbeddedPayload();
-            bool driver = File.Exists(Path.Combine(InstallDirectory, "WinDivert64.sys"));
-            if (!update) MessageBox.Show("安裝完成。請從開始功能表開啟「xa sk5」。\n\n" + (driver ? "請先檢測代理，再分配實例。" : "請到「診斷與設定 → 安裝／修復代理元件」下載及安裝官方驅動，並完成載入測試。") + "\n\n若已有離線代理設定，可在診斷頁移交至背景服務。", "xa sk5", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return 0;
+            throw new ArgumentException("無效的安裝指令。");
         }
         catch (Exception ex) {
             if (args.Contains("--set-startup") || args.Contains("--start-service")) { Console.Error.WriteLine(ex.Message); return ex is AggregateException ? 6 : 5; }
-            if (args.Contains("--verify-payload")) Console.Error.WriteLine(ex.Message); else MessageBox.Show(ex.Message, "xa sk5 安裝未完成", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1;
+            if (args.Contains("--verify-payload") || args.Contains("--setup-worker")) Console.Error.WriteLine(ex.Message); else MessageBox.Show(ex.Message, "xa sk5 安裝未完成", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1;
         }
     }
     private static void RunStartupCommand(string[] args)
@@ -60,8 +60,9 @@ internal static partial class Program
         using var user = Registry.Users.OpenSubKey(installOwnerSid, true) ?? throw new IOException("找不到安裝使用者的登入設定。");
         StartupConfiguration.Apply(new StartupRegistry(user), service, exe, enabled);
     }
-    private static void RegisterServiceAndShell(string uninstall)
+    private static void RegisterServiceAndShell(string uninstall, Action<string>? report = null)
     {
+            report?.Invoke("設定背景代理服務與開機啟動偏好…");
             string ownerFile = Path.Combine(DataDirectory, "owner.sid");
             string startupOwner = File.Exists(ownerFile) ? new SecurityIdentifier(File.ReadAllText(ownerFile).Trim()).Value : installOwnerSid;
             using var user = Registry.Users.OpenSubKey(startupOwner, true) ?? throw new IOException("找不到安裝使用者的登入設定，未改寫開機偏好。");
@@ -73,6 +74,7 @@ internal static partial class Program
             Run("sc.exe", ["failure", "WindowSocks", "reset=", "86400", "actions=", "restart/5000/restart/15000/restart/60000"]);
             Run("netsh.exe", ["advfirewall", "firewall", "delete", "rule", "name=WindowSocks relay"], false);
             foreach (var protocol in new[] { "TCP", "UDP" }) Run("netsh.exe", ["advfirewall", "firewall", "add", "rule", "name=WindowSocks relay", "dir=in", "action=allow", "program=" + Path.Combine(InstallDirectory, "WindowSocks.Service.exe"), "protocol=" + protocol, "profile=any"]);
+            report?.Invoke("建立桌面與開始功能表捷徑…");
             string shortcuts = Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms);
             string oldShortcut = Path.Combine(shortcuts, "窗流 WindowSocks.lnk");
             string mainExecutable = Path.Combine(InstallDirectory, File.Exists(Path.Combine(InstallDirectory, "xa sk5.exe")) ? "xa sk5.exe" : "WindowSocks.exe");
@@ -127,7 +129,12 @@ internal static partial class Program
     }
     private static void WaitForServiceStop()
     {
-        for (int i = 0; i < 30; i++) { if (Process.GetProcessesByName("WindowSocks.Service").Length == 0) return; Thread.Sleep(500); }
+        for (int i = 0; i < 30; i++) {
+            var processes = Process.GetProcessesByName("WindowSocks.Service");
+            foreach (var process in processes) process.Dispose();
+            if (processes.Length == 0) return;
+            Thread.Sleep(500);
+        }
         throw new IOException("背景服務尚未停止，沒有覆寫執行中的檔案。");
     }
     private static void Uninstall()

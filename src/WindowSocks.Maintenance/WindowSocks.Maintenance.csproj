@@ -1,4 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
  <PropertyGroup><OutputType>WinExe</OutputType><UseWindowsForms>true</UseWindowsForms><ApplicationManifest>../WindowSocks.Setup/app.manifest</ApplicationManifest></PropertyGroup>
  <ItemGroup><ProjectReference Include="../WindowSocks.Core/WindowSocks.Core.csproj"/><Compile Include="../WindowSocks.Setup/Program.cs" Link="Program.cs"/><Compile Include="../WindowSocks.Setup/ComponentInstaller.cs" Link="ComponentInstaller.cs"/><Compile Include="../WindowSocks.Setup/ReleaseInstaller.cs" Link="ReleaseInstaller.cs"/></ItemGroup>
+ <ItemGroup><Compile Include="../WindowSocks.Setup/SetupCoordinator.cs" Link="SetupCoordinator.cs"/><Compile Include="../WindowSocks.Setup/SetupWizardForm.cs" Link="SetupWizardForm.cs"/></ItemGroup>
 </Project>

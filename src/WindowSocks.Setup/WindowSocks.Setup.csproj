@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
- <PropertyGroup><OutputType>WinExe</OutputType><UseWindowsForms>true</UseWindowsForms><ApplicationManifest>app.manifest</ApplicationManifest><AssemblyName>WindowSocks-Setup</AssemblyName></PropertyGroup>
- <ItemGroup Condition="Exists('../../artifacts/package.zip')"><EmbeddedResource Include="../../artifacts/package.zip" LogicalName="payload.zip" /></ItemGroup>
+ <PropertyGroup><OutputType>WinExe</OutputType><UseWindowsForms>true</UseWindowsForms><ApplicationManifest>app.manifest</ApplicationManifest><AssemblyName>WindowSocks-Setup</AssemblyName><ApplicationIcon>../WindowSocks.Desktop/Assets/Brand/xa-sk5.ico</ApplicationIcon></PropertyGroup>
+ <PropertyGroup><SetupPayloadPath Condition="'$(SetupPayloadPath)' == ''">$(MSBuildThisFileDirectory)../../artifacts/package.zip</SetupPayloadPath></PropertyGroup>
+ <ItemGroup Condition="Exists('$(SetupPayloadPath)')"><EmbeddedResource Include="$(SetupPayloadPath)" LogicalName="payload.zip" /></ItemGroup>
  <ItemGroup><ProjectReference Include="../WindowSocks.Core/WindowSocks.Core.csproj"/></ItemGroup>
 </Project>
