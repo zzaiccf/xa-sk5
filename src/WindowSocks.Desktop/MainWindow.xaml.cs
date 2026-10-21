@@ -23,6 +23,7 @@ public partial class MainWindow : Window
     private readonly bool integrateShell;
     private bool startupChanging;
     private Snapshot? snapshot;
+    private Snapshot? lastConnectedSnapshot;
     private TargetInstance[] targets = [];
     private bool busy, quitting, picking;
     private readonly AutomaticProbeSchedule probeSchedule = new();
@@ -234,11 +235,7 @@ public partial class MainWindow : Window
         NetworkEvents.Text = snapshot.FlowEvents.Length == 0 ? "尚無連線事件。需要 0.1.7 以上背景服務；啟動遊戲後自動收集。" : string.Join(Environment.NewLine, snapshot.FlowEvents.TakeLast(40).Select(e => e.Label));
         AutoStatus.Text = snapshot.AutoProxy.Enabled ? "自動代理已開啟" : "手動模式";
         AutoStatus.ToolTip = snapshot.AutoProxyStatus;
-        GlobalStatus.Text = snapshot.GlobalProxy.Enabled ? "全局代理已開啟" : "全局未開啟";
-        GlobalStatus.ToolTip = snapshot.GlobalProxyStatus;
-        if (snapshot.GlobalProxy.Enabled && snapshot.Proxies.FirstOrDefault(p => p.Id == snapshot.GlobalProxy.ProxyId) is { } globalProfile)
-            GlobalStatus.ToolTip += "\n" + new ProxyNodeDisplay(globalProfile, snapshot.Probes.FirstOrDefault(p => p.ProxyId == globalProfile.Id)).Label;
-        StopGlobal.IsEnabled = backend.Online && snapshot.GlobalProxy.Enabled;
+        RenderGlobalProxy();
         StopProbe.IsEnabled = !probeSchedule.Paused && snapshot.Proxies.Length > 0;
         StopProbe.Visibility = probeSchedule.Paused ? Visibility.Collapsed : Visibility.Visible;
         ResumeProbe.Visibility = probeSchedule.Paused ? Visibility.Visible : Visibility.Collapsed;
@@ -265,6 +262,42 @@ public partial class MainWindow : Window
             ? "清單成功後每 30 分鐘複測、失敗後 5 分鐘重試。目前舊版背景服務仍有較頻繁的健康檢查，更新至 0.1.12 後會同步降低頻率。"
             : "開啟與匯入時檢測一次；成功後 30 分鐘複測，失敗後 5 分鐘重試。需要最新結果可按「立即檢測」。";
     }
+    private void RenderGlobalProxy()
+    {
+        if (snapshot is null) return;
+        var state = GlobalProxyDisplay.From(snapshot, backend.Online, lastConnectedSnapshot);
+        if (backend.Online && snapshot.Diagnostics.ServiceOnline) lastConnectedSnapshot = snapshot;
+        static System.Windows.Media.Brush Brush(string color) => new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(color));
+        var foreground = Brush(state.Foreground); var background = Brush(state.Background); var border = Brush(state.Border);
+        GlobalStatus.Text = GlobalHeading.Text = state.Title;
+        GlobalStatus.Foreground = GlobalHeading.Foreground = GlobalBannerIcon.Foreground = GlobalIndicator.Fill = foreground;
+        GlobalBadge.Background = GlobalBanner.Background = background;
+        GlobalBadge.BorderBrush = GlobalBanner.BorderBrush = border;
+        GlobalBadge.ToolTip = GlobalBanner.ToolTip = state.Detail;
+        GlobalBanner.Visibility = state.ShowBanner ? Visibility.Visible : Visibility.Collapsed;
+        System.Windows.Automation.AutomationProperties.SetName(GlobalBanner, state.Title + "。" + state.Hint);
+        GlobalHint.Text = state.Hint; GlobalNodeName.Text = state.NodeName;
+        GlobalNodeDetails.Visibility = state.ShowNode ? Visibility.Visible : Visibility.Collapsed;
+        GlobalExitLabel.Text = state.ExitLabel; GlobalExitIp.Text = state.ExitIp; GlobalExitIp.ToolTip = state.ExitHint;
+        GlobalAccountPort.Text = state.AccountPort; GlobalEntryIp.Text = state.EntryIp;
+        GlobalRemotePolicy.Text = state.RemotePolicy; GlobalLanPolicy.Text = state.LanPolicy;
+        GlobalRemotePolicy.Foreground = state.RemotePolicy.Contains("待", StringComparison.Ordinal) ? Brush("#A36D14") : foreground;
+        GlobalPolicies.Visibility = state.RemotePolicy.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        StopGlobal.IsEnabled = StopGlobalBanner.IsEnabled = state.CanStop;
+        ManageGlobal.IsEnabled = backend.Online && snapshot.Proxies.Length > 0;
+        GlobalProxyButton.Content = snapshot.GlobalProxy.Enabled && backend.Online ? "全局設定" : "全局代理";
+        TargetEmptyTitle.Text = snapshot.GlobalProxy.Enabled ? "尚無個別管理的窗口" : "尚無管理中的窗口";
+        TargetEmptyHint.Text = snapshot.GlobalProxy.Enabled ? "全局模式會依上方狀態處理其餘程式流量。" : "設定自動代理，或從「更多」加入程序。";
+        Title = state.ShowBanner ? "xa sk5 · " + state.Title : "xa sk5";
+        tray.Text = "xa sk5 · " + state.Title;
+        UpdateSummaryCards();
+    }
+    private void WorkspaceSizeChanged(object sender, SizeChangedEventArgs e) => UpdateSummaryCards();
+    private void UpdateSummaryCards()
+    {
+        if (SummaryCards is null || Pages is null || GlobalBanner is null) return;
+        SummaryCards.Visibility = Pages.SelectedIndex == 2 || GlobalBanner.Visibility == Visibility.Visible && Workspace.ActualHeight is > 0 and < 650 ? Visibility.Collapsed : Visibility.Visible;
+    }
     private static string Size(long n) => n >= 1048576 ? $"{n / 1048576d:F1} MB" : $"{n / 1024d:F1} KB";
     private void Navigate(object sender, RoutedEventArgs e)
     {
@@ -276,7 +309,7 @@ public partial class MainWindow : Window
         }
         PageTitle.Text = new[] { "窗口管理", "代理與檢測", "設定" }[index];
         PageSubtitle.Text = new[] { "每個實例，專屬出口。", "節點、實際 IP 與連線狀態。", "服務、模擬器與資料。" }[index];
-        SummaryCards.Visibility = index == 2 ? Visibility.Collapsed : Visibility.Visible;
+        UpdateSummaryCards();
         MainRefresh.ToolTip = index == 1 ? "立即檢測並更新節點" : "重新整理";
     }
     private async void RefreshClick(object sender, RoutedEventArgs e)

@@ -14,7 +14,8 @@ public partial class GlobalProxyWindow : Window
     public GlobalProxySettings? Settings { get; private set; }
     public GlobalProxyWindow(ProxyProfile[] profiles, GlobalProxySettings settings, ProbeResult[]? probes = null)
     {
-        InitializeComponent(); Proxy.ItemsSource = profiles.Select(p => new ProxyNodeDisplay(p, probes?.FirstOrDefault(result => result.ProxyId == p.Id))).ToArray();
+        InitializeComponent(); EnableGlobalButton.Content = settings.Enabled ? "套用全局設定" : "啟用全局代理";
+        Proxy.ItemsSource = profiles.Select(p => new ProxyNodeDisplay(p, probes?.FirstOrDefault(result => result.ProxyId == p.Id))).ToArray();
         Proxy.SelectedValue = profiles.Any(p => p.Id == settings.ProxyId) ? settings.ProxyId : profiles.FirstOrDefault()?.Id;
         BypassLan.IsChecked = settings.BypassLan;
         BypassRemoteControl.IsChecked = settings.BypassRemoteControl;

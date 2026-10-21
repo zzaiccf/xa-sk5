@@ -685,7 +685,7 @@ public sealed partial class Controller : IDisposable
         var visibleProbes = probes.Values.Where(p => !probeViews.ContainsKey(p.ProxyId)).Concat(probeViews.Values).ToArray();
         return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), visibleTargets, visibleProbes, statuses,
             new(true, NativeEngine.DriverPresent, NativeEngine.Present, running, AppReleasePackage.CurrentVersion + " 預覽版", NativeEngine.DriverPresent ? engineError : "缺少 WinDivert 驅動，未啟用攔截。", logs.ToArray()))
-            { SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
+            { SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
     }
     private string GlobalStatus()
     {

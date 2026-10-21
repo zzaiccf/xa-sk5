@@ -24,6 +24,7 @@ internal static partial class Program
             bool maintenance = Assembly.GetExecutingAssembly().GetName().Name == "WindowSocks.Maintenance";
             if (!maintenance && !args.Any(a => a is "--setup-worker" or "--uninstall" or "--set-startup" or "--start-service" or "--install-components")) {
                 using var wizard = new SetupWizardForm(args.Contains("--update"));
+                wizard.Shown += (_, _) => { wizard.Refresh(); NotifyBootstrapReady(); };
                 Application.Run(wizard); return wizard.Result;
             }
             if (!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator)) {
@@ -47,6 +48,15 @@ internal static partial class Program
             if (args.Contains("--set-startup") || args.Contains("--start-service")) { Console.Error.WriteLine(ex.Message); return ex is AggregateException ? 6 : 5; }
             if (args.Contains("--verify-payload") || args.Contains("--setup-worker")) Console.Error.WriteLine(ex.Message); else MessageBox.Show(ex.Message, "xa sk5 安裝未完成", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1;
         }
+    }
+    private static void NotifyBootstrapReady()
+    {
+        const string prefix = @"Local\WindowSocks.SetupReady.";
+        string? name = Environment.GetEnvironmentVariable("XA_SK5_SETUP_READY_EVENT");
+        if (name is null || !name.StartsWith(prefix, StringComparison.Ordinal) || !Guid.TryParseExact(name[prefix.Length..], "D", out _)) return;
+        try { using var ready = EventWaitHandle.OpenExisting(name); ready.Set(); }
+        catch (WaitHandleCannotBeOpenedException) { }
+        catch (UnauthorizedAccessException) { }
     }
     private static void RunStartupCommand(string[] args)
     {

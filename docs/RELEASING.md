@@ -15,6 +15,10 @@ pwsh -File scripts/Publish-GitHubRelease.ps1 -Publish     # 完成檢查後公�
 
 GitHub 發布附件只上傳兩項：自帶 .NET 的 x64 可攜 ZIP 與單檔安裝 EXE。`artifacts/release/版本/` 另保留本機用的 `latest.json` 與 `SHA256SUMS.txt`，不公開上傳附件；原始碼由儲存庫保存。腳本驗證主要組件版本、每個檔案 SHA-256，以及最終安裝 EXE 的內嵌套件，上傳採兩項明確允許清單。公開版本的程式檔案不可覆寫；修正須提升版本。
 
+單檔安裝 EXE 由 `scripts/Build-SetupBootstrap.ps1` 建立原生前置視窗，內嵌自帶 .NET 的安裝精靈。先顯示準備畫面才解開內層程式，提供解壓百分比與載入秒數；收到精靈的就緒通知或確認其視窗可見後交接。取消僅停止尚未顯示精靈的本次準備程序；交接後不會停止安裝工作。`--verify-payload` 保持無介面並將驗證交給內層程式。
+
+準備紀錄位於 `%LOCALAPPDATA%/WindowSocks/Setup/bootstrap-隨機值/bootstrap.log`，可在準備視窗開啟；內層暫存 EXE 在結束後移除。以全新目錄執行 `pwsh -File scripts/Test-SetupBootstrap.ps1 -OutputDirectory artifacts/setup-bootstrap-check-new` 可驗證延遲開窗前的回饋、精靈交接、暫存清理、啟動失敗及無介面驗證；測試不安裝元件或變更服務。原生視窗只能在 Windows 允許執行程式後出現，無法覆蓋執行前的系統安全檢查。
+
 0.1.16 預設版本來源為 `https://api.github.com/repos/zzaiccf/xa-sk5/releases/latest`。從公開發布 API 取得版本、更新內容、可攜 ZIP 下載位址、大小及 GitHub SHA-256 digest，無需獨立 JSON 附件。缺少 SHA-256、可攜 ZIP、正式版本或完整發布資訊時拒絕安裝。API 來源只能下載相同儲存庫的發布檔案及 GitHub 發布資產主機；HTTP、含帳密網址及其他儲存庫均拒絕。自有 HTTPS JSON 來源與本機 JSON／ZIP 離線檢查仍支援。
 
 0.1.15 及更早的發布附件已精簡為安裝包與可攜 ZIP；0.1.15 的舊預設 JSON 附件網址不再使用，升級至 0.1.16 時會將該舊預設來源轉為 API，明確設定的其他來源不變。尚在使用 0.1.15 的其他電腦請手動安裝新版一次。

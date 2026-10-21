@@ -21,7 +21,8 @@ try {
         dotnet publish src/WindowSocks.Setup/WindowSocks.Setup.csproj -c Release -r win-x64 --self-contained $selfContained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o artifacts/setup
         if ($LASTEXITCODE) { throw 'Installer publish failed.' }
         $setup = Join-Path $release "xa-sk5-Setup-$version.exe"
-        Copy-Item -LiteralPath 'artifacts/setup/WindowSocks-Setup.exe' -Destination $setup -Force
+        & "$PSScriptRoot/Build-SetupBootstrap.ps1" -HostExecutable 'artifacts/setup/WindowSocks-Setup.exe' -OutputPath $setup
+        if (!$?) { throw 'Native installer preparation launcher build failed.' }
         $verify = Start-Process -FilePath $setup -ArgumentList '--verify-payload' -Wait -PassThru -WindowStyle Hidden
         if ($verify.ExitCode) { throw 'Final installer embedded payload verification failed.' }
     }

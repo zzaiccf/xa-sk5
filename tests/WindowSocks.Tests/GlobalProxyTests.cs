@@ -89,6 +89,7 @@ public sealed class GlobalProxyTests : IDisposable
             using (var service = new Controller(directory)) {
                 var snapshot = Json.Read<Snapshot>((await service.Dispatch(Command.Create("snapshot", new { }), default)).Data);
                 Assert.True(snapshot.GlobalProxy.Enabled); Assert.False(snapshot.Diagnostics.EngineRunning);
+                Assert.False(snapshot.GlobalProxyRouting);
                 Assert.Equal(2, NativeEngine.Core_RouteForTest(123004, 100, 0, out _)); // no cached health after restart
                 Assert.False((await service.Dispatch(Command.Create("deleteProxy", new ProxyRequest(profile.Id)), default)).Ok);
                 Assert.True((await service.Dispatch(Command.Create("setGlobalProxy", new GlobalProxySettings()), default)).Ok);
