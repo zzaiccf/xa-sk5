@@ -7,7 +7,10 @@ namespace WindowSocks.Core;
 
 public sealed record ReleaseAsset(string Url, long Size, string Sha256);
 public sealed record AppRelease(int SchemaVersion, string Version, DateTimeOffset PublishedAt, string Notes, ReleaseAsset Portable);
-public sealed record UpdateProgress(string Message, long Received = 0, long Total = 0);
+public sealed record UpdateProgress(string Message, long Received = 0, long Total = 0)
+{
+    public bool CanCancel { get; init; }
+}
 
 public static class AppReleasePackage
 {
@@ -103,7 +106,7 @@ public static class AppReleasePackage
             else yield return path;
         }
     }
-    public static void Extract(string archivePath, string destination, string version, CancellationToken ct = default)
+    public static void Extract(string archivePath, string destination, string version, CancellationToken ct = default, IProgress<UpdateProgress>? progress = null)
     {
         if (Directory.Exists(destination)) throw new IOException("解壓目錄必須為新的空目錄。");
         using var zip = ZipFile.OpenRead(archivePath);
@@ -119,10 +122,21 @@ public static class AppReleasePackage
             total = checked(total + entry.Length); if (total > 1024L * 1024 * 1024) throw new InvalidDataException("更新解壓大小超出限制。");
         }
         Directory.CreateDirectory(destination); RejectLinks(destination);
-        foreach (var entry in zip.Entries.Where(e => !e.FullName.EndsWith('/'))) {
-            ct.ThrowIfCancellationRequested(); string target = SafePath(destination, entry.FullName);
-            Directory.CreateDirectory(Path.GetDirectoryName(target)!); RejectLinks(target); entry.ExtractToFile(target, false);
-        }
+        var entries = zip.Entries.Where(e => !e.FullName.EndsWith('/')).Select(e => e.FullName).ToArray();
+        int workers = Math.Min(entries.Length, Math.Clamp(Environment.ProcessorCount / 2, 1, 4));
+        long extracted = 0;
+        // Each worker has its own ZIP stream; ZipArchive itself is not safe for concurrent reads.
+        Parallel.For(0, workers, new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = workers }, worker => {
+            using var reader = ZipFile.OpenRead(archivePath); byte[] buffer = new byte[256 * 1024];
+            for (int index = worker; index < entries.Length; index += workers) {
+                ct.ThrowIfCancellationRequested(); string target = SafePath(destination, entries[index]);
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!); RejectLinks(target);
+                using var input = reader.GetEntry(entries[index])!.Open();
+                using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None, buffer.Length);
+                int read; while ((read = input.Read(buffer)) != 0) { ct.ThrowIfCancellationRequested(); output.Write(buffer, 0, read); long count = Interlocked.Add(ref extracted, read); progress?.Report(new("解壓更新…", count, total) { CanCancel = true }); }
+            }
+        });
+        ct.ThrowIfCancellationRequested(); progress?.Report(new("驗證檔案與元件版本…") { CanCancel = true });
         VerifyPayload(destination, version);
     }
 }
@@ -208,16 +222,24 @@ public sealed class ReleaseClient : IDisposable
         try {
             using var response = await Get(source, AssetUri(source, release.Portable.Url), ct);
             if (response.Content.Headers.ContentLength is { } size && size != release.Portable.Size) throw new InvalidDataException("發布下載大小與版本資訊不符。");
-            await using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, true)) {
-                created = true; await using var input = await response.Content.ReadAsStreamAsync(ct); byte[] buffer = new byte[65536]; long total = 0;
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            long total = 0; var clock = System.Diagnostics.Stopwatch.StartNew(); long reportedAt = -100;
+            await using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 256 * 1024, true)) {
+                created = true; await using var input = await response.Content.ReadAsStreamAsync(ct); byte[] buffer = new byte[256 * 1024];
                 while (true) {
                     int read = await input.ReadAsync(buffer, ct); if (read == 0) break; total += read;
                     if (total > release.Portable.Size) throw new InvalidDataException("發布下載超過預期大小。");
-                    await output.WriteAsync(buffer.AsMemory(0, read), ct); progress?.Report(new("下載更新…", total, release.Portable.Size));
+                    hash.AppendData(buffer, 0, read); await output.WriteAsync(buffer.AsMemory(0, read), ct);
+                    if (clock.ElapsedMilliseconds - reportedAt >= 100 || total == release.Portable.Size) {
+                        reportedAt = clock.ElapsedMilliseconds;
+                        progress?.Report(new("下載更新…", total, release.Portable.Size) { CanCancel = true });
+                    }
                 }
                 await output.FlushAsync(ct);
             }
-            ct.ThrowIfCancellationRequested(); progress?.Report(new("正在驗證 SHA-256…")); AppReleasePackage.VerifyArchive(destination, release.Portable);
+            ct.ThrowIfCancellationRequested();
+            if (total != release.Portable.Size || !Convert.ToHexString(hash.GetHashAndReset()).Equals(release.Portable.Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("下載大小或 SHA-256 不符，沒有安裝任何檔案。請重新檢查版本後再試。");
         }
         catch { if (created) File.Delete(destination); throw; }
     }

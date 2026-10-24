@@ -35,7 +35,7 @@ public sealed class DesktopStartupController : IDesktopStartupController
             var saved = registration.Read(); var mode = service.Read(); bool enabled = saved.Enabled ?? mode?.Automatic ?? true;
             bool registered = !enabled || string.Equals(saved.Command, StartupConfiguration.Command(executable), StringComparison.OrdinalIgnoreCase);
             string message = initializationError ?? (enabled
-                ? "Windows 登入時開啟主程式；背景代理服務於開機時啟動。"
+                ? "Windows 登入時開啟主程式；關閉主程式會同步停止代理服務。"
                 : "已取消下次開機自動啟動，目前的代理連線維持執行。");
             if (mode is not null && mode.Automatic != enabled) message = "主程式與背景服務的開機設定不同，請重新勾選或取消以同步。";
             if (!registered && initializationError is null) message = "主程式的登入啟動項目未就緒，請重新勾選以同步。";
@@ -70,7 +70,7 @@ public sealed class DesktopStartupController : IDesktopStartupController
 internal sealed class PreviewStartupController : IDesktopStartupController
 {
     private bool enabled = true;
-    public DesktopStartupState Read() => new(enabled, false, enabled ? "Windows 登入時開啟主程式；背景代理服務於開機時啟動。" : "已取消下次開機自動啟動，目前的代理連線維持執行。");
+    public DesktopStartupState Read() => new(enabled, false, enabled ? "Windows 登入時開啟主程式；關閉主程式會同步停止代理服務。" : "已取消下次開機自動啟動，目前的代理連線維持執行。");
     public Task SetEnabledAsync(bool value) { enabled = value; return Task.CompletedTask; }
     public Task StartServiceAsync() => Task.CompletedTask;
 }

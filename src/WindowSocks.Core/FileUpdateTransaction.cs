@@ -10,6 +10,7 @@ public sealed record UpdateJournal(string Target, string Version, string Phase, 
 public sealed class FileUpdateTransaction
 {
     public string BackupDirectory { get; }
+    public int FileCount => journal.Files.Length;
     private UpdateJournal journal;
     private string JournalPath => Path.Combine(BackupDirectory, "update-journal.json");
     private FileUpdateTransaction(string backup, UpdateJournal journal) { BackupDirectory = backup; this.journal = journal; }
@@ -20,6 +21,8 @@ public sealed class FileUpdateTransaction
         if (Pending(target).Length > 0)
             throw new IOException("發現未完成的更新。請先使用更新視窗的「回復上次更新」恢復備份。");
         var files = AppReleasePackage.VerifyPayload(source, version);
+        var expectedHashes = files.ToDictionary(f => f.Path, f => f.Sha256, StringComparer.OrdinalIgnoreCase);
+        expectedHashes["install-manifest.json"] = AppReleasePackage.Hash(Path.Combine(source, "install-manifest.json"));
         var paths = files.Select(f => f.Path).Append("install-manifest.json").ToHashSet(StringComparer.OrdinalIgnoreCase);
         string oldManifest = Path.Combine(target, "install-manifest.json");
         if (File.Exists(oldManifest)) {
@@ -35,10 +38,11 @@ public sealed class FileUpdateTransaction
             string destination = AppReleasePackage.SafePath(target, path), input = AppReleasePackage.SafePath(source, path);
             AppReleasePackage.RejectLinks(destination);
             bool existed = File.Exists(destination);
-            if (existed && File.Exists(input) && AppReleasePackage.Hash(destination) == AppReleasePackage.Hash(input)) continue;
+            string originalHash = existed ? AppReleasePackage.Hash(destination) : "";
+            if (existed && expectedHashes.TryGetValue(path, out var expected) && originalHash.Equals(expected, StringComparison.OrdinalIgnoreCase)) continue;
             // Detect occupied files before changing any file; never kill another program to release a handle.
             if (existed) { using var handle = File.Open(destination, FileMode.Open, FileAccess.ReadWrite, FileShare.None); }
-            states.Add(new(path, existed, existed ? AppReleasePackage.Hash(destination) : ""));
+            states.Add(new(path, existed, originalHash));
         }
         string backup = Path.Combine(target, ".xa-sk5-backup-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(backup);
         var transaction = new FileUpdateTransaction(backup, new(target, version, "preparing", states.ToArray()));
@@ -69,21 +73,24 @@ public sealed class FileUpdateTransaction
     {
         if (journal.Phase != "prepared") throw new IOException("更新不是已準備狀態。");
         AppReleasePackage.VerifyPayload(source, journal.Version); SetPhase("applying");
-        int count = 0;
-        foreach (var file in journal.Files) {
+        int count = 0; object callbackGate = new();
+        try { Parallel.ForEach(journal.Files, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount / 2, 1, 4) }, file => {
             beforeFile?.Invoke();
             string input = AppReleasePackage.SafePath(source, file.Path), target = AppReleasePackage.SafePath(journal.Target, file.Path);
             AppReleasePackage.RejectLinks(target); Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             if (File.Exists(input)) {
                 // A same-directory rename avoids leaving a truncated destination on power loss.
                 string temporary = target + ".xa-update-tmp"; AppReleasePackage.RejectLinks(temporary);
-                using (var output = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None, 65536, FileOptions.WriteThrough)) {
+                // Flush the complete file once before its atomic rename. WriteThrough on every
+                // copy buffer made large runtime files wait on hundreds of disk barriers.
+                using (var output = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024)) {
                     using var stream = File.OpenRead(input); stream.CopyTo(output); output.Flush(true);
                 }
                 File.Move(temporary, target, true);
             } else if (File.Exists(target)) File.Delete(target);
-            afterFile?.Invoke(++count);
-        }
+            lock (callbackGate) { afterFile?.Invoke(++count); }
+        }); }
+        catch (AggregateException ex) { System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.Flatten().InnerExceptions[0]).Throw(); throw; }
         AppReleasePackage.VerifyPayload(journal.Target, journal.Version, installed: true); SetPhase("applied");
     }
     public void Commit() { if (journal.Phase != "applied") throw new IOException("更新尚未完成，無法提交。"); SetPhase("committed"); }

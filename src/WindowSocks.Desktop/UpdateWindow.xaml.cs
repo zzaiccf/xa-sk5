@@ -16,6 +16,7 @@ public partial class UpdateWindow : Window
 {
     private readonly ReleaseClient client;
     private readonly string preferencesFile;
+    private readonly Func<UpdateJob, string, CancellationToken, Task>? handoff;
     private CancellationTokenSource? cancellation;
     private AppRelease? candidate;
     private Uri? checkedSource;
@@ -24,9 +25,9 @@ public partial class UpdateWindow : Window
     private bool initialCheckStarted;
     public bool ReadyToExit { get; private set; }
     public UpdateWindow() : this(new ReleaseClient()) { }
-    public UpdateWindow(ReleaseClient client, string? preferencesFile = null)
+    public UpdateWindow(ReleaseClient client, string? preferencesFile = null, Func<UpdateJob, string, CancellationToken, Task>? handoff = null)
     {
-        this.client = client; this.preferencesFile = preferencesFile ?? UpdatePaths.Preferences; InitializeComponent(); CurrentVersionText.Text = AppReleasePackage.CurrentVersion;
+        this.client = client; this.handoff = handoff; this.preferencesFile = preferencesFile ?? UpdatePaths.Preferences; InitializeComponent(); CurrentVersionText.Text = AppReleasePackage.CurrentVersion;
         UpdateService.Visibility = UpdatePaths.ServiceInstalled ? Visibility.Visible : Visibility.Collapsed;
         UpdateService.IsChecked = UpdatePaths.ServiceInstalled;
         if (Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory).Equals(UpdatePaths.Installed, StringComparison.OrdinalIgnoreCase)) UpdateService.IsEnabled = false;
@@ -47,8 +48,8 @@ public partial class UpdateWindow : Window
     }
     private void ServiceSelectionChanged(object sender, RoutedEventArgs e) { if (ImpactText is not null) UpdateImpact(); }
     private void UpdateImpact() => ImpactText.Text = UpdateService.IsChecked == true
-        ? "升級會關閉並重新開啟 xa sk5，備份程式及加密設定後重啟代理服務。現有代理連線會中斷，受管程式可能需要自行重新連線；遊戲、模擬器及遠控程式會繼續執行。Windows 管理員授權由你確認。"
-        : "升級會關閉並重新開啟此 xa sk5 可攜版。先備份原程式，失敗時回復；代理帳密、到期日及各項配置均保留。";
+        ? "按「升級」立即開始：先中斷代理，再下載、備份與安裝，完成後重新開啟 xa sk5。取消或失敗會恢復原服務狀態。Windows 管理員授權由你確認。"
+        : "按「升級」立即開始，下載前先中斷已安裝的代理服務，完成後恢復；只更新此可攜版。代理帳密、到期日及各項配置保留。";
     private void SourceChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
         candidate = null; checkedSource = null; localManifest = null;
@@ -102,20 +103,11 @@ public partial class UpdateWindow : Window
     private async void UpgradeClick(object sender, RoutedEventArgs e)
     {
         if (candidate is not { } release || working) return;
-        if (MessageBox.Show(this, $"更新至 {release.Version}\n\n{ImpactText.Text}\n\n現在開始下載、驗證並升級？", "xa sk5 升級", MessageBoxButton.OKCancel, MessageBoxImage.Information) != MessageBoxResult.OK) return;
         await Operation(async ct => {
-            string work = NewWork(), archive = Path.Combine(work, "update.zip");
-            DownloadProgress.Visibility = Visibility.Visible;
-            if (localManifest is not null) {
-                UpdateStatus.Text = "正在複製及驗證離線 ZIP…";
-                await Task.Run(() => { ct.ThrowIfCancellationRequested(); File.Copy(LocalArchive(localManifest, release), archive); AppReleasePackage.VerifyArchive(archive, release.Portable); }, ct);
-            } else {
-                var progress = new Progress<UpdateProgress>(p => { UpdateStatus.Text = p.Total > 0 ? $"{p.Message} {p.Received / 1024d / 1024:0.0} / {p.Total / 1024d / 1024:0.0} MB" : p.Message; DownloadProgress.IsIndeterminate = p.Total == 0; if (p.Total > 0) DownloadProgress.Value = p.Received * 100d / p.Total; });
-                await client.DownloadAsync(checkedSource!, release, archive, progress, ct);
-            }
-            UpdateStatus.Text = "正在安全解壓並驗證各元件版本…"; DownloadProgress.IsIndeterminate = true;
-            string payload = Path.Combine(work, "payload"); await Task.Run(() => AppReleasePackage.Extract(archive, payload, release.Version, ct), ct);
-            ct.ThrowIfCancellationRequested(); await LaunchHelper(work, payload, release.Version, false, ct);
+            string work = NewWork(); DownloadProgress.Visibility = Visibility.Visible; DownloadProgress.IsIndeterminate = true;
+            var download = new UpdateDownload(release, localManifest is null ? checkedSource!.AbsoluteUri : null, localManifest is null ? null : LocalArchive(localManifest, release));
+            UpdatePreparation.Validate(download, release.Version);
+            await LaunchHelper(work, "", release.Version, false, ct, download);
         });
         if (ReadyToExit) { DialogResult = true; Close(); }
     }
@@ -126,20 +118,16 @@ public partial class UpdateWindow : Window
         if (ReadyToExit) { DialogResult = true; Close(); }
     }
     private static string NewWork() { string path = Path.Combine(UpdatePaths.UserData, "Updates", Guid.NewGuid().ToString("N")); Directory.CreateDirectory(path); AppReleasePackage.RejectLinks(path); return path; }
-    private async Task LaunchHelper(string work, string payload, string version, bool recover, CancellationToken ct)
+    private async Task LaunchHelper(string work, string payload, string version, bool recover, CancellationToken ct, UpdateDownload? download = null)
     {
         UpdateStatus.Text = "準備獨立更新程式，完成後會重新開啟介面…";
-        string helper = Path.Combine(work, "helper"); Directory.CreateDirectory(helper);
+        string helper = Path.Combine(work, "helper");
         // Run the existing trusted updater outside the directory that will be replaced.
-        await Task.Run(() => {
-            foreach (var entry in ComponentPackage.VerifyManifest(AppContext.BaseDirectory)) {
-                ct.ThrowIfCancellationRequested(); string name = entry.Path;
-                if (AppReleasePackage.IsApplicationFile(name)) { string file = AppReleasePackage.SafePath(AppContext.BaseDirectory, name); AppReleasePackage.RejectLinks(file); string destination = AppReleasePackage.SafePath(helper, name); Directory.CreateDirectory(Path.GetDirectoryName(destination)!); File.Copy(file, destination); }
-            }
-        }, ct);
-        string exe = Path.Combine(helper, "WindowSocks.Updater.exe"); if (!File.Exists(exe)) throw new IOException("缺少獨立更新程式，請重新解壓完整可攜版。");
         using var parent = Process.GetCurrentProcess();
-        var job = new UpdateJob(payload, Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory), version, Environment.ProcessPath!, parent.Id, parent.StartTime.ToUniversalTime().Ticks, UpdateService.IsChecked == true, recover);
+        var job = new UpdateJob(payload, Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory), version, Environment.ProcessPath!, parent.Id, parent.StartTime.ToUniversalTime().Ticks, UpdateService.IsChecked == true, recover) { Download = download, PauseService = download is not null && (UpdatePaths.ServiceInstalled || UpdatePaths.ServiceRegistered) };
+        if (handoff is not null) { await handoff(job, work, ct); ReadyToExit = true; return; }
+        await Task.Run(() => UpdateHelperPackage.Stage(AppContext.BaseDirectory, helper, ct), ct);
+        string exe = Path.Combine(helper, "WindowSocks.Updater.exe");
         string jobFile = Path.Combine(work, "job.json"); await File.WriteAllTextAsync(jobFile, JsonSerializer.Serialize(job, Json.Options), ct);
         var start = new ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = helper }; start.ArgumentList.Add("--update"); start.ArgumentList.Add(jobFile);
         using var process = Process.Start(start) ?? throw new IOException("無法開啟獨立更新程式。");

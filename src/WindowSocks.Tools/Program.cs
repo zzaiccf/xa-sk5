@@ -6,6 +6,8 @@ Console.OutputEncoding = new System.Text.UTF8Encoding(false);
 if (args.Length == 0) { Console.WriteLine("WindowSocks.Tools probe | import-local | identity <pid> | pipe <action>\n代理資料從標準輸入讀取，不放在命令列參數。"); return; }
 switch (args[0])
 {
+    case "vmware-discover":
+        Console.WriteLine(JsonSerializer.Serialize((await VmwareDiscovery.Running()).Concat(VmwareDiscovery.Registered()).DistinctBy(v => v.Machine.Path, StringComparer.OrdinalIgnoreCase), Json.Options)); break;
     case "check-update":
         using (var releases = new ReleaseClient()) {
             var latest = await releases.CheckAsync(ReleaseClient.SourceUri(args[1]), default);

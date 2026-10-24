@@ -1,5 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
- <PropertyGroup><IsTestProject>true</IsTestProject><IsPackable>false</IsPackable></PropertyGroup>
+ <PropertyGroup><IsTestProject>true</IsTestProject><IsPackable>false</IsPackable><UseWindowsForms>true</UseWindowsForms></PropertyGroup>
+ <ItemGroup><ProjectReference Include="../../src/WindowSocks.Updater/WindowSocks.Updater.csproj"/></ItemGroup>
+ <ItemGroup><ProjectReference Include="../WindowSocks.GameLauncherFixture/WindowSocks.GameLauncherFixture.csproj" ReferenceOutputAssembly="false"/></ItemGroup>
  <ItemGroup><ProjectReference Include="../../src/WindowSocks.Core/WindowSocks.Core.csproj"/><ProjectReference Include="../../src/WindowSocks.Service/WindowSocks.Service.csproj"/><PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1"/><PackageReference Include="xunit" Version="2.9.3"/><PackageReference Include="xunit.runner.visualstudio" Version="3.1.1" PrivateAssets="all"/></ItemGroup>
  <ItemGroup><Compile Include="../../src/WindowSocks.Desktop/GlobalProxyDisplay.cs" Link="Desktop/GlobalProxyDisplay.cs"/></ItemGroup>
 </Project>

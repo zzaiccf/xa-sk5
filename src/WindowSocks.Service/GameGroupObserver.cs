@@ -19,6 +19,10 @@ internal sealed class GameGroupObserver : IDisposable
         timer = new(_ => Sample(), null, TimeSpan.Zero, TimeSpan.FromMilliseconds(250));
     }
     public void SetRule(AutoProxyRule value) { lock (sync) rule = value; }
+    public void ResetRule(AutoProxyRule value, IEnumerable<GameLaunchGroup> groups)
+    {
+        lock (sync) { rule = value; scan = new(groups.ToArray(), []); error = ""; foreach (var handle in handles.Values) CloseHandle(handle); handles.Clear(); }
+    }
     public (GameGroupScan Scan, string Error) Read() { lock (sync) return (scan, error); }
     private void Sample()
     {

@@ -129,9 +129,11 @@ public sealed class GlobalProxyTests : IDisposable
                 Assert.Contains(identity, Assert.Single(snapshot.Bindings).Descendants);
                 Assert.Equal(2, NativeEngine.Core_RouteForTest((uint)child.Id, (ulong)identity.CreatedFileTime, 0, out _));
             }
-            using (var service = new Controller(directory)) {
+            var now = DateTimeOffset.UtcNow;
+            using (var service = new Controller(directory, handoffClock: () => now)) {
                 await service.Tick(default); Assert.Single(store.Load().Bindings);
-                Stop(child); await service.Tick(default); Assert.Empty(store.Load().Bindings);
+                Stop(child); await service.Tick(default); Assert.Single(store.Load().Bindings);
+                now = now.AddSeconds(11); await service.Tick(default); Assert.Empty(store.Load().Bindings);
             }
         } finally { Stop(child); Directory.Delete(directory, true); }
     }

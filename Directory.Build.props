@@ -4,10 +4,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <PlatformTarget>x64</PlatformTarget>
-    <Version>0.1.19</Version>
+    <Version>0.1.23</Version>
     <Product>xa sk5</Product>
     <AssemblyTitle>xa sk5</AssemblyTitle>
     <Description>xa sk5 SOCKS5 代理工具</Description>
     <Deterministic>true</Deterministic>
+    <SatelliteResourceLanguages>zh-Hant;zh-Hans;en</SatelliteResourceLanguages>
   </PropertyGroup>
 </Project>

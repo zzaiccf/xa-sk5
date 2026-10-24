@@ -81,6 +81,7 @@ internal static partial class Program
             Run("sc.exe", ["create", "WindowSocks", "binPath=", $"\"{Path.Combine(InstallDirectory, "WindowSocks.Service.exe")}\"", "start=", startType, "DisplayName=", "xa sk5 SOCKS5 背景服務"], false);
             Run("sc.exe", ["config", "WindowSocks", "binPath=", $"\"{Path.Combine(InstallDirectory, "WindowSocks.Service.exe")}\"", "start=", startType, "DisplayName=", "xa sk5 SOCKS5 背景服務"]);
             Run("sc.exe", ["description", "WindowSocks", "xa sk5：程序級 SOCKS5 TCP／UDP 代理。"]);
+            WindowsProxyService.GrantOwnerControl(startupOwner);
             Run("sc.exe", ["failure", "WindowSocks", "reset=", "86400", "actions=", "restart/5000/restart/15000/restart/60000"]);
             Run("netsh.exe", ["advfirewall", "firewall", "delete", "rule", "name=WindowSocks relay"], false);
             foreach (var protocol in new[] { "TCP", "UDP" }) Run("netsh.exe", ["advfirewall", "firewall", "add", "rule", "name=WindowSocks relay", "dir=in", "action=allow", "program=" + Path.Combine(InstallDirectory, "WindowSocks.Service.exe"), "protocol=" + protocol, "profile=any"]);
@@ -139,11 +140,14 @@ internal static partial class Program
     }
     private static void WaitForServiceStop()
     {
-        for (int i = 0; i < 30; i++) {
-            var processes = Process.GetProcessesByName("WindowSocks.Service");
-            foreach (var process in processes) process.Dispose();
-            if (processes.Length == 0) return;
-            Thread.Sleep(500);
+        for (int i = 0; i < 60; i++) {
+            bool alive = false;
+            foreach (var process in Process.GetProcessesByName("WindowSocks.Service")) using (process) {
+                try { alive |= !process.HasExited && string.Equals(process.MainModule?.FileName, Path.Combine(InstallDirectory, "WindowSocks.Service.exe"), StringComparison.OrdinalIgnoreCase); }
+                catch (InvalidOperationException) { }
+            }
+            if (!alive) return;
+            Thread.Sleep(250);
         }
         throw new IOException("背景服務尚未停止，沒有覆寫執行中的檔案。");
     }
@@ -151,6 +155,11 @@ internal static partial class Program
     {
         if (MessageBox.Show("解除安裝將停止代理服務並恢復原有連線。\n請先關閉受管遊戲／模擬器。加密設定將保留。", "解除安裝 xa sk5", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
         if (DesktopRunning()) throw new InvalidOperationException("請先從系統匣結束 xa sk5。");
+        string vmwareBackup = Path.Combine(DataDirectory, "vmware-network-backup.json");
+        if (File.Exists(vmwareBackup)) {
+            using var record = System.Text.Json.JsonDocument.Parse(File.ReadAllText(vmwareBackup));
+            if (record.RootElement.GetProperty("phase").GetString() != "restored") throw new InvalidOperationException("請先啟動 xa sk5，將 VMware 虛擬機關機後，在「VMware 虛擬機」按「回復原網路」，再解除安裝。");
+        }
         string ownerFile = Path.Combine(DataDirectory, "owner.sid");
         string ownerSid = File.Exists(ownerFile) ? new SecurityIdentifier(File.ReadAllText(ownerFile).Trim()).Value : installOwnerSid;
         using (var user = Registry.Users.OpenSubKey(ownerSid, true)) { if (user is not null) { new StartupRegistry(user).RemoveForDirectory(InstallDirectory); WindowsShortcuts.RemoveDesktopForDirectory(user, InstallDirectory); } }

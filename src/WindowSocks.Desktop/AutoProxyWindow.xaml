@@ -3,7 +3,7 @@
   <StackPanel Margin="0,0,0,22"><TextBlock Text="自動代理" FontSize="24" FontWeight="SemiBold"/><TextBlock x:Name="PoolSummary" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,8,0,0"/></StackPanel>
   <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto"><Border Style="{StaticResource Card}" Padding="22"><StackPanel>
    <TextBlock Text="目標類型" Style="{StaticResource FieldLabel}"/>
-   <ComboBox x:Name="Mode" SelectedIndex="0" SelectionChanged="ModeChanged" Margin="0,0,0,18"><ComboBoxItem Content="模擬器"/><ComboBoxItem Content="程序檔名"/><ComboBoxItem Content="執行檔路徑"/><ComboBoxItem Content="遊戲組：登入器＋遊戲"/></ComboBox>
+   <ComboBox x:Name="Mode" SelectedIndex="0" SelectionChanged="ModeChanged" Margin="0,0,0,18"><ComboBoxItem Content="模擬器"/><ComboBoxItem Content="程序檔名 · 自動接續遊戲"/><ComboBoxItem Content="執行檔路徑 · 自動接續遊戲"/><ComboBoxItem Content="遊戲組：登入器＋遊戲"/><ComboBoxItem Content="虛擬機 · VMware Workstation"/></ComboBox>
    <StackPanel x:Name="EmulatorPanel">
     <TextBlock Text="分配方式" Style="{StaticResource FieldLabel}"/>
     <ComboBox x:Name="AllocationMode" SelectedIndex="0" SelectionChanged="AllocationChanged" Margin="0,0,0,16"><ComboBoxItem Content="固定窗口編號"/><ComboBoxItem Content="依啟動順序"/></ComboBox>
@@ -22,9 +22,9 @@
    <StackPanel x:Name="ClientPanel" Visibility="Collapsed"><TextBlock Text="遊戲執行檔" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ClientPath" Tag="D:\Game\Client.exe" Margin="0,0,0,16"/><TextBlock Text="請先儲存規則，再開啟登入器。" Foreground="{StaticResource Accent}" FontSize="12" Margin="0,0,0,14"/></StackPanel>
    <Grid Margin="0,0,0,18"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="80"/></Grid.ColumnDefinitions><StackPanel VerticalAlignment="Center"><TextBlock x:Name="LimitLabel" Text="每個節點的目標數"/><TextBlock x:Name="LimitHint" Text="1–10 個窗口或遊戲組" Style="{StaticResource FieldLabel}" Margin="0,5,0,0"/></StackPanel><TextBox Grid.Column="1" x:Name="Limit" Text="1" TextAlignment="Center"/></Grid>
    <CheckBox x:Name="EnableRule" Content="儲存後立即啟用" IsChecked="True" Margin="0,0,0,12"/>
-   <CheckBox x:Name="Children" Content="涵蓋子程序" ToolTip="一般程序可包含由它啟動的子程序；雷電與遊戲組維持指定成員。"/>
+   <TextBlock x:Name="Children" Text="登入後自動接續 · 沿用相同 IP" Foreground="{StaticResource Accent}" ToolTip="程序檔名與路徑規則會依啟動關係自動接續遊戲，不必另選遊戲組。"/>
    <Border Background="#F5F7FD" CornerRadius="8" Padding="12" Margin="0,18,0,0"><TextBlock x:Name="ModeNote" TextWrapping="Wrap" FontSize="12" Foreground="{StaticResource Muted}"/></Border>
-   <Expander Header="運作方式與限制" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,16,0,0"><StackPanel Margin="6,10,6,0"><TextBlock Text="依代理清單順序分配，保留既有出口；TCP／UDP 檢測通過後才放行，失敗時保持封鎖並重試。既有遊戲連線需重新建立。" TextWrapping="Wrap" Margin="0,0,0,10"/><TextBlock Text="完整路徑會先攔截啟動連線；僅檔名規則可能在探索前直連。修改規則會暫停原有自動綁定，不需要的項目可解除綁定。" TextWrapping="Wrap" Margin="0,0,0,10"/><TextBlock Text="遊戲組只包含指定的登入器與遊戲，需能驗證啟動關係；整組結束約十秒後釋放名額。橋接網卡、獨立系統服務連網的模擬器仍需實測。" TextWrapping="Wrap"/></StackPanel></Expander>
+   <Expander Header="運作方式與限制" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,16,0,0"><StackPanel Margin="6,10,6,0"><TextBlock Text="依代理清單順序分配，保留既有出口；TCP／UDP 檢測通過後才放行，失敗時保持封鎖並重試。既有遊戲連線需重新建立。" TextWrapping="Wrap" Margin="0,0,0,10"/><TextBlock Text="程序檔名與完整路徑皆會先攔截符合規則的新程序；登入後的遊戲依啟動關係自動接續，仍使用原 IP 與同一個名額。修改規則會暫停原有自動綁定。" TextWrapping="Wrap" Margin="0,0,0,10"/><TextBlock Text="所有程序結束後保留約十秒供交接，再釋放名額。若遊戲由獨立系統服務啟動而無法確認來源，須另設遊戲路徑規則或使用全局代理。橋接網卡模擬器仍需實測。" TextWrapping="Wrap"/></StackPanel></Expander>
   </StackPanel></Border></ScrollViewer>
   <StackPanel Grid.Row="2" Margin="0,18,0,0"><TextBlock x:Name="Error" Foreground="#C75353" TextWrapping="Wrap" Margin="0,0,0,8"/><StackPanel Orientation="Horizontal" HorizontalAlignment="Right"><Button Content="取消" IsCancel="True"/><Button x:Name="SaveRuleButton" Content="儲存配置" Style="{StaticResource PrimaryButton}" Click="Confirm" IsDefault="True" Margin="0"/></StackPanel></StackPanel>
  </Grid>

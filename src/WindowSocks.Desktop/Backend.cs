@@ -44,6 +44,9 @@ public class Backend
             if (!Online) StopProbes();
             Online = true; supportsTcpFirst = snapshot.SupportsTcpFirstProbes;
             await Call<bool>(Command.Create("syncTargets", snapshot.SupportsFixedEmulators ? targets : targets.Where(t => t.Kind != "MuMu").ToArray()));
+            if (snapshot.Vmware is { } vmware && System.Text.Json.JsonSerializer.Serialize(config.Vmware, Json.Options) != System.Text.Json.JsonSerializer.Serialize(vmware.Settings, Json.Options)) {
+                config.Vmware = vmware.Settings; store.Save(config);
+            }
             return snapshot with { Proxies = ProxyExpirationMetadata.Apply(snapshot.Proxies, config.ServiceProxyExpirations), Targets = targets.Concat(snapshot.Targets).DistinctBy(t => t.Key).ToArray(),
                 AutoProxy = PendingForService(snapshot.Proxies) ?? snapshot.AutoProxy,
                 HasPendingEmulatorConfiguration = config.PendingEmulatorRule is not null,
@@ -54,6 +57,7 @@ public class Backend
         return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), targets.Concat(savedTargets).DistinctBy(t => t.Key).ToArray(), probes.Values.ToArray(), config.Bindings.Select(b => new RuntimeStatus(b.TargetKey, "待服務套用 · 未代理", b.IncludeChildren ? "僅儲存分配；啟用後涵蓋子程序" : "僅儲存分配，不含子程序", 0, 0)).ToArray(),
             new(false, NativeEngine.DriverPresent, NativeEngine.Present, false, AppReleasePackage.CurrentVersion + " 預覽版", "離線設定模式：可管理與檢測代理，尚未攔截任何窗口流量。", [])) {
                 AutoProxy = config.PendingEmulatorRule ?? config.AutoProxy,
+                Vmware = config.Vmware.Machines.Length == 0 ? null : new(config.Vmware, [], false, false, "背景服務未連線；已儲存規則保留，執行狀態待確認。"),
                 HasPendingEmulatorConfiguration = config.PendingEmulatorRule is not null,
                 AutoProxyStatus = config.PendingEmulatorRule is null ? "離線模式 · 尚未啟用自動代理" : "模擬器配置已儲存在本機 · 背景服務連線後請套用"
             };
@@ -83,7 +87,8 @@ public class Backend
         if (Online) return await Call<ProbeResult>(Command.Create(supportsTcpFirst ? "probeTcp" : "probe", new ProxyRequest(id)), ct);
         var profile = config.Proxies.First(p => p.Id == id) with { };
         var result = await ProxyProbe.RunTcpAsync(profile, ct: ct); ct.ThrowIfCancellationRequested();
-        if (config.Proxies.Any(p => p.Id == id)) { probes[id] = result; config.LastProbes = probes.Values.ToList(); store.Save(config); }
+        if (!config.Proxies.Any(p => p.Id == id && ProxyImport.SameProxy(p, profile))) throw new InvalidOperationException("節點已變更，請重新檢測。");
+        probes[id] = result; config.LastProbes = probes.Values.ToList(); store.Save(config);
         if (result.UdpPending) _ = SupplementLocal(profile, result, supplementalLifetime.Token);
         return result;
     }
@@ -131,6 +136,37 @@ public class Backend
             config.Proxies.RemoveAll(p => p.Id == id); probes.Remove(id); config.LastProbes = probes.Values.ToList(); store.Save(config);
         }
     }
+    public virtual async Task<ClearProxyPoolResult> ClearProxyPool()
+    {
+        if (Online) {
+            await RequireBulkActions();
+            var result = await Call<ClearProxyPoolResult>(Command.Create("clearProxyPool", new { }));
+            foreach (Guid id in result.RemovedIds) config.ServiceProxyExpirations.Remove(id);
+            store.Save(config); return result;
+        }
+        ProxyPoolUsage.RequireUnused(config);
+        Guid[] ids = config.Proxies.Select(p => p.Id).ToArray();
+        var next = config with { Proxies = [], LastProbes = [] };
+        store.Save(next); StopProbes();
+        config.Proxies = next.Proxies; config.LastProbes = next.LastProbes; probes.Clear();
+        return new(ids);
+    }
+    private async Task RequireBulkActions()
+    {
+        if (!Online) throw new InvalidOperationException("背景服務未連線，無法關閉代理進程。");
+        if (!(await Call<Snapshot>(Command.Create("snapshot", new { }))).SupportsBulkActions)
+            throw new InvalidOperationException("請先套用 0.1.22 以上背景服務，才能使用批次清除及關閉進程。");
+    }
+    public virtual async Task<CloseProxyProcessesPlan> PrepareCloseProxyProcesses()
+    {
+        await RequireBulkActions();
+        return await Call<CloseProxyProcessesPlan>(Command.Create("prepareCloseProxyProcesses", new { }));
+    }
+    public virtual async Task<CloseProxyProcessesResult> CloseProxyProcesses(Guid token)
+    {
+        if (!Online) throw new InvalidOperationException("背景服務未連線，無法關閉代理進程。");
+        return await Call<CloseProxyProcessesResult>(Command.Create("closeProxyProcesses", new CloseProxyProcessesRequest(token)));
+    }
     public async Task Assign(BatchBindRequest request)
     {
         if (Online) {
@@ -142,8 +178,24 @@ public class Backend
             if (item.Target.Processes.Any(p => LdPlayer.Identity(p.Pid) != p)) throw new InvalidOperationException("選取的程序已結束，請重新選取。");
         config.Bindings = AssignmentPlanner.Prepare(config.Bindings, config.Proxies, request); store.Save(config);
     }
+    public virtual async Task<bool> Edit(EditProxyRequest request)
+    {
+        if (Online) {
+            var state = await Call<Snapshot>(Command.Create("snapshot", new { }));
+            if (!state.SupportsProxyEditing) throw new InvalidOperationException("目前背景服務尚未支援修改節點，請套用新版背景服務後再試。");
+            bool changed = await Call<bool>(Command.Create("editProxy", request));
+            config.ServiceProxyExpirations.Remove(request.ProxyId); store.Save(config); return changed;
+        }
+        var next = ProxyEditing.Prepare(config.Proxies, request);
+        int index = config.Proxies.FindIndex(p => p.Id == request.ProxyId);
+        bool connectionChanged = !ProxyImport.SameProxy(config.Proxies[index], next);
+        config.Proxies[index] = next;
+        if (connectionChanged) probes.Remove(next.Id);
+        config.LastProbes = probes.Values.ToList(); store.Save(config); return connectionChanged;
+    }
     public async Task<bool> ConfigureAutomatic(AutoProxyRule rule)
     {
+        rule = ProcessHandoffPolicy.Automatic(rule) with { Configured = true };
         AutoProxyPlanner.Validate(rule);
         if (rule.Kind is "Emulator" or "EmulatorSequence") {
             var state = Online ? await Call<Snapshot>(Command.Create("snapshot", new { })) : null;
@@ -153,6 +205,20 @@ public class Backend
         }
         await Act("setAutoProxy", rule);
         config.PendingEmulatorRule = null; store.Save(config); return true;
+    }
+    public async Task DeleteRule(string key)
+    {
+        if (Online) {
+            var state = await Call<Snapshot>(Command.Create("snapshot", new { }));
+            if (!state.SupportsRuleManagement) throw new InvalidOperationException("請先安裝新版私人測試版，才能刪除保存的代理規則。");
+            await Call<bool>(Command.Create("deleteRule", new DeleteRuleRequest(key)));
+            if (key == "automatic") { config.PendingEmulatorRule = null; store.Save(config); }
+            return;
+        }
+        var next = ProxyRules.Delete(config, key);
+        config.AutoProxy = next.AutoProxy; config.PendingEmulatorRule = next.PendingEmulatorRule; config.Bindings = next.Bindings;
+        config.GameGroups = next.GameGroups; config.AutoExcludedTargets = next.AutoExcludedTargets; config.AutoExcludedDescendants = next.AutoExcludedDescendants;
+        config.Vmware = next.Vmware; config.VmwareSessions = next.VmwareSessions; store.Save(config);
     }
     private AutoProxyRule? PendingForService(ProxyProfile[] serviceProfiles)
     {
@@ -181,6 +247,18 @@ public class Backend
             throw new InvalidOperationException("遠端控制直連需要 0.1.11 背景服務與原生核心。請先更新元件，再啟用全局代理，以保留遠端連線。");
         await Call<bool>(Command.Create(action, data));
     }
+    public Task<VmwareAdapter[]> VmwareAdapters(CancellationToken ct = default) => Call<VmwareAdapter[]>(Command.Create("vmwareAdapters", new { }), ct);
+    public Task RequestServiceStop(CancellationToken ct) => Call<bool>(Command.Create("stopService", new { }), ct);
+    public Task<VmwareDiscovered[]> DiscoverVmware(CancellationToken ct = default) => Call<VmwareDiscovered[]>(Command.Create("discoverVmware", new { }), ct);
+    public async Task SetupVmware(VmwareSettings settings)
+    {
+        if ((settings.OverflowToLocal || settings.Machines.Any(m => m.UseLocalNetwork)) && !(await Call<Snapshot>(Command.Create("snapshot", new { }))).SupportsVmwareLocalNetwork)
+            throw new InvalidOperationException("本地網路需要新版代理元件，請安裝新版私人測試安裝包。");
+        await Act("setupVmware", settings);
+    }
+    public Task PauseVmware() => Act("pauseVmware", new { });
+    public Task SaveVmware(VmwareSettings settings, bool prepare) => Act(prepare ? "prepareVmware" : "setVmware", settings);
+    public Task RestoreVmware() => Act("restoreVmware", new { });
     public async Task Migrate()
     {
         if (config.Bindings.Any(b => b.IncludeChildren)) {

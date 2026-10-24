@@ -31,13 +31,16 @@ public static class AssignmentPlanner
         var keys = request.Items.Select(i => i.Target.Key).ToHashSet(StringComparer.Ordinal);
         if (keys.Count != request.Items.Length || keys.Contains("")) throw new InvalidOperationException("目標識別不可空白或重複。");
         var proxyIds = profiles.Select(p => p.Id).ToHashSet();
-        var result = current.Where(b => !keys.Contains(b.TargetKey)).Select(b => b with { }).ToList();
+        var existing = current.ToArray();
+        var result = existing.Where(b => !keys.Contains(b.TargetKey)).Select(b => b with { }).ToList();
         foreach (var item in request.Items) {
             if (!proxyIds.Contains(item.ProxyId)) throw new InvalidOperationException("找不到指定代理。");
             var t = item.Target;
             if (t.Kind is not ("Process" or "LDPlayer" or "MuMu" or "GameGroup") || t.Kind == "Process" && (t.Processes.Length != 1 || !t.Running) || t.Kind == "GameGroup" && (t.Processes.Length is < 1 or > 64 || !t.Running)) throw new InvalidOperationException("請選取正在執行的程序或已辨識的模擬器／遊戲組。");
             if (item.IncludeChildren && t.Kind != "Process") throw new InvalidOperationException("子程序代理僅適用一般程序；雷電與遊戲組使用各自的成員規則。");
+            var previous = existing.FirstOrDefault(b => b.TargetKey == t.Key);
             result.Add(new() { TargetKey = t.Key, ProxyId = item.ProxyId, SharedProxy = item.SharedProxy, IncludeChildren = item.IncludeChildren,
+                Descendants = item.IncludeChildren && previous?.IncludeChildren == true && previous.Processes.SequenceEqual(t.Processes) ? previous.Descendants.ToArray() : [],
                 Name = t.Name, Kind = t.Kind, Path = t.Path, Index = t.Index, Processes = t.Processes.ToArray(), Enabled = false,
                 EmulatorProcessPath = t.EmulatorProcessPath, EmulatorCommandHash = t.EmulatorCommandHash });
         }

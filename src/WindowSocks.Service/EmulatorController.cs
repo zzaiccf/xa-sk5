@@ -98,7 +98,7 @@ public sealed partial class Controller
     {
         bool running = NativeEngine.Present && NativeEngine.Core_IsRunning() != 0;
         sessions.Synchronize(config.Bindings.Select(b => new ProxySessionState(b.TargetKey, b.ProxyId,
-            b.Processes.Where(p => LdPlayer.Identity(p.Pid) == p && IsOwned(p.Pid)).ToArray(),
+            b.Kind == "Process" && b.IncludeChildren ? b.Processes : b.Processes.Where(p => LdPlayer.Identity(p.Pid) == p && IsOwned(p.Pid)).ToArray(),
             running && b.Enabled && !conflicts.Contains(b.TargetKey) && Healthy(b.ProxyId) && !DuplicateExit(b.ProxyId))), DateTimeOffset.UtcNow);
     }
 }

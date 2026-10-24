@@ -23,6 +23,19 @@ public sealed class GameProcessTests
         Assert.Equal(Environment.ProcessPath, ProcessCatalog.ImagePath(Environment.ProcessId), StringComparer.OrdinalIgnoreCase);
         Assert.Empty(ProcessCatalog.ImagePath(int.MaxValue));
     }
+    [Fact] public async Task FilenameRulesAlsoQuarantineStartupBeforeDiscovery()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "WindowSocksTests", Guid.NewGuid().ToString("N")); Directory.CreateDirectory(directory);
+        File.WriteAllText(Path.Combine(directory, "owner.sid"), WindowsIdentity.GetCurrent().User!.Value);
+        new ConfigStore(directory).Save(new() { AutoProxy = new() { Enabled = true, Kind = "Process", Pattern = "ping.exe" } });
+        using var child = Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "ping.exe")) { Arguments = "-n 30 127.0.0.1", UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true })!;
+        try {
+            using var service = new Controller(directory); var identity = LdPlayer.Identity(child.Id)!.Value;
+            Assert.Equal(2, NativeEngine.Core_RouteForTest((uint)child.Id, (ulong)identity.CreatedFileTime, 0, out _));
+            var snapshot = Json.Read<Snapshot>((await service.Dispatch(Command.Create("snapshot", new { }), default)).Data);
+            Assert.True(snapshot.AutoProxy.IncludeChildren); Assert.True(snapshot.SupportsProcessHandoffs);
+        } finally { NativeEngine.Core_ReplacePolicy([], 0, "\0\0"); if (!child.HasExited) child.Kill(); child.WaitForExit(); Directory.Delete(directory, true); }
+    }
     [Fact] public async Task SavedFullPathRuleGuardsStartupBeforeDiscoveryAndExplicitOverflowCanBypass()
     {
         string directory = Path.Combine(Path.GetTempPath(), "WindowSocksTests", Guid.NewGuid().ToString("N")); Directory.CreateDirectory(directory);

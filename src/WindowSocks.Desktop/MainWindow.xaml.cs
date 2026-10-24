@@ -21,11 +21,18 @@ public partial class MainWindow : Window
     private readonly Backend backend;
     private readonly IDesktopStartupController startup;
     private readonly bool integrateShell;
+    private readonly IProxyServiceSession serviceSession;
+    private bool closingService, exitCleaned;
     private bool startupChanging;
     private Snapshot? snapshot;
     private Snapshot? lastConnectedSnapshot;
     private TargetInstance[] targets = [];
+    private VmwareDiscovered[] vmwareDiscovered = [];
+    private TargetRow[] windowRows = [];
     private bool busy, quitting, picking;
+    private bool ruleDialogOpen, vmwareDialogOpen;
+    private bool bulkActionPending;
+    private readonly Func<string, string, bool> confirmBulkAction;
     private readonly AutomaticProbeSchedule probeSchedule = new();
     private readonly CancellationTokenSource lifetime = new();
     private readonly Dictionary<ProbeJob, CancellationTokenSource> probeRequests = [];
@@ -39,12 +46,19 @@ public partial class MainWindow : Window
     private Task? discovery;
     private bool taskbarReading, taskbarRequesting;
     private readonly List<TargetInstance> extraTargets = [];
+    private Guid[] contextProxyIds = [];
+    private bool contextFromPointer, contextOnRow;
+    private string? contextRuleKey;
+    private bool ruleContextFromPointer, ruleContextOnRow;
     public MainWindow() : this(new Backend(), new DesktopStartupController(), true) { }
-    public MainWindow(Backend backend, IDesktopStartupController? startup = null, bool integrateShell = false)
+    public MainWindow(Backend backend, IDesktopStartupController? startup = null, bool integrateShell = false, IProxyServiceSession? serviceSession = null,
+        Func<string, string, bool>? confirmBulkAction = null)
     {
         this.integrateShell = integrateShell;
         this.backend = backend ?? throw new ArgumentNullException(nameof(backend));
+        this.confirmBulkAction = confirmBulkAction ?? ((message, title) => MessageBox.Show(this, message, title, MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes);
         this.startup = startup ?? new PreviewStartupController();
+        this.serviceSession = serviceSession ?? (integrateShell ? new DesktopProxySession(backend) : new PreviewProxySession());
         InitializeComponent(); LdPath.Text = backend.ConsolePath; ProductVersionText.Text = AboutVersionText.Text = AppReleasePackage.CurrentVersion + " · 預覽版";
         RenderStartup();
         Activated += async (_, _) => { if (this.integrateShell && !taskbarRequesting) await RefreshTaskbar(); };
@@ -52,10 +66,11 @@ public partial class MainWindow : Window
         tray = new() { Icon = trayIcon, Visible = true, Text = "xa sk5" };
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("開啟 xa sk5", null, (_, _) => Dispatcher.Invoke(Restore));
-        menu.Items.Add("結束介面（背景服務繼續執行）", null, (_, _) => Dispatcher.Invoke(() => { quitting = true; Close(); }));
+        menu.Items.Add("結束 xa sk5", null, (_, _) => Dispatcher.Invoke(Close));
         tray.ContextMenuStrip = menu; tray.DoubleClick += (_, _) => Dispatcher.Invoke(Restore);
         Loaded += async (_, _) => {
-            await Run("正在讀取節點並自動檢測實際 IP…", () => Refresh(false, skipDiscovery: true));
+            await Run("正在啟動代理元件並讀取節點…", async () => { await this.serviceSession.StartAsync(lifetime.Token); await Refresh(false, skipDiscovery: true); });
+            if (!lifetime.IsCancellationRequested) { discovery = DiscoverTargets(); _ = RefreshAfterDiscovery(discovery); }
             if (this.integrateShell) {
                 try {
                     WindowsShortcuts.Initialize(Registry.CurrentUser, DesktopExecutable);
@@ -137,8 +152,27 @@ public partial class MainWindow : Window
     }
     private void OnClosing(object? sender, CancelEventArgs e)
     {
-        if (!quitting) { e.Cancel = true; Hide(); tray.ShowBalloonTip(1800, "xa sk5 仍在系統匣", "背景服務不受主視窗關閉影響。", System.Windows.Forms.ToolTipIcon.Info); }
-        else { timer.Stop(); durationTimer.Stop(); probeSchedule.Stop(); lifetime.Cancel(); backend.StopProbes(); tray.Dispose(); trayIcon.Dispose(); }
+        if (quitting) { CleanupExit(); return; }
+        e.Cancel = true;
+        if (closingService) return;
+        closingService = true; IsEnabled = false; timer.Stop(); durationTimer.Stop(); backend.StopProbes();
+        StatusText.Text = "正在停止代理與背景服務…";
+        Dispatcher.BeginInvoke(new Action(async () => await CloseWithService()));
+    }
+    private async Task CloseWithService()
+    {
+        try { await serviceSession.StopAsync(CancellationToken.None); quitting = true; Close(); }
+        catch (Exception ex) {
+            closingService = false; IsEnabled = true; timer.Start(); durationTimer.Start();
+            StatusText.Text = "尚未完成關閉：" + ex.Message;
+            Restore();
+        }
+    }
+    private void CleanupExit()
+    {
+        if (exitCleaned) return; exitCleaned = true;
+        timer.Stop(); durationTimer.Stop(); probeSchedule.Stop(); lifetime.Cancel(); backend.StopProbes();
+        tray.Visible = false; tray.Dispose(); trayIcon.Dispose();
     }
     private static System.Drawing.Icon LoadTrayIcon()
     {
@@ -156,7 +190,7 @@ public partial class MainWindow : Window
         }
         busy = true; if (message.Length > 0) StatusText.Text = message;
         try { await action(); if (message.Length > 0) StatusText.Text = "完成 · " + DateTime.Now.ToString("HH:mm:ss") + (probeSchedule.ActiveCount == 0 ? "" : $" · 實際 IP 自動檢測中（{probeSchedule.ActiveCount} 條並行）"); }
-        catch (Exception ex) { StatusText.Text = ex.Message; if (showError) MessageBox.Show(this, ex.Message, "xa sk5", MessageBoxButton.OK, MessageBoxImage.Information); }
+        catch (Exception ex) { StatusText.Text = ex.Message; if (showError && !closingService && !quitting) MessageBox.Show(this, ex.Message, "xa sk5", MessageBoxButton.OK, MessageBoxImage.Information); }
         finally { busy = false; }
     }
     private async Task Refresh(bool discover, bool skipDiscovery = false)
@@ -187,41 +221,50 @@ public partial class MainWindow : Window
     }
     private async Task DiscoverTargets()
     {
-            await Task.Yield();
+        string ldConsole = backend.ConsolePath, mumuConsole = backend.MuMuConsolePath;
+        bool online = backend.Online; var extra = extraTargets.ToArray(); var ct = lifetime.Token;
+        var result = await Task.Run(async () => {
+            string message = "";
             TargetInstance[] ld = [];
-            if (File.Exists(backend.ConsolePath))
+            if (File.Exists(ldConsole))
             {
                 try {
-                    var output = await LdPlayer.RunAsync(backend.ConsolePath, ["list2"], lifetime.Token);
-                    ld = LdPlayer.Parse(output, backend.ConsolePath, LdPlayer.Identity);
+                    var output = await LdPlayer.RunAsync(ldConsole, ["list2"], ct);
+                    ld = LdPlayer.Parse(output, ldConsole, LdPlayer.Identity);
                 }
-                catch (Exception ex) when (ex is not OutOfMemoryException) { StatusText.Text = "模擬器探索未完成；繼續讀取節點與自動檢測實際 IP。"; }
+                catch (Exception ex) when (ex is not OutOfMemoryException && !ct.IsCancellationRequested) { message = "模擬器探索未完成；繼續讀取節點與自動檢測實際 IP。"; }
             }
             TargetInstance[] mumu = [];
-            if (File.Exists(backend.MuMuConsolePath)) {
-                try { mumu = await EmulatorCatalog.DiscoverAsync("MuMu", backend.MuMuConsolePath, lifetime.Token); }
-                catch (Exception ex) when (ex is not OutOfMemoryException) { StatusText.Text = "MuMu 清單暫時無法讀取；固定配置仍保留。"; }
+            if (File.Exists(mumuConsole)) {
+                try { mumu = await EmulatorCatalog.DiscoverAsync("MuMu", mumuConsole, ct); }
+                catch (Exception ex) when (ex is not OutOfMemoryException && !ct.IsCancellationRequested) { message = "MuMu 清單暫時無法讀取；固定配置仍保留。"; }
             }
-            targets = ld.Concat(mumu).Concat(extraTargets.Where(t => t.Processes.All(p => LdPlayer.Identity(p.Pid) == p))).DistinctBy(t => t.Key).ToArray(); lastDiscovery = DateTimeOffset.Now;
+            var found = ld.Concat(mumu).Concat(extra.Where(t => t.Processes.All(p => LdPlayer.Identity(p.Pid) == p))).DistinctBy(t => t.Key).ToArray();
+            VmwareDiscovered[] vmware;
+            try { vmware = online ? await backend.DiscoverVmware(ct) : await VmwareDiscovery.Running(ct); }
+            catch (Exception ex) when (ex is not OutOfMemoryException && !ct.IsCancellationRequested) { vmware = []; }
+            return (Targets: found, Vmware: vmware, Message: message);
+        }, ct);
+        if (ct.IsCancellationRequested) return;
+        targets = result.Targets; vmwareDiscovered = result.Vmware; lastDiscovery = DateTimeOffset.Now;
+        if (result.Message.Length > 0 && !ruleDialogOpen) StatusText.Text = result.Message;
     }
     private void RenderSnapshot()
     {
         if (snapshot is null) return;
+        string? selectedRule = (RuleGrid.SelectedItem as ProxyRuleItem)?.Key;
+        RuleGrid.ItemsSource = ProxyRules.List(snapshot);
+        RuleGrid.SelectedItem = RuleGrid.Items.Cast<ProxyRuleItem>().FirstOrDefault(r => r.Key == selectedRule);
         RenderStartup();
-        var selectedTarget = TargetGrid.SelectedItems.Cast<TargetRow>().Select(x => x.Target.Key).ToHashSet();
         var selectedProxy = ProxyGrid.SelectedItems.Cast<ProxyRow>().Select(x => x.Profile.Id).ToHashSet();
-        TargetGrid.ItemsSource = snapshot.Targets.Select(t => {
-            var b = snapshot.Bindings.FirstOrDefault(x => x.TargetKey == t.Key); var p = snapshot.Proxies.FirstOrDefault(x => x.Id == b?.ProxyId); var result = snapshot.Probes.FirstOrDefault(x => x.ProxyId == p?.Id); var status = snapshot.Statuses.FirstOrDefault(x => x.TargetKey == t.Key);
-            int count = p is null ? 0 : snapshot.Bindings.Count(x => x.ProxyId == p.Id);
-            return new TargetRow(t, t.Name + (EmulatorCatalog.IsEmulator(t.Kind) ? $"  #{t.Index}" : t.Kind == "GameGroup" ? $"（{t.Processes.Length} 個成員）" : b?.IncludeChildren == true ? $"（含 {b.Descendants.Length} 個子程序）" : ""), p is null ? "尚未分配" : p.Name + (count > 1 ? $"（共用 {count}）" : ""), result?.ExitLabel ?? "未驗證", status?.State ?? (t.Kind is "GameGroup" or "GameOrphan" ? "未分配 · 已封鎖" : snapshot.GlobalProxy.Enabled ? "依全局代理規則" : t.Running ? "執行中 · 未代理" : "未啟動"), status is null ? "—" : $"{Size(status.Sent)} / {Size(status.Received)}", result is null ? "未檢測" : $"{(result.Tcp ? "通過" : "失敗")} / {(result.Udp ? "通過" : "失敗")}") { ConnectedAt = status?.ConnectedAt, Connections = status is null ? "—" : $"{status.TcpConnections} / {status.UdpAssociations}", Members = t.Detail, Node = p is null ? null : new ProxyNodeDisplay(p, result), AccountPort = p is null ? "尚未分配" : new ProxyNodeDisplay(p, result).AccountPort, EntryIp = p?.Host ?? "—" };
-        }).ToArray();
+        windowRows = BuildWindowRows(snapshot);
+        RenderWindowList();
         var query = ProxySearch.Text.Trim();
-        var rows = snapshot.Proxies.Select(p => new ProxyRow(p, snapshot.Probes.FirstOrDefault(x => x.ProxyId == p.Id), snapshot.Bindings.Count(b => b.ProxyId == p.Id), string.Join("、", snapshot.Bindings.Where(b => b.ProxyId == p.Id).Select(b => b.Name)), probeSchedule.IsActive(p.Id), probeSchedule.IsQueued(p.Id))).ToArray();
+        var rows = snapshot.Proxies.Select(p => new ProxyRow(p, snapshot.Probes.FirstOrDefault(x => x.ProxyId == p.Id), snapshot.Bindings.Count(b => b.ProxyId == p.Id) + windowRows.Count(r => r.Target.Kind == "VMware" && r.Target.Running && r.Node?.Id == p.Id), string.Join("、", snapshot.Bindings.Where(b => b.ProxyId == p.Id).Select(b => b.Name).Concat(windowRows.Where(r => r.Target.Kind == "VMware" && r.Target.Running && r.Node?.Id == p.Id).Select(r => r.Name))), probeSchedule.IsActive(p.Id), probeSchedule.IsQueued(p.Id))).ToArray();
         ProxyGrid.ItemsSource = rows.Where(r => query.Length == 0 || new[] { r.Name, r.EntryIp, r.Profile.Username, r.Probe?.TcpExit, r.Probe?.UdpExit }.Any(value => value?.Contains(query, StringComparison.OrdinalIgnoreCase) == true)).ToArray();
-        foreach (TargetRow row in TargetGrid.Items) if (selectedTarget.Contains(row.Target.Key)) TargetGrid.SelectedItems.Add(row);
         foreach (ProxyRow row in ProxyGrid.Items) if (selectedProxy.Contains(row.Profile.Id)) ProxyGrid.SelectedItems.Add(row);
         UpdateProxyDetails();
-        TargetCount.Text = snapshot.Targets.Length.ToString(); ProxyCount.Text = snapshot.Proxies.Length.ToString();
+        ProxyCount.Text = snapshot.Proxies.Length.ToString();
         ReadyCount.Text = snapshot.Probes.Count(p => p.Ready && !ProbeTiming.IsStale(p.At, DateTimeOffset.UtcNow) && snapshot.Proxies.Any(profile => profile.Id == p.ProxyId)).ToString();
         ReadyCount.ToolTip = "最近 30 分鐘內 TCP 與 UDP 皆實測通過的節點數。";
         ModeText.Text = !backend.Online ? "離線模式" : "服務已連線";
@@ -239,14 +282,15 @@ public partial class MainWindow : Window
         StopProbe.IsEnabled = !probeSchedule.Paused && snapshot.Proxies.Length > 0;
         StopProbe.Visibility = probeSchedule.Paused ? Visibility.Collapsed : Visibility.Visible;
         ResumeProbe.Visibility = probeSchedule.Paused ? Visibility.Visible : Visibility.Collapsed;
-        TargetEmpty.Visibility = snapshot.Targets.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        RenderWorkspaceCounters();
         ProxyEmpty.Visibility = ProxyGrid.Items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         ProxyEmptyTitle.Text = query.Length > 0 ? "找不到符合的節點" : "匯入你的第一個節點";
         ProxyEmptyHint.Text = query.Length > 0 ? "試試其他 IP、帳號或名稱。" : "貼上代理資料，實際 IP 會自動檢測。";
         ProxyListSummary.Text = query.Length > 0 ? $"{ProxyGrid.Items.Count} / {rows.Length} 個節點" : $"{rows.Length} 個節點";
         if (ProxyGrid.SelectedItems.Count > 0) ProxyListSummary.Text += $" · 已選 {ProxyGrid.SelectedItems.Count}";
         ManualProbe.IsEnabled = snapshot.Proxies.Length > 0;
-        MainRefresh.ToolTip = Pages.SelectedIndex == 1 ? "立即檢測並更新節點" : "重新整理";
+        RenderBulkActions();
+        MainRefresh.ToolTip = Pages.SelectedIndex == 2 ? "立即檢測並更新節點" : "重新整理";
         int supplemental = snapshot.Probes.Count(p => p.UdpPending);
         ProbeStateText.Text = probeSchedule.ActiveCount > 0 || probeSchedule.PendingCount > 0 ? $"TCP 檢測中 · {probeSchedule.ActiveCount} 條並行 · 等待 {probeSchedule.PendingCount}" : supplemental > 0 ? $"TCP 已完成 · 背景補測 {supplemental} 條" : probeSchedule.Paused ? "自動檢測已暫停" : "每 30 分鐘複測";
         if (probeStatusPending) {
@@ -261,6 +305,56 @@ public partial class MainWindow : Window
         ProbeStateText.ToolTip = backend.Online && !snapshot.SupportsLowFrequencyProbes
             ? "清單成功後每 30 分鐘複測、失敗後 5 分鐘重試。目前舊版背景服務仍有較頻繁的健康檢查，更新至 0.1.12 後會同步降低頻率。"
             : "開啟與匯入時檢測一次；成功後 30 分鐘複測，失敗後 5 分鐘重試。需要最新結果可按「立即檢測」。";
+    }
+    private void RenderBulkActions()
+    {
+        if (snapshot is null) return;
+        bool supported = backend.Online && snapshot.SupportsBulkActions;
+        ClearAllProxyIps.IsEnabled = !bulkActionPending && snapshot.Proxies.Length > 0 && (!backend.Online || supported);
+        ClearAllProxyIps.ToolTip = backend.Online && !supported ? "請先套用 0.1.22 以上背景服務。" : "清除全部節點，不受搜尋或選取影響。使用中的節點會阻止整批清除。";
+        CloseAllProxyProcesses.IsEnabled = !bulkActionPending && supported &&
+            (snapshot.Bindings.Any(b => b.Processes.Length > 0 || b.Descendants.Length > 0) || snapshot.Vmware?.Machines.Any(m => m.Process.HasValue && m.ProxyId != Guid.Empty && !m.UseLocalNetwork) == true);
+        CloseAllProxyProcesses.ToolTip = !supported ? "請先連線並套用 0.1.22 以上背景服務。" : "結束所有個別綁定的程式及子程序；全局代理與僅使用全局代理的其他程式不受影響。";
+    }
+    private async void ClearAllProxyIpsClick(object sender, RoutedEventArgs e)
+    {
+        if (bulkActionPending) return;
+        bulkActionPending = true; RenderBulkActions();
+        try {
+            await Run("", async () => {
+                await Refresh(false, skipDiscovery: true);
+                int count = snapshot?.Proxies.Length ?? 0;
+                if (count == 0) return;
+                if (!confirmBulkAction($"清除全部 {count} 個 IP 節點？此操作包含目前搜尋未顯示及未選取的節點。\n\n使用中的節點會阻止整批清除，請先解除相關綁定或分配；不會關閉程式或自動停用全局代理。", "清除所有 IP")) return;
+                StatusText.Text = "正在清除所有 IP…";
+                try {
+                    var result = await backend.ClearProxyPool();
+                    foreach (Guid id in result.RemovedIds) probeSchedule.Invalidate(id);
+                    await Refresh(false, skipDiscovery: true);
+                    StatusText.Text = $"已清除全部 {result.RemovedIds.Length} 個 IP 節點。";
+                } catch { await Refresh(false, skipDiscovery: true); throw; }
+            });
+        } finally { bulkActionPending = false; RenderBulkActions(); }
+    }
+    private async void CloseAllProxyProcessesClick(object sender, RoutedEventArgs e)
+    {
+        if (bulkActionPending) return;
+        bulkActionPending = true; RenderBulkActions();
+        try {
+            await Run("", async () => {
+                StatusText.Text = "正在確認個別綁定的程式與子程序…";
+                var plan = await backend.PrepareCloseProxyProcesses();
+                if (plan.ProcessCount == 0) { StatusText.Text = "目前沒有可關閉的個別代理進程；全局代理保持原設定。"; return; }
+                string names = string.Join("\n", plan.Targets.Take(8).Select(t => "• " + t.Name));
+                if (plan.Targets.Length > 8) names += $"\n…另 {plan.Targets.Length - 8} 組";
+                string vmWarning = plan.Targets.Any(t => t.Key.StartsWith("vmware:", StringComparison.OrdinalIgnoreCase)) ? "VMware 程序會直接結束，請先保存虛擬機工作。" : "";
+                if (!confirmBulkAction($"關閉 {plan.Targets.Length} 組個別代理程式及其子程序（目前共 {plan.ProcessCount} 個程序）？\n\n{names}\n\n未儲存的工作可能遺失。{vmWarning}全局代理及僅使用全局代理的其他程式保持運作；代理規則會保留。", "關閉所有代理進程")) { StatusText.Text = "已取消關閉代理進程。"; return; }
+                StatusText.Text = "正在關閉個別代理程式與子程序…";
+                var result = await backend.CloseProxyProcesses(plan.Token);
+                await Refresh(false, skipDiscovery: true); StatusText.Text = result.Message;
+                if (result.Unclosed > 0) MessageBox.Show(this, string.Join("\n", result.Processes.Where(p => p.State is "failed" or "skipped").Take(20).Select(p => $"PID {p.Identity.Pid}：{p.Message}")), "部分代理進程未關閉", MessageBoxButton.OK, MessageBoxImage.Information);
+            });
+        } finally { bulkActionPending = false; RenderBulkActions(); }
     }
     private void RenderGlobalProxy()
     {
@@ -286,8 +380,8 @@ public partial class MainWindow : Window
         StopGlobal.IsEnabled = StopGlobalBanner.IsEnabled = state.CanStop;
         ManageGlobal.IsEnabled = backend.Online && snapshot.Proxies.Length > 0;
         GlobalProxyButton.Content = snapshot.GlobalProxy.Enabled && backend.Online ? "全局設定" : "全局代理";
-        TargetEmptyTitle.Text = snapshot.GlobalProxy.Enabled ? "尚無個別管理的窗口" : "尚無管理中的窗口";
-        TargetEmptyHint.Text = snapshot.GlobalProxy.Enabled ? "全局模式會依上方狀態處理其餘程式流量。" : "設定自動代理，或從「更多」加入程序。";
+        TargetEmptyTitle.Text = WindowFilter.SelectedIndex == 0 ? "目前沒有執行中的窗口" : "尚無管理中的窗口";
+        TargetEmptyHint.Text = snapshot.GlobalProxy.Enabled ? "全局模式會依上方狀態處理其餘程式流量。" : "已儲存設定可在「規則管理」查看；切換「全部窗口」可看未啟動項目。";
         Title = state.ShowBanner ? "xa sk5 · " + state.Title : "xa sk5";
         tray.Text = "xa sk5 · " + state.Title;
         UpdateSummaryCards();
@@ -296,25 +390,110 @@ public partial class MainWindow : Window
     private void UpdateSummaryCards()
     {
         if (SummaryCards is null || Pages is null || GlobalBanner is null) return;
-        SummaryCards.Visibility = Pages.SelectedIndex == 2 || GlobalBanner.Visibility == Visibility.Visible && Workspace.ActualHeight is > 0 and < 650 ? Visibility.Collapsed : Visibility.Visible;
+        SummaryCards.Visibility = Pages.SelectedIndex == 3 || GlobalBanner.Visibility == Visibility.Visible && Workspace.ActualHeight is > 0 and < 650 ? Visibility.Collapsed : Visibility.Visible;
     }
     private static string Size(long n) => n >= 1048576 ? $"{n / 1048576d:F1} MB" : $"{n / 1024d:F1} KB";
+    private void WindowFilterChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (TargetGrid is null || RuleGrid is null || RuntimePicker is null || TargetCountLabel is null) return;
+        RenderWindowList(); RenderWorkspaceCounters();
+    }
+    private void RenderWindowList()
+    {
+        var selected = TargetGrid.SelectedItems.Cast<TargetRow>().Select(r => r.Target.Key).ToHashSet();
+        TargetGrid.ItemsSource = windowRows.Where(r => WindowFilter.SelectedIndex == 1 || r.Target.Running).ToArray();
+        foreach (TargetRow row in TargetGrid.Items) if (selected.Contains(row.Target.Key)) TargetGrid.SelectedItems.Add(row);
+        TargetEmpty.Visibility = TargetGrid.Items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        TargetSelectionChanged(this, null!);
+    }
+    private void RenderWorkspaceCounters()
+    {
+        bool rules = Pages.SelectedIndex == 1;
+        RuleEmpty.Visibility = RuleGrid.Items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        TargetCountLabel.Text = rules ? "已儲存規則" : WindowFilter.SelectedIndex == 0 ? "執行中窗口" : "全部窗口";
+        TargetCount.Text = (rules ? RuleGrid.Items.Count : TargetGrid.Items.Count).ToString();
+        RuleListSummary.Text = $"共 {RuleGrid.Items.Count} 條規則 · 未啟動、等待準備與已暫停的規則都會保留 · 右鍵可編輯或刪除";
+        AutoStatus.Text = $"{TargetGrid.Items.Count} 個窗口 · 每 5 秒更新 · VM 顯示目前分配的線路，客體實際出口仍需核對";
+    }
+    private void TargetSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (EnableTargetAction is null) return;
+        var selected = TargetGrid.SelectedItems.Cast<TargetRow>().ToArray();
+        EnableTargetAction.IsEnabled = PauseTargetAction.IsEnabled = UnbindTargetAction.IsEnabled = selected.Length > 0 && selected.All(r => r.Target.Kind != "VMware");
+        RuntimeBind.IsEnabled = selected.Length > 0 && (selected.All(r => r.Target.Kind == "VMware") || selected.All(r => r.Target.Kind != "VMware"));
+        RuntimeBind.Content = selected.Length > 0 && selected.All(r => r.Target.Kind == "VMware") ? "調整 VM 線路" : "分配節點";
+    }
+    private TargetRow[] BuildWindowRows(Snapshot state) => WindowInventory.List(state, vmwareDiscovered).Select(item => {
+        var target = item.Target; var binding = state.Bindings.FirstOrDefault(b => b.TargetKey == target.Key);
+        var profile = state.Proxies.FirstOrDefault(p => p.Id == item.ProxyId); var probe = state.Probes.FirstOrDefault(p => p.ProxyId == item.ProxyId);
+        string line = item.UseLocalNetwork ? "本地網路" : profile is null ? item.Rule == "未設定規則" ? "未納管" : "尚未分配" : profile.Name.Length > 0 ? profile.Name : profile.Endpoint;
+        if (target.Kind == "VMware" && item.State.Contains("未代理") && (profile is not null || item.UseLocalNetwork)) line = "預定 · " + line;
+        return new TargetRow(target, target.Name + (EmulatorCatalog.IsEmulator(target.Kind) ? $"  #{target.Index}" : target.Kind == "GameGroup" ? $"（{target.Processes.Length} 個成員）" : binding?.IncludeChildren == true ? $"（含 {binding.Descendants.Length} 個子程序）" : ""), line,
+            item.UseLocalNetwork ? "本地出口待核對" : probe?.ExitLabel ?? "未驗證", item.State, item.Sent is { } sent && item.Received is { } received ? $"{Size(sent)} / {Size(received)}" : "—", probe is null ? "未檢測" : $"{(probe.Tcp ? "通過" : "失敗")} / {(probe.Udp ? "通過" : "失敗")}") {
+            ConnectedAt = item.State.Contains("未代理") || item.State.Contains("封鎖") ? null : item.ConnectedAt,
+            Connections = item.TcpConnections.HasValue ? $"{item.TcpConnections} / {item.UdpAssociations}" : "—", Members = item.Detail + "\n規則：" + item.Rule,
+            Node = profile is null ? null : new ProxyNodeDisplay(profile, probe), AccountPort = profile is null ? "—" : new ProxyNodeDisplay(profile, probe).AccountPort, EntryIp = profile?.Host ?? "—", InstanceDetail = item.InstanceDetail
+        };
+    }).ToArray();
+    private void EditRuleClick(object sender, RoutedEventArgs e)
+    {
+        if (RuleGrid.SelectedItem is not ProxyRuleItem rule) return;
+        if (rule.Key == "vmware") VmwareClick(sender, e);
+        else if (rule.Key == "automatic") AutoProxyClick(sender, e);
+        else {
+            WindowFilter.SelectedIndex = 1; SelectWorkspace(0); TargetGrid.UnselectAll();
+            TargetGrid.SelectedItem = TargetGrid.Items.Cast<TargetRow>().FirstOrDefault(r => rule.Key == "binding:" + r.Target.Key);
+            BindClick(sender, e);
+        }
+    }
+    private void RuleGridRightMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        ruleContextFromPointer = true; ruleContextOnRow = false;
+        for (var source = e.OriginalSource as DependencyObject; source is not null && source != RuleGrid;) {
+            if (source is DataGridRow row && row.Item is ProxyRuleItem item) {
+                ruleContextOnRow = true; RuleGrid.SelectedItem = item; row.Focus(); break;
+            }
+            source = source is FrameworkContentElement content ? content.Parent :
+                source is System.Windows.Media.Visual or System.Windows.Media.Media3D.Visual3D ? System.Windows.Media.VisualTreeHelper.GetParent(source) : LogicalTreeHelper.GetParent(source);
+        }
+    }
+    private void RuleGridKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Apps || e.Key == Key.F10 && Keyboard.Modifiers == ModifierKeys.Shift) ruleContextFromPointer = false;
+    }
+    private void RuleContextOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (busy || ruleContextFromPointer && !ruleContextOnRow || RuleGrid.SelectedItem is not ProxyRuleItem item) { contextRuleKey = null; e.Handled = true; }
+        else { contextRuleKey = item.Key; ContextDeleteRule.IsEnabled = true; }
+        ruleContextFromPointer = false;
+    }
+    private async void DeleteRuleClick(object sender, RoutedEventArgs e)
+    {
+        string? key = contextRuleKey; if (key is null) return;
+        await Run("正在刪除規則…", async () => { await backend.DeleteRule(key); await Refresh(false, skipDiscovery: true); StatusText.Text = "規則已刪除。"; });
+    }
     private void Navigate(object sender, RoutedEventArgs e)
     {
-        int index = int.Parse((string)((Button)sender).Tag); Pages.SelectedIndex = index;
+        SelectWorkspace(int.Parse((string)((Button)sender).Tag));
+    }
+    private void SelectWorkspace(int index)
+    {
+        Pages.SelectedIndex = index;
         foreach (var button in SidebarNavigation.Children.OfType<Button>()) {
-            button.Background = button == sender ? (System.Windows.Media.Brush)FindResource("SoftBlue") : System.Windows.Media.Brushes.Transparent;
-            button.Foreground = (System.Windows.Media.Brush)FindResource(button == sender ? "Accent" : "Muted");
-            button.FontWeight = button == sender ? FontWeights.SemiBold : FontWeights.Normal;
+            bool active = int.Parse((string)button.Tag) == index;
+            button.Background = active ? (System.Windows.Media.Brush)FindResource("SoftBlue") : System.Windows.Media.Brushes.Transparent;
+            button.Foreground = (System.Windows.Media.Brush)FindResource(active ? "Accent" : "Muted");
+            button.FontWeight = active ? FontWeights.SemiBold : FontWeights.Normal;
         }
-        PageTitle.Text = new[] { "窗口管理", "代理與檢測", "設定" }[index];
-        PageSubtitle.Text = new[] { "每個實例，專屬出口。", "節點、實際 IP 與連線狀態。", "服務、模擬器與資料。" }[index];
+        PageTitle.Text = new[] { "窗口列表", "規則管理", "代理與檢測", "設定" }[index];
+        PageSubtitle.Text = new[] { "正在執行的窗口、虛擬機與目前使用的 IP 線路。", "已儲存的分配規則、網路準備與啟用狀態。", "節點、實際 IP 與連線狀態。", "服務、模擬器與資料。" }[index];
+        RenderWorkspaceCounters();
         UpdateSummaryCards();
-        MainRefresh.ToolTip = index == 1 ? "立即檢測並更新節點" : "重新整理";
+        MainRefresh.ToolTip = index == 2 ? "立即檢測並更新節點" : "重新整理";
     }
     private async void RefreshClick(object sender, RoutedEventArgs e)
     {
-        bool probe = Pages.SelectedIndex == 1;
+        bool probe = Pages.SelectedIndex == 2;
         await Run("正在重新整理…", () => Refresh(!probe));
         if (probe) RequestManualProbe();
     }
@@ -338,7 +517,33 @@ public partial class MainWindow : Window
         var dialog = new SaveFileDialog { Filter = "CSV|*.csv", FileName = "xa-sk5-proxies.csv" };
         if (dialog.ShowDialog(this) == true) await Run("正在匯出…", async () => await File.WriteAllTextAsync(dialog.FileName, await backend.Export()));
     }
-    private async void DeleteClick(object sender, RoutedEventArgs e) => await Run("正在刪除…", async () => { foreach (var row in ProxyGrid.SelectedItems.Cast<ProxyRow>().ToArray()) await backend.Delete(row.Profile.Id); await Refresh(false); });
+    private async void DeleteClick(object sender, RoutedEventArgs e) => await DeleteProxies(ProxyGrid.SelectedItems.Cast<ProxyRow>().Select(row => row.Profile.Id).ToArray());
+    private Task DeleteProxies(Guid[] ids) => Run("正在刪除…", async () => {
+        try { foreach (var id in ids) await backend.Delete(id); }
+        finally { await Refresh(false, skipDiscovery: true); }
+    });
+    private async void ContextDeleteProxyClick(object sender, RoutedEventArgs e) => await DeleteProxies(contextProxyIds.ToArray());
+    private void ContextProbeProxyClick(object sender, RoutedEventArgs e)
+    {
+        probeSchedule.Request(contextProxyIds); RenderSnapshot(); StartProbeWorker();
+    }
+    private async void ContextEditProxyClick(object sender, RoutedEventArgs e)
+    {
+        if (contextProxyIds.Length != 1 || snapshot?.Proxies.FirstOrDefault(p => p.Id == contextProxyIds[0]) is not { } profile) return;
+        var dialog = new ProxyEditWindow(profile) { Owner = this };
+        if (dialog.ShowDialog() != true || dialog.Request is not { } request) return;
+        await Run("正在儲存節點…", async () => {
+            bool changed = await backend.Edit(request);
+            if (changed) {
+                foreach (var pair in probeRequests.Where(pair => pair.Key.ProxyId == profile.Id).ToArray()) pair.Value.Cancel();
+                probeSchedule.Invalidate(profile.Id);
+                if (snapshot is not null) snapshot = snapshot with { Probes = snapshot.Probes.Where(p => p.ProxyId != profile.Id).ToArray() };
+            }
+            await Refresh(false, skipDiscovery: true);
+            if (changed) { probeSchedule.Request([profile.Id]); RenderSnapshot(); StartProbeWorker(); }
+            StatusText.Text = changed ? "節點已儲存，正在重新檢測。" : "節點已儲存。";
+        });
+    }
     private void StartProbeWorker()
     {
         if (probeWorkerRunning || lifetime.IsCancellationRequested || probeSchedule.PendingCount == 0) return;
@@ -428,7 +633,30 @@ public partial class MainWindow : Window
     }
     private void ProxyGridKeyDown(object sender, KeyEventArgs e)
     {
+        if (e.Key == Key.Apps || e.Key == Key.F10 && Keyboard.Modifiers == ModifierKeys.Shift) contextFromPointer = false;
         if (e.Key == Key.Escape && ProxyGrid.SelectedItems.Count > 0) { ProxyGrid.UnselectAll(); e.Handled = true; }
+    }
+    private void ProxyGridRightMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        contextFromPointer = true; contextOnRow = false;
+        for (var source = e.OriginalSource as DependencyObject; source is not null && source != ProxyGrid;) {
+            if (source is DataGridRow row && row.Item is ProxyRow item) {
+                contextOnRow = true;
+                if (!row.IsSelected) { ProxyGrid.UnselectAll(); ProxyGrid.SelectedItem = item; }
+                row.Focus(); break;
+            }
+            source = source is FrameworkContentElement content ? content.Parent :
+                source is System.Windows.Media.Visual or System.Windows.Media.Media3D.Visual3D ? System.Windows.Media.VisualTreeHelper.GetParent(source) : LogicalTreeHelper.GetParent(source);
+        }
+    }
+    private void ProxyContextOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (busy || contextFromPointer && !contextOnRow || ProxyGrid.SelectedItems.Count == 0) { contextProxyIds = []; e.Handled = true; contextFromPointer = false; return; }
+        contextProxyIds = ProxyGrid.SelectedItems.Cast<ProxyRow>().Select(row => row.Profile.Id).ToArray();
+        ContextDeleteProxy.IsEnabled = ContextProbeProxy.IsEnabled = true;
+        ContextEditProxy.IsEnabled = contextProxyIds.Length == 1;
+        ContextEditProxy.ToolTip = contextProxyIds.Length == 1 ? "修改連入 IP、端口、帳密與到期時間" : "一次選取一個節點進行修改";
+        contextFromPointer = false;
     }
     private void ClearProxySelectionClick(object sender, RoutedEventArgs e) => ProxyGrid.UnselectAll();
     private void UpdateProxyDetails()
@@ -452,6 +680,10 @@ public partial class MainWindow : Window
     }
     private static string Ms(long? value) => value.HasValue ? $"{value} ms" : "—";
     public sealed record DetailFact(string Label, string Value);
+    private void RequireProcessHandoffSupport()
+    {
+        if (snapshot?.SupportsProcessHandoffs != true) throw new InvalidOperationException("請先安裝遊戲接續修正版，更新主程式與背景服務後再套用。原有 IP 配置會保留。");
+    }
     private void RequireServiceVersion(Version minimum, string feature)
     {
         if (!backend.Online || !Version.TryParse(snapshot?.Diagnostics.Version.Split(' ')[0], out var version) || version < minimum)
@@ -471,27 +703,54 @@ public partial class MainWindow : Window
     });
     private async void AutoProxyClick(object sender, RoutedEventArgs e)
     {
-        await Run("正在讀取自動分配規則…", async () => {
-            await Refresh(true);
+        if (ruleDialogOpen || closingService || quitting) return;
+        ruleDialogOpen = true;
+        try {
+            // Opening an editor uses the last rendered state. Discovery and service health checks
+            // can take seconds; neither may hold the editor behind the main-window work queue.
+            if (snapshot is null) await Refresh(false, skipDiscovery: true);
             var dialog = new AutoProxyWindow(snapshot!.AutoProxy, backend.ConsolePath, snapshot.Proxies.Length,
                 snapshot.Proxies, snapshot.Probes, snapshot.Targets, backend.MuMuConsolePath, snapshot.Bindings) { Owner = this };
-            if (dialog.ShowDialog() != true || dialog.Rule is null) return;
+            if (dialog.ShowDialog() != true) return;
+            if (dialog.VmwareRequested) { await OpenVmware(); return; }
+            if (dialog.Rule is null) return;
+            await Run("正在儲存自動分配規則…", async () => {
+            // Refresh capabilities before applying, without waiting for emulator/VM discovery.
+            await Refresh(false, skipDiscovery: true);
             if (dialog.Rule.Kind is "Emulator" or "EmulatorSequence") {
                 backend.MuMuConsolePath = dialog.MuMuConsolePath;
                 backend.ConsolePath = dialog.LdConsolePath;
                 targets = dialog.DiscoveredTargets.Concat(targets).DistinctBy(t => t.Key).ToArray();
                 snapshot = await backend.Snapshot(targets);
                 bool applied = await backend.ConfigureAutomatic(dialog.Rule);
-                await Refresh(true);
+                await Refresh(false, skipDiscovery: true);
+                SelectWorkspace(1);
                 if (!applied) MessageBox.Show(this, $"模擬器配置已儲存在本機。請更新至 {(dialog.Rule.Kind == "EmulatorSequence" ? "0.1.13" : "0.1.10")} 背景服務，再開啟自動代理按「儲存配置」套用。現有代理繼續執行。", "配置已儲存", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
-            if (dialog.Rule.IncludeChildren) RequireServiceVersion(new(0, 1, 9), "子程序代理");
+            if (dialog.Rule.IncludeChildren) RequireProcessHandoffSupport();
             if (dialog.Rule.Kind == "GameGroup" && !Version.TryParse(snapshot.Diagnostics.Version.Split(' ')[0], out var serviceVersion)) throw new InvalidOperationException("無法確認背景服務版本，請安裝 0.1.6 以上版本。");
             if (dialog.Rule.Kind == "GameGroup" && Version.Parse(snapshot.Diagnostics.Version.Split(' ')[0]) < new Version(0, 1, 6)) throw new InvalidOperationException("遊戲組需要 0.1.6 以上背景服務，請先安裝新版。");
-            if (!backend.Online || snapshot.Diagnostics.Version.StartsWith("0.1.2")) throw new InvalidOperationException("自動分配需要 0.1.3 以上背景服務，請先安裝新版。");
-            await backend.ConfigureAutomatic(dialog.Rule); await Refresh(true);
-        });
+            if (!backend.Online || !Version.TryParse(snapshot.Diagnostics.Version.Split(' ')[0], out var automaticVersion) || automaticVersion < new Version(0, 1, 3)) throw new InvalidOperationException("自動分配需要 0.1.3 以上背景服務，請先安裝新版。");
+            await backend.ConfigureAutomatic(dialog.Rule); await Refresh(false, skipDiscovery: true); SelectWorkspace(1);
+            });
+        }
+        catch (Exception ex) { StatusText.Text = ex.Message; }
+        finally { ruleDialogOpen = false; }
+    }
+    private async void VmwareClick(object sender, RoutedEventArgs e) {
+        if (closingService || quitting) return;
+        try { await OpenVmware(); } catch (Exception ex) { StatusText.Text = ex.Message; }
+    }
+    private async Task OpenVmware() {
+        if (vmwareDialogOpen) return;
+        vmwareDialogOpen = true;
+        try {
+        if (snapshot is null) await Refresh(false, skipDiscovery: true);
+        var state = snapshot!;
+        var dialog = new VmwareWindow(backend, state, [], loadAdapters: ct => state.SupportsVmware ? backend.VmwareAdapters(ct) : Task.Run(VmwareDiscovery.Adapters, ct)) { Owner = this }; dialog.ShowDialog();
+        if (dialog.ConfigurationSaved) await Run("", async () => { await Refresh(false, skipDiscovery: true); SelectWorkspace(1); RuleGrid.SelectedItem = RuleGrid.Items.Cast<ProxyRuleItem>().FirstOrDefault(r => r.Key == "vmware"); });
+        } finally { vmwareDialogOpen = false; }
     }
     private async void PauseAutoClick(object sender, RoutedEventArgs e) => await Run("正在暫停自動分配…", async () => {
         if (snapshot is null) return;
@@ -507,7 +766,7 @@ public partial class MainWindow : Window
             var candidates = snapshot!.Targets.Concat(await Task.Run(() => ProcessCatalog.List())).DistinctBy(t => t.Key).ToArray();
             var dialog = new AssignmentWindow(proxies, candidates, backend.Online, probes: snapshot.Probes) { Owner = this };
             if (dialog.ShowDialog() != true || dialog.Request is null) return;
-            if (dialog.Request.Items.Any(i => i.IncludeChildren) && backend.Online) RequireServiceVersion(new(0, 1, 9), "子程序代理");
+            if (dialog.Request.Items.Any(i => i.IncludeChildren) && backend.Online) RequireProcessHandoffSupport();
             try {
                 await backend.Assign(dialog.Request);
                 foreach (var item in dialog.Request.Items) if (item.Target.Kind == "Process") extraTargets.Add(item.Target);
@@ -530,13 +789,14 @@ public partial class MainWindow : Window
     private async void BindClick(object sender, RoutedEventArgs e)
     {
         var selected = TargetGrid.SelectedItems.Cast<TargetRow>().Select(r => r.Target).ToArray();
+        if (selected.Any(t => t.Kind == "VMware")) { await Run("正在讀取虛擬機規則…", OpenVmware); return; }
         if (selected.Length == 0) { MessageBox.Show(this, "請先選取目標，或使用「自動分配並代理」設定持續匹配規則。", "xa sk5"); return; }
         await Run("正在依數量分配並啟用…", async () => {
             await Refresh(false);
             if (snapshot!.Proxies.Length == 0) throw new InvalidOperationException("請先匯入代理。");
             var dialog = new AssignmentWindow(snapshot.Proxies, selected, backend.Online, true, snapshot.AutoProxy.PerProxy, snapshot.Probes) { Owner = this };
             if (dialog.ShowDialog() != true || dialog.Request is null) return;
-            if (dialog.Request.Items.Any(i => i.IncludeChildren) && backend.Online) RequireServiceVersion(new(0, 1, 9), "子程序代理");
+            if (dialog.Request.Items.Any(i => i.IncludeChildren) && backend.Online) RequireProcessHandoffSupport();
             try {
                 await backend.Assign(dialog.Request);
                 if (dialog.EnableImmediately) foreach (var item in dialog.Request.Items) await backend.Act("enable", new TargetRequest(item.Target.Key));
@@ -668,13 +928,14 @@ public partial class MainWindow : Window
         public void UpdateDuration() => PropertyChanged?.Invoke(this, new(nameof(ConnectionDuration)));
         public string Uploaded => "↑ " + Traffic.Split('/')[0].Trim();
         public string Downloaded => Traffic.Contains('/') ? "↓ " + Traffic.Split('/')[1].Trim() : "—";
-        public string StateLabel => State.Contains("封鎖") ? "已封鎖" : State.Contains("代理執行中") ? "代理中" : State.Contains("全局") ? "全局規則" : State.Contains("等待") ? "等待啟動" : State.Contains("未啟動") ? "未啟動" : State.Contains("核心") ? "核心未啟用" : "未代理";
-        public string Tone => State.Contains("封鎖") || State.Contains("異常") ? "danger" : State.Contains("代理執行中") ? "success" : State.Contains("等待") ? "warning" : "neutral";
+        public string StateLabel => State.Contains("封鎖") ? "已封鎖" : State.Contains("準備未完成") ? "準備未完成" : State.Contains("等待網路準備") ? "等待準備" : State.Contains("待確認") ? "待確認" : State.Contains("本地網路已套用") ? "本地網路" : State.Contains("代理執行中") || State.Contains("代理規則已套用") ? "代理中" : State.Contains("全局") ? "全局規則" : State.Contains("等待") ? "等待啟動" : State.Contains("未啟動") ? "未啟動" : State.Contains("核心") ? "核心未啟用" : "未代理";
+        public string Tone => State.Contains("封鎖") || State.Contains("異常") || State.Contains("準備未完成") ? "danger" : State.Contains("代理執行中") || State.Contains("代理規則已套用") || State.Contains("本地網路已套用") ? "success" : State.Contains("等待") || State.Contains("待確認") ? "warning" : "neutral";
         public string Connections { get; init; } = "—";
         public string Members { get; init; } = "";
         public ProxyNodeDisplay? Node { get; init; }
         public string AccountPort { get; init; } = "—";
         public string EntryIp { get; init; } = "—";
+        public string InstanceDetail { get; init; } = "";
     }
     public sealed record ProxyRow(ProxyProfile Profile, ProbeResult? Probe, int Count, string Owners, bool Probing, bool Queued = false)
     {

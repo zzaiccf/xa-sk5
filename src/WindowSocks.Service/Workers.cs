@@ -2,7 +2,7 @@ using WindowSocks.Core;
 
 namespace WindowSocks.Service;
 
-public sealed class PipeWorker(Controller controller, ILogger<PipeWorker> logger) : BackgroundService
+public sealed class PipeWorker(Controller controller, ILogger<PipeWorker> logger, IHostApplicationLifetime lifetime, string? pipeName = null) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -10,7 +10,7 @@ public sealed class PipeWorker(Controller controller, ILogger<PipeWorker> logger
         try {
             while (!stoppingToken.IsCancellationRequested)
             {
-                var pipe = PipeTransport.CreateServer(controller.OwnerSid);
+                var pipe = PipeTransport.CreateServer(controller.OwnerSid, pipeName ?? PipeTransport.Name);
                 try { await pipe.WaitForConnectionAsync(stoppingToken); }
                 catch { pipe.Dispose(); throw; }
                 var task = Handle(pipe, stoppingToken); pending.RemoveWhere(t => t.IsCompleted); pending.Add(task);
@@ -23,8 +23,10 @@ public sealed class PipeWorker(Controller controller, ILogger<PipeWorker> logger
         await using (pipe)
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken); timeout.CancelAfter(TimeSpan.FromSeconds(115));
-            try { var command = await PipeTransport.ReadAsync<Command>(pipe, timeout.Token); var response = await controller.Dispatch(command, timeout.Token); await PipeTransport.WriteAsync(pipe, response, timeout.Token); }
+            bool stop = false;
+            try { var command = await PipeTransport.ReadAsync<Command>(pipe, timeout.Token); var response = await controller.Dispatch(command, timeout.Token); stop = command.Action == "stopService" && response.Ok; await PipeTransport.WriteAsync(pipe, response, timeout.Token); }
             catch (Exception ex) when (ex is IOException or OperationCanceledException or System.Text.Json.JsonException) { logger.LogDebug("Pipe ended: {Type}", ex.GetType().Name); }
+            finally { if (stop) lifetime.StopApplication(); }
         }
     }
 }

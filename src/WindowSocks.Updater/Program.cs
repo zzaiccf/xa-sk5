@@ -17,7 +17,7 @@ internal static class Program
         try {
             if (args.Length != 2 || args[0] is not ("--update" or "--worker")) throw new ArgumentException("請從 xa sk5 的「檢查更新」啟動更新。");
             string jobFile = Path.GetFullPath(args[1]); AppReleasePackage.RejectLinks(jobFile);
-            if (new FileInfo(jobFile).Length > 16384) throw new IOException("更新工作資料超出限制。");
+            if (new FileInfo(jobFile).Length > 128 * 1024) throw new IOException("更新工作資料超出限制。");
             var job = JsonSerializer.Deserialize<UpdateJob>(File.ReadAllText(jobFile), Json.Options) ?? throw new IOException("缺少更新工作。");
             ValidateJob(job);
             if (args[0] == "--worker") return Execute(job, jobFile);
@@ -28,6 +28,7 @@ internal static class Program
     private static void ValidateJob(UpdateJob job)
     {
         _ = AppReleasePackage.ParseVersion(job.Version);
+        if (job.Download is { } download) { if (job.Recover) throw new IOException("回復工作不可包含下載。"); UpdatePreparation.Validate(download, job.Version); }
         string target = Path.TrimEndingDirectorySeparator(Path.GetFullPath(job.Target));
         AppReleasePackage.RejectLinks(target);
         if (!Path.IsPathFullyQualified(job.Target) || target.Length < 4 || !Directory.Exists(target) || !File.Exists(Path.Combine(target, "WindowSocks.exe"))) throw new IOException("找不到原有 xa sk5 程式目錄。");
@@ -38,20 +39,52 @@ internal static class Program
     }
     private static bool Administrator => new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
     private static void AtomicJson<T>(string path, T data) { File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(data, Json.Options)); File.Move(path + ".tmp", path, true); }
-    internal static int Execute(UpdateJob job, string jobFile)
+    internal interface IUpdateServiceControl
     {
+        void Validate(); bool IsRunning { get; } string Version { get; }
+        void Stop(); void Start(); Snapshot WaitReady(string version, Action<string> report);
+    }
+    private sealed class InstalledServiceControl : IUpdateServiceControl
+    {
+        public void Validate() {
+            if (!Administrator) throw new IOException("暫停或更新代理服務需要使用者核准 Windows 管理員授權。");
+            using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\WindowSocks");
+            string path = (key?.GetValue("ImagePath") as string ?? "").Trim('"');
+            if (!path.Equals(Path.Combine(UpdatePaths.Installed, "WindowSocks.Service.exe"), StringComparison.OrdinalIgnoreCase)) throw new IOException("背景服務路徑與標準安裝不符，已停止。");
+        }
+        public bool IsRunning { get { using var service = new ServiceController("WindowSocks"); return service.Status != ServiceControllerStatus.Stopped; } }
+        public string Version => System.Reflection.AssemblyName.GetAssemblyName(Path.Combine(UpdatePaths.Installed, "WindowSocks.Core.dll")).Version!.ToString(3);
+        public void Stop() => StopService(); public void Start() => StartService();
+        public Snapshot WaitReady(string version, Action<string> report) => ServiceReadiness.WaitAsync(version, report: report).GetAwaiter().GetResult();
+    }
+    internal static int Execute(UpdateJob job, string jobFile, IUpdateServiceControl? serviceControl = null)
+    {
+        serviceControl ??= new InstalledServiceControl();
         string work = Path.GetDirectoryName(jobFile)!;
         var backups = new List<string>(); var transactions = new List<FileUpdateTransaction>();
         bool stopped = false, wasRunning = false; string? secureStage = null;
+        string? originalServiceVersion = null;
         var settings = new List<(string Source, string Backup)>();
         string? previousDisplayVersion = null;
-        void Report(string value) { AtomicJson(Path.Combine(work, "status.json"), new UpdateProgress(value)); File.AppendAllText(Path.Combine(work, "update.log"), $"{DateTimeOffset.Now:O} {value}\n"); }
+        object reportGate = new(); long lastReport = -100; string lastMessage = "";
+        var elapsed = Stopwatch.StartNew();
+        void ReportProgress(UpdateProgress value) {
+            lock (reportGate) {
+                if (value.Total > 0 && value.Received < value.Total && elapsed.ElapsedMilliseconds - lastReport < 100) return;
+                lastReport = elapsed.ElapsedMilliseconds;
+                AtomicJson(Path.Combine(work, "status.json"), value);
+                if (value.Message != lastMessage) { lastMessage = value.Message; File.AppendAllText(Path.Combine(work, "update.log"), $"{DateTimeOffset.Now:O} {value.Message}\n"); }
+            }
+        }
+        void Report(string value) => ReportProgress(new(value));
+        using var cancellation = new CancellationTokenSource();
+        using var cancelWatch = new System.Threading.Timer(_ => { try { if (File.Exists(Path.Combine(work, "cancel"))) cancellation.Cancel(); } catch (ObjectDisposedException) { } }, null, 0, 100);
         using var mutex = new Mutex(false, @"Global\WindowSocks.AppUpdate");
         bool acquired = false;
         try {
             try { acquired = mutex.WaitOne(0); } catch (AbandonedMutexException) { acquired = true; }
             if (!acquired) throw new IOException("另一個 xa sk5 更新正在執行。");
-            if (job.IncludeService && !Administrator) throw new IOException("更新背景服務需要使用者核准 Windows 管理員授權。");
+            if (job.IncludeService || job.PauseService) serviceControl.Validate();
             string[] targets = new[] { job.Target }.Concat(job.IncludeService ? [UpdatePaths.Installed] : Array.Empty<string>()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             foreach (string target in targets) {
                 AppReleasePackage.RejectLinks(target);
@@ -59,7 +92,17 @@ internal static class Program
                     if (process.MainModule?.FileName is { } exe && Path.GetDirectoryName(exe)!.Equals(target, StringComparison.OrdinalIgnoreCase)) throw new IOException("此程式目錄仍有 xa sk5 介面執行中；沒有替換任何檔案。請結束該介面後再試。");
                 }
             }
+            void InterruptProxy() {
+                if (stopped || !(job.IncludeService || job.PauseService)) return;
+                wasRunning = serviceControl.IsRunning; originalServiceVersion = serviceControl.Version;
+                Report("正在中斷代理連線，完成後才下載更新…"); stopped = true; serviceControl.Stop();
+            }
             string source = job.Payload;
+            if (job.Download is { } download) {
+                ReportProgress(new("準備中斷代理並下載更新…") { CanCancel = true });
+                source = UpdatePreparation.PrepareAsync(download, job.Version, work, ct => { ct.ThrowIfCancellationRequested(); if (job.PauseService || job.IncludeService) InterruptProxy(); return Task.CompletedTask; },
+                    new InlineProgress(ReportProgress), cancellation.Token).GetAwaiter().GetResult();
+            }
             if (!job.Recover) {
                 Report("重新驗證更新套件與元件版本…"); AppReleasePackage.VerifyPayload(source, job.Version);
                 foreach (string target in targets) {
@@ -72,7 +115,7 @@ internal static class Program
                 using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\WindowSocks");
                 string path = (key?.GetValue("ImagePath") as string ?? "").Trim('"');
                 if (!path.Equals(Path.Combine(UpdatePaths.Installed, "WindowSocks.Service.exe"), StringComparison.OrdinalIgnoreCase)) throw new IOException("背景服務路徑與標準安裝不符，已停止。");
-                using var service = new ServiceController("WindowSocks"); wasRunning = service.Status != ServiceControllerStatus.Stopped;
+                if (!stopped) wasRunning = serviceControl.IsRunning;
                 // Stage into an administrator-owned directory before touching a privileged installation.
                 secureStage = Path.Combine(UpdatePaths.ServiceData, "update-stage-" + Guid.NewGuid().ToString("N"));
                 Directory.CreateDirectory(secureStage); Protect(secureStage);
@@ -83,7 +126,7 @@ internal static class Program
                     }
                     source = Path.Combine(secureStage, "payload"); AppReleasePackage.VerifyPayload(source, job.Version);
                 }
-                Report("停止 xa sk5 背景服務；代理連線將暫時中斷…"); StopService(); stopped = true;
+                if (!stopped) InterruptProxy();
                 foreach (string name in new[] { "settings.dpapi", "settings.dpapi.bak", "owner.sid" }) {
                     string original = Path.Combine(UpdatePaths.ServiceData, name);
                     if (!File.Exists(original)) continue; AppReleasePackage.RejectLinks(original);
@@ -139,10 +182,10 @@ internal static class Program
                     transaction.Apply(source, beforeFile: () => { if (job.IncludeService) { using var service = new ServiceController("WindowSocks"); if (service.Status != ServiceControllerStatus.Stopped) throw new IOException("檔案替換期間服務重新啟動，已中止並準備回復。"); } });
                 }
             }
-            if (job.IncludeService && wasRunning) {
-                Report("重新啟動並驗證背景服務…"); StartService();
-                var snapshot = PipeTransport.CallAsync<Snapshot>(Command.Create("snapshot", new { }), new CancellationTokenSource(TimeSpan.FromSeconds(25)).Token).GetAwaiter().GetResult();
-                string expectedVersion = job.Recover ? System.Reflection.AssemblyName.GetAssemblyName(Path.Combine(UpdatePaths.Installed, "WindowSocks.Core.dll")).Version!.ToString(3) : job.Version;
+            if ((job.IncludeService || job.PauseService) && wasRunning) {
+                Report("重新啟動並驗證背景服務…"); serviceControl.Start();
+                string expectedVersion = !job.IncludeService ? originalServiceVersion! : job.Recover ? System.Reflection.AssemblyName.GetAssemblyName(Path.Combine(UpdatePaths.Installed, "WindowSocks.Core.dll")).Version!.ToString(3) : job.Version;
+                var snapshot = serviceControl.WaitReady(expectedVersion, Report);
                 if (snapshot.Diagnostics.Version.Split(' ')[0] != expectedVersion) throw new IOException("服務回報的版本不符，將回復原版本。");
             }
             if (job.IncludeService) {
@@ -156,14 +199,14 @@ internal static class Program
             return 0;
         }
         catch (Exception ex) {
-            string message = ex.Message;
+            string message = ex is OperationCanceledException ? "已取消更新。" : ex.Message;
             try {
-                if (stopped) StopService();
+                if (stopped) serviceControl.Stop();
                 if (!job.Recover) {
                     foreach (var transaction in transactions.AsEnumerable().Reverse()) transaction.Rollback();
                     foreach (var (original, backup) in settings) File.Copy(backup, original, true);
                 }
-                if (stopped && wasRunning) StartService();
+                if (stopped && wasRunning) { serviceControl.Start(); message += " 原代理服務已恢復。"; }
                 if (!job.Recover) foreach (var transaction in transactions) File.WriteAllText(Path.Combine(transaction.BackupDirectory, "service-recovery-complete"), "complete");
                 if (previousDisplayVersion is not null) { using var registration = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\WindowSocks", true); registration?.SetValue("DisplayVersion", previousDisplayVersion); }
                 message += transactions.Count > 0 ? " 已回復原程式，備份保留。" : " 原程式未變更。";
@@ -173,6 +216,7 @@ internal static class Program
         }
         finally { if (acquired) mutex.ReleaseMutex(); }
     }
+    private sealed class InlineProgress(Action<UpdateProgress> report) : IProgress<UpdateProgress> { public void Report(UpdateProgress value) => report(value); }
     private sealed record ServiceRecovery(string Directory, bool WasRunning, InstallFile[] Files);
     private static void Protect(string path)
     {
@@ -185,7 +229,14 @@ internal static class Program
         using var service = new ServiceController("WindowSocks");
         if (service.Status != ServiceControllerStatus.Stopped) { service.Stop(); service.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(40)); }
         // Dispose every process handle before copying its mapped binaries.
-        for (int i = 0; i < 60; i++) { bool alive = false; foreach (var p in Process.GetProcessesByName("WindowSocks.Service")) using (p) { alive |= !p.HasExited; } if (!alive) return; Thread.Sleep(500); }
+        for (int i = 0; i < 60; i++) {
+            bool alive = false;
+            foreach (var p in Process.GetProcessesByName("WindowSocks.Service")) using (p) {
+                try { alive |= !p.HasExited && string.Equals(p.MainModule?.FileName, Path.Combine(UpdatePaths.Installed, "WindowSocks.Service.exe"), StringComparison.OrdinalIgnoreCase); }
+                catch (InvalidOperationException) { }
+            }
+            if (!alive) return; Thread.Sleep(250);
+        }
         throw new IOException("背景服務程序仍在結束中，尚未覆寫程式。");
     }
     private static void StartService()
@@ -198,12 +249,18 @@ internal static class Program
         private readonly Label status = new() { Dock = DockStyle.Top, Height = 90, Text = "準備更新…" };
         private readonly TextBox details = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
         private readonly Button close = new() { Dock = DockStyle.Bottom, Height = 40, Text = "更新中…", Enabled = false };
+        private readonly ProgressBar progressBar = new() { Dock = DockStyle.Top, Height = 8, Visible = false, Minimum = 0, Maximum = 100 };
         private bool finished;
+        private bool canCancel;
+        private bool cancelRequested;
         public int Result { get; private set; } = 1;
         public UpdateForm(UpdateJob job, string jobFile)
         {
             Text = "xa sk5 — 更新進度"; Width = 740; Height = 400; StartPosition = FormStartPosition.CenterScreen; Padding = new(20); Font = new("Microsoft JhengHei UI", 10);
-            Controls.Add(details); Controls.Add(status); Controls.Add(close); close.Click += (_, _) => Close(); FormClosing += (_, e) => { if (!finished) e.Cancel = true; };
+            void Cancel() { if (!canCancel) return; File.WriteAllText(Path.Combine(Path.GetDirectoryName(jobFile)!, "cancel"), "cancel"); cancelRequested = true; canCancel = false; close.Enabled = false; close.Text = "正在取消…"; }
+            Controls.Add(details); Controls.Add(progressBar); Controls.Add(status); Controls.Add(close);
+            close.Click += (_, _) => { if (finished) Close(); else Cancel(); };
+            FormClosing += (_, e) => { if (!finished) { e.Cancel = true; Cancel(); } };
             Shown += async (_, _) => {
                 string work = Path.GetDirectoryName(jobFile)!;
                 try {
@@ -212,21 +269,31 @@ internal static class Program
                     if (job.ParentPid > 0) {
                         try {
                             using var parent = Process.GetProcessById(job.ParentPid);
-                            if (parent.StartTime.ToUniversalTime().Ticks == job.ParentStartTime) { status.Text = "等候 xa sk5 介面關閉，背景服務目前維持運作…"; using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45)); await parent.WaitForExitAsync(timeout.Token); }
+                            if (parent.StartTime.ToUniversalTime().Ticks == job.ParentStartTime) { status.Text = "等候 xa sk5 介面關閉，接著中斷代理並開始更新…"; using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45)); await parent.WaitForExitAsync(timeout.Token); }
                         } catch (ArgumentException) { }
                     }
                     var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden };
-                    start.ArgumentList.Add("--worker"); start.ArgumentList.Add(jobFile); if (job.IncludeService) start.Verb = "runas";
-                    status.Text = job.IncludeService ? "等候你核准 Windows 管理員授權；取消授權會重新開啟原介面。" : "開始備份與更新程式…"; status.Refresh();
+                    start.ArgumentList.Add("--worker"); start.ArgumentList.Add(jobFile); if (job.IncludeService || job.PauseService) start.Verb = "runas";
+                    status.Text = job.IncludeService || job.PauseService ? "等候 Windows 管理員授權，接著中斷代理並下載更新。" : "開始下載與更新程式…"; status.Refresh();
                     using var worker = Process.Start(start) ?? throw new IOException("無法啟動更新工作。");
-                    string previous = "";
+                    string previous = ""; var stageClock = Stopwatch.StartNew();
                     while (!worker.HasExited) {
                         string file = Path.Combine(work, "status.json");
-                        if (File.Exists(file)) try { var progress = JsonSerializer.Deserialize<UpdateProgress>(File.ReadAllText(file), Json.Options); if (progress?.Message is { } message && message != previous) { previous = message; status.Text = message; details.AppendText(message + Environment.NewLine); } } catch (IOException) { } catch (JsonException) { }
+                        if (File.Exists(file)) try {
+                            var progress = JsonSerializer.Deserialize<UpdateProgress>(File.ReadAllText(file), Json.Options);
+                            if (progress is not null) {
+                                canCancel = progress.CanCancel && !cancelRequested; close.Enabled = canCancel; close.Text = cancelRequested ? "正在取消…" : canCancel ? "取消更新" : "更新中…";
+                                progressBar.Visible = true; progressBar.Style = progress.Total > 0 ? ProgressBarStyle.Continuous : ProgressBarStyle.Marquee;
+                                if (progress.Total > 0) progressBar.Value = (int)Math.Clamp(progress.Received * 100d / progress.Total, 0, 100);
+                                if (progress.Message != previous) { previous = progress.Message; stageClock.Restart(); details.AppendText(previous + Environment.NewLine); }
+                                double seconds = Math.Max(stageClock.Elapsed.TotalSeconds, 0.1);
+                                status.Text = progress.Total > 0 ? $"{progress.Message} {progress.Received / 1048576d:0.0} / {progress.Total / 1048576d:0.0} MB · {progress.Received / 1048576d / seconds:0.0} MB/s" : progress.Message;
+                            }
+                        } catch (IOException) { } catch (JsonException) { }
                         await Task.Delay(250);
                     }
                     var result = JsonSerializer.Deserialize<UpdateResult>(File.ReadAllText(Path.Combine(work, "result.json")), Json.Options)!;
-                    Result = result.Success ? 0 : 1; status.Text = result.Message; details.AppendText("\r\n備份：\r\n" + string.Join("\r\n", result.Backups));
+                    Result = result.Success ? 0 : 1; status.Text = result.Message; progressBar.Visible = false; details.AppendText("\r\n備份：\r\n" + string.Join("\r\n", result.Backups));
                     Restart(job, Path.Combine(work, "result.json"));
                     if (result.Success) { finished = true; Close(); return; }
                 }

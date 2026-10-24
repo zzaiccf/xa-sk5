@@ -76,6 +76,14 @@ public sealed record Snapshot(ProxyProfile[] Proxies, InstanceBinding[] Bindings
     public bool SupportsRemoteControlBypass { get; init; }
     public bool SupportsLowFrequencyProbes { get; init; }
     public bool SupportsTcpFirstProbes { get; init; }
+    public bool SupportsProxyEditing { get; init; }
+    public bool SupportsVmware { get; init; }
+    public bool SupportsVmwareQuickSetup { get; init; }
+    public bool SupportsVmwareLocalNetwork { get; init; }
+    public bool SupportsRuleManagement { get; init; }
+    public bool SupportsProcessHandoffs { get; init; }
+    public bool SupportsBulkActions { get; init; }
+    public VmwareState? Vmware { get; init; }
     public bool HasPendingEmulatorConfiguration { get; init; }
     public AutoProxyRule AutoProxy { get; init; } = new();
     public string AutoProxyStatus { get; init; } = "尚未啟用自動分配";
@@ -101,6 +109,8 @@ public sealed record SavedConfig
     public List<GameLaunchGroup> GameGroups { get; set; } = [];
     public string LdConsole { get; set; } = @"C:\LDPlayer\LDPlayer9\ldconsole.exe";
     public string MuMuConsole { get; set; } = "";
+    public VmwareSettings Vmware { get; set; } = new();
+    public VmwareRuntime[] VmwareSessions { get; set; } = [];
 }
 public sealed record Command(string Action, JsonElement Data)
 {
@@ -136,6 +146,7 @@ public sealed record GlobalProxySettings
 }
 public sealed record AutoProxyRule
 {
+    public bool Configured { get; init; }
     public bool Enabled { get; init; }
     public string Kind { get; init; } = "LDPlayer";
     public TargetMatch Match { get; init; } = TargetMatch.ExecutableName;

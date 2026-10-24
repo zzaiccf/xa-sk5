@@ -9,6 +9,26 @@ public static class NativeEngine
     { public uint Pid, Proxy; public ulong Created; public uint Blocked, Reserved; }
     [StructLayout(LayoutKind.Sequential)] public struct Traffic
     { public ulong Sent, Received, Dropped; }
+    [StructLayout(LayoutKind.Sequential)] public struct GatewayRule
+    { public uint Source, Pid, Proxy, Blocked; public ulong Created; }
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_ReplaceGatewayRules([In] GatewayRule[] rules, uint count);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_StartGateway(uint network, uint mask, uint host, uint interfaceIndex);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern void Core_StopGateway();
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_GatewayRunning();
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_GatewayRouteForTest(uint source, out uint proxy);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_GatewayTranslationForTest([In, Out] byte[] packet, uint length, uint guest, uint destination, uint host, uint interfaceIndex, int reply, out uint outbound);
+    private static readonly Lazy<bool> vmwareSupport = new(() => {
+        if (!NativeLibrary.TryLoad(Path.Combine(AppContext.BaseDirectory, Dll), out var library)) return false;
+        try { return NativeLibrary.TryGetExport(library, nameof(Core_StartGateway), out _); } finally { NativeLibrary.Free(library); }
+    });
+    public static bool SupportsVmwareGateway => Present && vmwareSupport.Value;
+    private static readonly Lazy<bool> vmwareLocalSupport = new(() => {
+        if (!NativeLibrary.TryLoad(Path.Combine(AppContext.BaseDirectory, Dll), out var library)) return false;
+        try { return NativeLibrary.TryGetExport(library, "Core_GatewayLocalSupported", out _); } finally { NativeLibrary.Free(library); }
+    });
+    public static bool SupportsVmwareLocalNetwork => SupportsVmwareGateway && vmwareLocalSupport.Value;
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern nuint Core_GatewayOpenLocalForTest(uint destination, ushort port, int udp);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern uint Core_GatewayDestinationForTest(uint host, uint destination, ushort port, int local);
     [StructLayout(LayoutKind.Sequential)] public struct FlowEvent
     {
         public ulong Sequence, Flow, At, Created, Sent, Received;
@@ -21,6 +41,12 @@ public static class NativeEngine
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int Core_ReplacePolicyEx2([In] Rule[] rules, uint count, string guards, uint globalProxy, uint globalState, uint bypassLan,
         uint bypassRemoteControl, string remoteImages, uint rdpPid, ulong rdpCreated, uint rdpPort);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern uint Core_GetDescendants(uint pid, ulong birth, [Out] Rule[] output, uint capacity);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_ProcessHandoffMode(uint pid, ulong birth);
+    private static readonly Lazy<bool> handoffSupport = new(() => {
+        if (!NativeLibrary.TryLoad(Path.Combine(AppContext.BaseDirectory, Dll), out var library)) return false;
+        try { return NativeLibrary.TryGetExport(library, nameof(Core_ProcessHandoffMode), out _); } finally { NativeLibrary.Free(library); }
+    });
+    public static bool SupportsProcessHandoffs => Present && handoffSupport.Value;
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_GlobalBypassForTest([In] byte[] packet, uint length);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int Core_SetOwner(string sid);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_RouteForTest(uint pid, ulong birth, int ipv6, out uint proxy);

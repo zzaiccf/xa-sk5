@@ -1,6 +1,10 @@
 using System.Diagnostics;
 using System.Text.Json;
 
+if (args.Length == 2 && args[0] == "--session") { await BackgroundSession.LaunchAsync(args[1]); return; }
+if (args.Length == 2 && args[0] == "--session-hold") { await BackgroundSession.LaunchAsync(args[1], true); return; }
+if (args.Length == 2 && args[0] == "--client") { await BackgroundSession.ClientAsync(args[1]); return; }
+
 // Live diagnostic only: a distinct launcher image creates a real ordinary TCP client, then exits.
 Console.WriteLine(JsonSerializer.Serialize(new { ready = true, pid = Environment.ProcessId }));
 if (await Console.In.ReadLineAsync() != "spawn" || args.Length != 1) return;

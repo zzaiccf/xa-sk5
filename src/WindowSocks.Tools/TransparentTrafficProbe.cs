@@ -8,22 +8,26 @@ using WindowSocks.Core;
 // Deliberately uses ordinary sockets with no SOCKS configuration. This checks the installed interception path.
 internal static class TransparentTrafficProbe
 {
+    public static async Task<string> TcpExitAsync(int timeoutSeconds = 18)
+    {
+        using var handler = new SocketsHttpHandler { UseProxy = false, ConnectTimeout = TimeSpan.FromSeconds(timeoutSeconds), AllowAutoRedirect = false };
+        handler.ConnectCallback = async (context, ct) => {
+            var addresses = (await Dns.GetHostAddressesAsync(context.DnsEndPoint.Host, ct)).Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToArray();
+            var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            try { await socket.ConnectAsync(addresses, context.DnsEndPoint.Port, ct); return new NetworkStream(socket, ownsSocket: true); }
+            catch { socket.Dispose(); throw; }
+        };
+        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+        string text = (await client.GetStringAsync("https://api.ipify.org")).Trim();
+        if (!IPAddress.TryParse(text, out var address) || address.AddressFamily != AddressFamily.InterNetwork) throw new IOException("出口回覆不是 IPv4。");
+        return text;
+    }
     public static async Task<object> RunAsync(bool dnsOnly = false)
     {
         string? tcpExit = null, udpExit = null; bool dns = false;
         var errors = new List<string>(); var watch = Stopwatch.StartNew();
         if (!dnsOnly) try {
-            using var handler = new SocketsHttpHandler { UseProxy = false, ConnectTimeout = TimeSpan.FromSeconds(12), AllowAutoRedirect = false };
-            handler.ConnectCallback = async (context, ct) => {
-                var addresses = (await Dns.GetHostAddressesAsync(context.DnsEndPoint.Host, ct)).Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToArray();
-                var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                try { await socket.ConnectAsync(addresses, context.DnsEndPoint.Port, ct); return new NetworkStream(socket, ownsSocket: true); }
-                catch { socket.Dispose(); throw; }
-            };
-            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(18) };
-            string text = (await client.GetStringAsync("https://api.ipify.org")).Trim();
-            if (!IPAddress.TryParse(text, out _)) throw new IOException("出口回覆不是 IP。");
-            tcpExit = text;
+            tcpExit = await TcpExitAsync();
         } catch (Exception ex) { errors.Add("TCP: " + ex.GetType().Name); }
         if (!dnsOnly) try {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));

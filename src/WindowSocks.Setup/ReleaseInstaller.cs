@@ -61,7 +61,7 @@ internal static partial class Program
                 catch (IOException ex) when ((ex.HResult & 0xffff) is 32 or 33 && DateTime.UtcNow < deadline) { Thread.Sleep(700); }
             }
             File.WriteAllText(Path.Combine(transaction.BackupDirectory, "service-recovery.json"), JsonSerializer.Serialize(new { directory = stage, wasRunning = true, files = settings.Select(s => new InstallFile(Path.GetFileName(s.Original), AppReleasePackage.Hash(s.Backup))).ToArray() }, Json.Options));
-            int total = ComponentPackage.VerifyManifest(payload).Length;
+            int total = transaction.FileCount;
             report(40, "正在安裝程式檔案…");
             transaction.Apply(payload, count => { if (count % 20 == 0 || count == total) report(40 + count * 40 / total, $"正在安裝程式檔案（{count}/{total}）…"); });
             string sidFile = Path.Combine(DataDirectory, "owner.sid"); if (!File.Exists(sidFile)) File.WriteAllText(sidFile, installOwnerSid);

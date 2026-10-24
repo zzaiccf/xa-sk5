@@ -36,6 +36,7 @@ public partial class AssignmentWindow : Window
     {
         if (!ready) return;
         CollectionViewSource.GetDefaultView(Candidates.ItemsSource).Filter = o => AssignmentPlanner.Matches(((Choice)o).Target, Search.Text, (TargetMatch)MatchMode.SelectedIndex);
+        Update();
     }
     private void SelectFiltered(object sender, RoutedEventArgs e) { foreach (var c in choices.Where(c => AssignmentPlanner.Matches(c.Target, Search.Text, (TargetMatch)MatchMode.SelectedIndex))) c.Selected = true; }
     private void ClearSelection(object sender, RoutedEventArgs e) { foreach (var c in choices) c.Selected = false; }

@@ -28,9 +28,12 @@ public sealed partial class Controller : IDisposable
     private readonly HashSet<string> conflicts = [];
     private readonly HashSet<string> automaticUnassigned = [];
     private bool started;
+    private bool stopping;
     private string engineError = "尚未啟動";
     private string autoStatus = "尚未啟用自動分配";
     private readonly GameGroupObserver gameObserver;
+    private readonly ProcessHandoffGrace processHandoffGrace = new();
+    private readonly Func<DateTimeOffset> handoffClock;
     private string gameWarning = "";
     private ulong lastEventSequence;
     private bool childrenDirty;
@@ -40,6 +43,7 @@ public sealed partial class Controller : IDisposable
     private readonly Dictionary<Guid, Task<ProbeResult>> activeProbes = [];
     private readonly Func<ProxyProfile, bool, CancellationToken, Task<ProbeResult>> measureProxy;
     private readonly Dictionary<Guid, Task<ProbeResult>> tcpProbes = [];
+    private readonly Dictionary<(Guid Id, bool Tcp), long> activeChecks = [];
     private readonly HashSet<Task> supplementalTasks = [];
     private readonly Dictionary<Guid, long> epochs = [];
     private readonly Dictionary<Guid, long> supplementalChecks = [];
@@ -52,8 +56,10 @@ public sealed partial class Controller : IDisposable
     public Controller() : this(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "WindowSocks")) { }
     public Controller(string configurationDirectory, Func<ProxyProfile, bool, CancellationToken, Task<ProbeResult>>? measureProxy = null,
         Func<ProxyProfile, bool, CancellationToken, Task<ProbeResult>>? measureTcp = null,
-        Func<ProxyProfile, ProbeResult, bool, CancellationToken, Task<ProbeResult>>? supplementProxy = null)
+        Func<ProxyProfile, ProbeResult, bool, CancellationToken, Task<ProbeResult>>? supplementProxy = null,
+        Func<DateTimeOffset>? handoffClock = null)
     {
+        this.handoffClock = handoffClock ?? (() => DateTimeOffset.UtcNow);
         this.measureProxy = measureProxy ?? MeasureProxy;
         this.measureTcp = measureTcp ?? ((profile, remote, ct) => ProxyProbe.RunTcpAsync(profile, new(RemoteStunDns: remote), ct));
         this.supplementProxy = supplementProxy ?? ((profile, result, remote, ct) => ProxyProbe.SupplementAsync(profile, result, new(RemoteStunDns: remote), ct));
@@ -61,12 +67,15 @@ public sealed partial class Controller : IDisposable
         var sidFile = Path.Combine(directory, "owner.sid");
         if (!File.Exists(sidFile)) throw new InvalidOperationException("尚未安裝服務，缺少 owner.sid。");
         OwnerSid = File.ReadAllText(sidFile).Trim(); _ = new SecurityIdentifier(OwnerSid);
-        store = new(directory); config = store.Load();
+        store = new(directory); config = store.Load(); vmwareRuntime = config.VmwareSessions;
         if (NativeEngine.Present && NativeEngine.Core_SetOwner(OwnerSid) == 0) throw new InvalidDataException("安裝使用者識別無效。");
         // Restart is deliberately blocked until targets and upstreams are revalidated.
-        ConfigureProxies(); ApplyRules();
+        config.AutoProxy = ProcessHandoffPolicy.Automatic(config.AutoProxy);
+        foreach (var binding in config.Bindings.Where(b => b.AutoManaged && b.Kind == "Process")) binding.IncludeChildren = true;
+        ConfigureProxies();
+        ApplyRules();
         gameObserver = new(config.AutoProxy, config.GameGroups, IsOwned);
-        if ((config.GlobalProxy.Enabled || config.AutoProxy.Enabled || config.Bindings.Count > 0) && NativeEngine.DriverPresent) {
+        if ((config.GlobalProxy.Enabled || config.AutoProxy.Enabled || config.Bindings.Count > 0 || config.Vmware.Enabled) && NativeEngine.DriverPresent) {
             try { EnsureEngine(); } catch (Exception ex) { engineError = ex.Message; }
         }
         Log("背景服務啟動；等待程序身分及代理檢測。");
@@ -83,6 +92,7 @@ public sealed partial class Controller : IDisposable
     }
     public async Task<Reply> Dispatch(Command cmd, CancellationToken ct)
     {
+        if (Volatile.Read(ref stopping)) return cmd.Action == "stopService" ? Reply.Success(true) : Reply.Failure("代理服務正在結束。");
         // Network checks must not hold the configuration lock: imports and snapshots
         // remain available even when an upstream takes the full timeout to respond.
         if (cmd.Action is "probe" or "probeTcp") {
@@ -94,9 +104,27 @@ public sealed partial class Controller : IDisposable
         await Gate.WaitAsync(ct);
         try
         {
+            if (stopping) return cmd.Action == "stopService" ? Reply.Success(true) : Reply.Failure("代理服務正在結束。");
             switch (cmd.Action)
             {
+                case "stopService":
+                    SuspendVmwareNetwork();
+                    supplementalLifetime.Cancel();
+                    if (NativeEngine.Present) NativeEngine.Core_Stop();
+                    started = false; stopping = true;
+                    return Reply.Success(true);
+                case "deleteRule": DeleteRule(Json.Read<DeleteRuleRequest>(cmd.Data)); return Reply.Success(true);
+                case "vmwareAdapters": return Reply.Success(VmwareNetwork.Adapters());
+                case "discoverVmware": return Reply.Success(ListVmware());
+                case "setupVmware": return Reply.Success(await SetupVmware(Json.Read<VmwareSettings>(cmd.Data), ct));
+                case "pauseVmware": PauseVmware(); return Reply.Success(true);
+                case "prepareVmware": return Reply.Success(await PrepareVmware(Json.Read<VmwareSettings>(cmd.Data), ct));
+                case "setVmware": SetVmware(Json.Read<VmwareSettings>(cmd.Data)); return Reply.Success(true);
+                case "restoreVmware": RestoreVmware(); return Reply.Success(true);
                 case "snapshot": return Reply.Success(GetSnapshot());
+                case "clearProxyPool": return Reply.Success(ClearProxyPool());
+                case "prepareCloseProxyProcesses": return Reply.Success(PrepareCloseProxyProcesses());
+                case "closeProxyProcesses": return Reply.Success(await CloseProxyProcesses(Json.Read<CloseProxyProcessesRequest>(cmd.Data)));
                 case "diagnose": return Reply.Success(GetDiagnosticBundle());
                 case "probeTarget":
                     var targetProbe = Json.Read<TargetProbeRequest>(cmd.Data);
@@ -106,11 +134,13 @@ public sealed partial class Controller : IDisposable
                     ProxyImport.ApplyTo(config.Proxies, imported);
                     ConfigureProxies(); store.Save(config); Log($"已處理 {imported.Count} 筆代理匯入。"); return Reply.Success(imported.Count);
                 case "export": return Reply.Success(ProxyImport.Export(config.Proxies));
+                case "editProxy": return Reply.Success(await EditProxy(Json.Read<EditProxyRequest>(cmd.Data), ct));
                 case "backup": return Reply.Success(Convert.ToBase64String(store.Backup(config)));
                 case "deleteProxy":
                     var delId = Json.Read<ProxyRequest>(cmd.Data).ProxyId;
                     if (config.Bindings.Any(x => x.ProxyId == delId)) throw new InvalidOperationException("請先解除使用此代理的綁定。");
                     if (config.AutoProxy.EmulatorAssignments.Any(x => x.ProxyId == delId)) throw new InvalidOperationException("請先在固定窗口配置中移除此代理。");
+                    if (!config.Vmware.RuleDeleted && config.Vmware.Machines.Any(m => m.ProxyId == delId) || vmwareRuntime.Any(m => m.ProxyId == delId)) throw new InvalidOperationException("請先移除 VMware 使用此節點的分配。");
                     if (config.GlobalProxy.Enabled && config.GlobalProxy.ProxyId == delId) throw new InvalidOperationException("請先停用使用此節點的全局代理。");
                     config.Proxies.RemoveAll(x => x.Id == delId); probes.Remove(delId); probeViews.Remove(delId); store.Save(config); return Reply.Success(true);
                 case "syncTargets":
@@ -176,7 +206,8 @@ public sealed partial class Controller : IDisposable
     }
     private void BindBatch(BatchBindRequest request)
     {
-        request = new(request.Items.Select(i => i with { Target = CaptureEmulatorIdentity(i.Target) }).ToArray());
+        RefreshBindingChildren();
+        request = new(request.Items.Select(i => i with { Target = CaptureEmulatorIdentity(ResolveHandoffTarget(i)) }).ToArray());
         var next = AssignmentPlanner.Prepare(config.Bindings, config.Proxies, request);
         foreach (var item in request.Items) {
             ValidateTarget(item.Target);
@@ -191,14 +222,24 @@ public sealed partial class Controller : IDisposable
             config.Bindings = old; targets.Clear(); foreach (var pair in previousTargets) targets.Add(pair.Key, pair.Value);
             ApplyRules(); throw;
         }
-        Log($"已分配 {request.Items.Length} 個目標／遊戲組；僅指定成員，目前封鎖，啟用前需通過檢測。");
+        Log($"已分配 {request.Items.Length} 個目標／遊戲組；目前封鎖，啟用前需通過檢測。");
+    }
+    private TargetInstance ResolveHandoffTarget(AssignmentItem item)
+    {
+        var previous = config.Bindings.FirstOrDefault(b => b.TargetKey == item.Target.Key);
+        if (item.Target.Kind != "Process" || !item.IncludeChildren || previous is not { Kind: "Process", IncludeChildren: true } ||
+            !item.Target.Path.Equals(previous.Path, StringComparison.OrdinalIgnoreCase)) return item.Target;
+        var members = previous.Processes.Concat(previous.Descendants).ToHashSet();
+        if (item.Target.Processes.Length == 0 || !item.Target.Processes.All(members.Contains)) return item.Target;
+        return item.Target with { Processes = previous.Processes, Running = members.Any(p => LdPlayer.Identity(p.Pid) == p && IsOwned(p.Pid)) };
     }
     private void EnsureEngine()
     {
+        if (stopping) throw new InvalidOperationException("代理服務正在結束。");
         if (started && NativeEngine.Core_IsRunning() != 0) return;
         if (!NativeEngine.Present) throw new InvalidOperationException("缺少 WindowSocksNative.dll，尚未啟用代理。");
         if (!NativeEngine.DriverPresent) throw new InvalidOperationException("缺少官方 WinDivert.dll／WinDivert64.sys，無法攔截流量。代理尚未啟用。");
-        if (started) { NativeEngine.Core_Stop(); started = false; }
+        if (started) { SuspendVmwareNetwork(); NativeEngine.Core_Stop(); started = false; }
         if (NativeEngine.Core_Start(Path.Combine(AppContext.BaseDirectory, "WinDivert.dll")) == 0) { engineError = $"驅動啟動失敗，Windows 錯誤 {NativeEngine.Core_LastError()}。"; throw new InvalidOperationException(engineError); }
         started = true; engineError = "核心執行中（實機相容性須驗收）";
     }
@@ -231,6 +272,7 @@ public sealed partial class Controller : IDisposable
     }
     private void SetAutoProxy(AutoProxyRule rule)
     {
+        rule = ProcessHandoffPolicy.Automatic(rule) with { Configured = true };
         if (rule.Kind == "Emulator") { SetFixedEmulators(rule); return; }
         if (rule.Kind == "EmulatorSequence") { SetSequentialEmulators(rule); return; }
         if (!rule.Enabled) {
@@ -320,12 +362,13 @@ public sealed partial class Controller : IDisposable
         var roots = AutoProxyPlanner.Roots(candidates, ProcessCatalog.Parents(), LdPlayer.Identity);
         var rootKeys = roots.Select(t => t.Key).ToHashSet(StringComparer.Ordinal);
         var known = config.AutoExcludedDescendants.ToHashSet();
+        foreach (var child in config.Bindings.Where(b => b.Kind == "Process" && b.IncludeChildren).SelectMany(b => b.Descendants)) known.Add(child);
         foreach (var child in candidates.Where(t => !rootKeys.Contains(t.Key)).SelectMany(t => t.Processes)) known.Add(child);
         bool changed = removed > 0 || known.Count != config.AutoExcludedDescendants.Count;
         config.AutoExcludedDescendants = known.ToList();
         if (changed) store.Save(config);
         automaticUnassigned.Clear();
-        foreach (var candidate in candidates.Where(t => config.Bindings.All(b => b.TargetKey != t.Key))) automaticUnassigned.Add(candidate.Key);
+        foreach (var candidate in candidates.Where(t => config.Bindings.All(b => b.TargetKey != t.Key) && !t.Processes.Any(known.Contains))) automaticUnassigned.Add(candidate.Key);
         return roots.Where(t => !t.Processes.Any(known.Contains)).ToArray();
     }
 
@@ -341,9 +384,9 @@ public sealed partial class Controller : IDisposable
             if (config.Bindings.RemoveAll(b => b.AutoManaged && EmulatorCatalog.IsEmulator(b.Kind) && !SequentialEmulatorPlanner.IsLive(b, LdPlayer.Identity)) > 0)
                 store.Save(config);
         }
-        bool changed = config.Bindings.RemoveAll(b => b.AutoManaged && b.Kind == "Process" && !b.Processes.Concat(b.IncludeChildren ? b.Descendants : []).Any(p => LdPlayer.Identity(p.Pid) == p)) > 0;
+        bool changed = config.Bindings.RemoveAll(b => b.AutoManaged && b.Kind == "Process" && ProcessBindingEnded(b)) > 0;
         foreach (var key in targets.Where(x => x.Value.Kind == "Process" && !x.Value.Processes.Any(p => LdPlayer.Identity(p.Pid) == p) &&
-            !config.Bindings.Any(b => b.TargetKey == x.Key && b.IncludeChildren && b.Descendants.Any(p => LdPlayer.Identity(p.Pid) == p))).Select(x => x.Key).ToArray()) targets.Remove(key);
+            !config.Bindings.Any(b => b.TargetKey == x.Key && b.IncludeChildren && !ProcessBindingEnded(b))).Select(x => x.Key).ToArray()) targets.Remove(key);
         if (config.AutoExcludedTargets.RemoveAll(key => key.StartsWith("pid:") && !targets.ContainsKey(key)) > 0) changed = true;
         var candidates = targets.Values.Where(t => AutoProxyPlanner.Matches(t, rule)).ToArray();
         if (rule.Kind == "Process") candidates = SelectAutomaticRoots(candidates);
@@ -351,7 +394,8 @@ public sealed partial class Controller : IDisposable
             .Where(t => t.Processes.All(p => LdPlayer.Identity(p.Pid) == p && IsOwned(p.Pid)) && (t.Kind != "LDPlayer" || LdPlayer.IsNat(t.Path, t.Index))).ToArray();
         else if (rule.Kind == "LDPlayer") candidates = candidates.Where(t => LdPlayer.IsNat(t.Path, t.Index)).ToArray();
         else candidates = candidates.Where(t => t.Processes.Length > 0 && config.GameGroups.Any(g => g.Key == t.Key && g.ClientPath.Equals(rule.ClientPath, StringComparison.OrdinalIgnoreCase))).ToArray();
-        var additions = AutoProxyPlanner.Additions(candidates, config.Bindings, config.Proxies, rule.PerProxy, config.AutoExcludedTargets, launchOrder: rule.Kind == "EmulatorSequence");
+        var additions = AutoProxyPlanner.Additions(candidates, config.Bindings, config.Proxies, rule.PerProxy, config.AutoExcludedTargets, launchOrder: rule.Kind == "EmulatorSequence")
+            .Select(item => item with { IncludeChildren = item.Target.Kind == "Process" && rule.IncludeChildren }).ToArray();
         if (additions.Length > 0) {
             BindBatch(new(additions));
             foreach (var item in additions) {
@@ -388,6 +432,7 @@ public sealed partial class Controller : IDisposable
             if (!active.TryGetValue(id, out work!)) {
                 created = true;
                 long check = ++epoch; epochs[id] = check;
+                activeChecks[(id, tcpFirst)] = check;
                 work = MeasureInBackground(profile, config.GlobalProxy, check, tcpFirst, ct);
                 active.Add(id, work);
             }
@@ -418,7 +463,7 @@ public sealed partial class Controller : IDisposable
                 } else { RecordProbe(current, result); ApplyProbeRules(profile.Id); }
                 return result;
             } finally {
-                (tcpFirst ? tcpProbes : activeProbes).Remove(profile.Id); removed = true;
+                RemoveActiveCheck(profile.Id, tcpFirst, check); removed = true;
                 Gate.Release();
             }
         } finally {
@@ -427,9 +472,38 @@ public sealed partial class Controller : IDisposable
             // synchronous completion cannot remove the entry before it is added.
             if (!removed) {
                 await Gate.WaitAsync(CancellationToken.None);
-                try { (tcpFirst ? tcpProbes : activeProbes).Remove(profile.Id); } finally { Gate.Release(); }
+                try { RemoveActiveCheck(profile.Id, tcpFirst, check); } finally { Gate.Release(); }
             }
         }
+    }
+    private void RemoveActiveCheck(Guid id, bool tcp, long check)
+    {
+        if (activeChecks.GetValueOrDefault((id, tcp)) != check) return;
+        (tcp ? tcpProbes : activeProbes).Remove(id); activeChecks.Remove((id, tcp));
+    }
+    private async Task<bool> EditProxy(EditProxyRequest request, CancellationToken ct)
+    {
+        var next = ProxyEditing.Prepare(config.Proxies, request);
+        int index = config.Proxies.FindIndex(p => p.Id == request.ProxyId);
+        var previous = config.Proxies[index]; bool changed = !ProxyImport.SameProxy(previous, next);
+        var global = config.GlobalProxy;
+        if (changed && global.Enabled && global.ProxyId == next.Id) {
+            var addresses = await Dns.GetHostAddressesAsync(next.Host, ct);
+            string resolved = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)?.ToString() ?? throw new InvalidOperationException("新節點沒有可用的 IPv4 位址。");
+            global = global with { ResolvedHost = resolved };
+        }
+        var oldGlobal = config.GlobalProxy; config.Proxies[index] = next; config.GlobalProxy = global;
+        try { store.Save(config); } catch { config.Proxies[index] = previous; config.GlobalProxy = oldGlobal; throw; }
+        if (changed) {
+            epochs[next.Id] = ++epoch; activeProbes.Remove(next.Id); tcpProbes.Remove(next.Id);
+            activeChecks.Remove((next.Id, false)); activeChecks.Remove((next.Id, true));
+            supplementalChecks.Remove(next.Id); probes.Remove(next.Id); probeViews.Remove(next.Id);
+            lastReady.Remove(next.Id); retries.Remove(next.Id);
+            // Close old connections under quarantine before changing credentials or upstream.
+            ApplyRules(); ConfigureProxies(); ApplyRules();
+        }
+        Log(changed ? "節點已修改；既有分配保留，等待重新檢測。" : "節點資料已修改。");
+        return changed;
     }
     private bool CurrentCheck(ProxyProfile profile, GlobalProxySettings policy, long check) =>
         epochs.GetValueOrDefault(profile.Id) == check && policy == config.GlobalProxy &&
@@ -484,7 +558,7 @@ public sealed partial class Controller : IDisposable
     {
         // An unused pool node cannot change live process/global routing. Rebuilding
         // all emulator rules here would hold up unrelated TCP result delivery.
-        if (config.Bindings.Any(b => b.ProxyId == id) || config.GlobalProxy.Enabled && config.GlobalProxy.ProxyId == id) ApplyRules();
+        if (config.Bindings.Any(b => b.ProxyId == id) || config.GlobalProxy.Enabled && config.GlobalProxy.ProxyId == id || config.Vmware.Machines.Length > 0) ApplyRules();
     }
     private bool DuplicateExit(Guid id)
     {
@@ -509,10 +583,11 @@ public sealed partial class Controller : IDisposable
     }
     private void ApplyRules()
     {
+        if (stopping) return;
         if (!NativeEngine.Present) { sessions.Synchronize([], DateTimeOffset.UtcNow); return; }
         // Build then atomically replace the quarantine set; releasing a binding must release its guard too.
         var guardPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        bool processStartupGuard = config.AutoProxy.Enabled && config.AutoProxy.Kind == "Process" && config.AutoProxy.Match == TargetMatch.ExecutablePath;
+        bool processStartupGuard = config.AutoProxy.Enabled && config.AutoProxy.Kind == "Process";
         if (processStartupGuard) guardPaths.Add(config.AutoProxy.Pattern);
         if (config.AutoProxy.Enabled && config.AutoProxy.Kind == "GameGroup") { guardPaths.Add(config.AutoProxy.Pattern); guardPaths.Add(config.AutoProxy.ClientPath); }
         foreach (var group in config.GameGroups.Where(g => config.Bindings.Any(b => b.TargetKey == g.Key))) { guardPaths.Add(group.LauncherPath); guardPaths.Add(group.ClientPath); }
@@ -541,8 +616,13 @@ public sealed partial class Controller : IDisposable
                     b.EmulatorProcessPath = target.EmulatorProcessPath; b.EmulatorCommandHash = target.EmulatorCommandHash; childrenDirty = true;
                 }
             }
-            var processes = b.Processes.Concat(b.IncludeChildren ? b.Descendants : []).Distinct().Where(p => LdPlayer.Identity(p.Pid) == p).ToArray();
-            foreach (var p in processes.Where(p => IsOwned(p.Pid))) { if (!ownership.TryGetValue(p, out var list)) ownership[p] = list = []; list.Add(b); }
+            // Retain the original identity's follow rule during handoff. A dead PID cannot route a reused PID's traffic.
+            var processes = b.Processes.Concat(b.IncludeChildren ? b.Descendants : []).Distinct()
+                .Where(p => LdPlayer.Identity(p.Pid) == p || b.Kind == "Process" && b.IncludeChildren && b.Processes.Contains(p)).ToArray();
+            foreach (var p in processes.Where(p => IsOwned(p.Pid) && LdPlayer.Identity(p.Pid) == p ||
+                b.Kind == "Process" && b.IncludeChildren && b.Processes.Contains(p) && LdPlayer.Identity(p.Pid) != p)) {
+                if (!ownership.TryGetValue(p, out var list)) ownership[p] = list = []; list.Add(b);
+            }
         }
         foreach (var (process, bindings) in ownership)
         {
@@ -579,7 +659,7 @@ public sealed partial class Controller : IDisposable
                 global.BypassRemoteControl ? 1u : 0u, RemoteControlBypass.NativeImages(global.RemoteControlExecutables), rdp.Pid, rdp.Created, rdp.Port);
         } else applied = NativeEngine.Core_ReplacePolicyEx(rows.ToArray(), (uint)rows.Count, guards, globalId, globalState, global.BypassLan ? 1u : 0u);
         if (applied == 0) throw new InvalidOperationException("程序規則有衝突，核心拒絕更新。");
-        UpdateSessions();
+        ApplyVmwareRules(); UpdateSessions();
     }
     private void RefreshBindingChildren()
     {
@@ -602,17 +682,19 @@ public sealed partial class Controller : IDisposable
         await Gate.WaitAsync(ct);
         try
         {
+            if (stopping) return;
             SaveNetworkEvents();
+            await CompleteVmwareSetup(ct);
             DiscoverGameGroups();
             RefreshBindingChildren();
             PruneExitedProcesses();
             DiscoverAutomaticTargets();
             DiscoverRestarts();
-            DiscoverMuMuRestarts();
+            DiscoverMuMuRestarts(); DiscoverVmware();
             ReconcileAutomaticBindings();
-            if ((config.GlobalProxy.Enabled || config.Bindings.Count > 0 || config.AutoProxy.Enabled) && NativeEngine.DriverPresent && (!started || NativeEngine.Core_IsRunning() == 0)) { try { EnsureEngine(); } catch (Exception ex) { engineError = ex.Message; } }
+            if ((config.GlobalProxy.Enabled || config.Bindings.Count > 0 || config.AutoProxy.Enabled || config.Vmware.Machines.Length > 0 && VmwarePrepared) && NativeEngine.DriverPresent && (!started || NativeEngine.Core_IsRunning() == 0)) { try { EnsureEngine(); } catch (Exception ex) { engineError = ex.Message; } }
             ApplyRules();
-            due = config.Bindings.Where(b => b.Enabled).Select(b => b.ProxyId).Concat(config.GlobalProxy.Enabled ? [config.GlobalProxy.ProxyId] : []).Distinct().FirstOrDefault(id => !tcpProbes.ContainsKey(id) && !supplementalChecks.ContainsKey(id) && (!retries.TryGetValue(id, out var r) || r.At <= DateTimeOffset.UtcNow));
+            due = config.Bindings.Where(b => b.Enabled).Select(b => b.ProxyId).Concat(config.GlobalProxy.Enabled ? [config.GlobalProxy.ProxyId] : []).Concat(config.Vmware.Enabled ? vmwareRuntime.Select(r => r.ProxyId).Where(id => id != Guid.Empty) : []).Distinct().FirstOrDefault(id => !tcpProbes.ContainsKey(id) && !supplementalChecks.ContainsKey(id) && (!retries.TryGetValue(id, out var r) || r.At <= DateTimeOffset.UtcNow));
             if (childrenDirty) { store.Save(config); childrenDirty = false; }
         }
         catch (Exception ex) when (ex is not OperationCanceledException) { autoStatus = "自動分配／監測失敗：" + ex.Message; Log("監測失敗：" + ex.Message); }
@@ -628,11 +710,18 @@ public sealed partial class Controller : IDisposable
     private void PruneExitedProcesses()
     {
         // A PID+birth binding cannot apply to a future process; retaining exited roots permanently consumes IP capacity.
-        var expired = config.Bindings.Where(b => b.Kind == "Process" && !b.Processes.Concat(b.IncludeChildren ? b.Descendants : []).Any(p => LdPlayer.Identity(p.Pid) == p)).ToArray();
+        var expired = config.Bindings.Where(b => b.Kind == "Process" && ProcessBindingEnded(b)).ToArray();
         foreach (var binding in expired) { config.Bindings.Remove(binding); targets.Remove(binding.TargetKey); }
         foreach (var key in targets.Where(t => t.Value.Kind == "Process" && !t.Value.Processes.Any(p => LdPlayer.Identity(p.Pid) == p) &&
-            !config.Bindings.Any(b => b.TargetKey == t.Key && b.IncludeChildren && b.Descendants.Any(p => LdPlayer.Identity(p.Pid) == p))).Select(t => t.Key).ToArray()) targets.Remove(key);
+            !config.Bindings.Any(b => b.TargetKey == t.Key && b.IncludeChildren && !ProcessBindingEnded(b))).Select(t => t.Key).ToArray()) targets.Remove(key);
+        processHandoffGrace.Retain(config.Bindings.Select(b => b.TargetKey));
         if (expired.Length > 0) { store.Save(config); Log($"已釋放 {expired.Length} 個已結束程序的分配名額。"); }
+    }
+    private bool ProcessBindingEnded(InstanceBinding binding)
+    {
+        bool live = binding.Processes.Concat(binding.IncludeChildren ? binding.Descendants : []).Any(p => LdPlayer.Identity(p.Pid) == p);
+        bool waiting = processHandoffGrace.Waiting(binding.TargetKey, live, handoffClock());
+        return !live && (!binding.IncludeChildren || !waiting);
     }
     private void DiscoverRestarts()
     {
@@ -677,7 +766,7 @@ public sealed partial class Controller : IDisposable
             var members = b.Kind == "GameGroup" ? config.GameGroups.FirstOrDefault(g => g.Key == b.TargetKey)?.Members.Select(m => m.Identity).ToArray() ?? pids : pids;
             long sent = 0, received = 0; uint tcp = 0, udp = 0;
             foreach (var p in members) if (NativeEngine.Present) { NativeEngine.Core_GetProcessStats((uint)p.Pid, (ulong)p.CreatedFileTime, out var t, out uint pt, out uint pu); sent += (long)t.Sent; received += (long)t.Received; tcp += pt; udp += pu; }
-            string state = !running ? "核心未啟用" : conflicts.Contains(b.TargetKey) ? "共用程序，不支援分流" : !b.Enabled ? "已封鎖" : pids.Length == 0 ? "等待實例" : DuplicateExit(b.ProxyId) ? "出口重複，已封鎖" : !Healthy(b.ProxyId) ? "代理異常，已封鎖" : "代理執行中";
+            string state = !running ? "核心未啟用" : conflicts.Contains(b.TargetKey) ? "共用程序，不支援分流" : !b.Enabled ? "已封鎖" : pids.Length == 0 ? b.Kind == "Process" && b.IncludeChildren ? "接續遊戲中 · 保留 IP" : "等待實例" : DuplicateExit(b.ProxyId) ? "出口重複，已封鎖" : !Healthy(b.ProxyId) ? "代理異常，已封鎖" : "代理執行中";
             return new RuntimeStatus(b.TargetKey, state, running ? "TCP／UDP 規則已下達；實際 IP 仍須從目標內驗證。連入時長為本次代理啟用時長；連線數為核心已建立的 TCP／UDP 關聯。" : engineError, sent, received) { TcpConnections = tcp, UdpAssociations = udp, ConnectedAt = sessions.ConnectedAt(b.TargetKey) };
         }).ToArray();
         var visibleTargets = targets.Values.Concat(config.Bindings.Select(b => new TargetInstance(b.TargetKey, b.Name, b.Kind, b.Path, b.Index,
@@ -685,7 +774,7 @@ public sealed partial class Controller : IDisposable
         var visibleProbes = probes.Values.Where(p => !probeViews.ContainsKey(p.ProxyId)).Concat(probeViews.Values).ToArray();
         return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), visibleTargets, visibleProbes, statuses,
             new(true, NativeEngine.DriverPresent, NativeEngine.Present, running, AppReleasePackage.CurrentVersion + " 預覽版", NativeEngine.DriverPresent ? engineError : "缺少 WinDivert 驅動，未啟用攔截。", logs.ToArray()))
-            { SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
+            { SupportsBulkActions = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
     }
     private string GlobalStatus()
     {
@@ -718,7 +807,8 @@ public sealed partial class Controller : IDisposable
         var snapshot = GetSnapshot();
         var reports = config.Bindings.Select(b => {
             var group = config.GameGroups.FirstOrDefault(g => g.Key == b.TargetKey);
-            var members = group?.Members ?? b.Processes.Select(p => new GameGroupMember(p, b.Path)).ToArray();
+            var members = group?.Members ?? b.Processes.Concat(b.IncludeChildren ? b.Descendants : []).Distinct()
+                .Select(p => new GameGroupMember(p, b.Processes.Contains(p) ? b.Path : LdPlayer.Identity(p.Pid) == p ? ProcessCatalog.ImagePath(p.Pid) : "")).ToArray();
             var processes = members.Select(m => {
                 bool alive = LdPlayer.Identity(m.Identity.Pid) == m.Identity;
                 bool? responding = null; string title = ""; long window = 0;
@@ -748,6 +838,9 @@ public sealed partial class Controller : IDisposable
     }
     private void ValidateTarget(TargetInstance target)
     {
+        var continuation = target.Kind == "Process" ? config.Bindings.FirstOrDefault(b => b.TargetKey == target.Key && b.IncludeChildren &&
+            b.Processes.SequenceEqual(target.Processes) && b.Path.Equals(target.Path, StringComparison.OrdinalIgnoreCase) &&
+            b.Descendants.Any(p => LdPlayer.Identity(p.Pid) == p && IsOwned(p.Pid))) : null;
         if (target.Kind == "LDPlayer") { ValidateConsole(target.Path); if (target.Index < 0 || target.Key != LdPlayer.Key(target.Path, target.Index)) throw new InvalidDataException("實例識別不符。"); }
         else if (target.Kind == "MuMu") {
             EmulatorCatalog.ValidateConsole("MuMu", target.Path);
@@ -762,7 +855,10 @@ public sealed partial class Controller : IDisposable
             foreach (var p in target.Processes) if (!ProcessCatalog.ImagePath(p.Pid).Equals(group.Members.Single(m => m.Identity == p).Path, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("遊戲組成員路徑已改變。");
         }
         else if (target.Kind != "Process") throw new InvalidDataException("不支援的目標種類。");
-        foreach (var p in target.Processes) if (LdPlayer.Identity(p.Pid) != p || !IsOwned(p.Pid)) throw new InvalidOperationException("程序已結束、身分改變，或不屬於安裝使用者。");
+        foreach (var p in target.Processes) {
+            if (continuation is not null && LdPlayer.Identity(p.Pid) != p) continue;
+            if (LdPlayer.Identity(p.Pid) != p || !IsOwned(p.Pid)) throw new InvalidOperationException("程序已結束、身分改變，或不屬於安裝使用者。");
+        }
     }
     [DllImport("kernel32.dll")] private static extern nint OpenProcess(uint access, bool inherit, int pid);
     [DllImport("advapi32.dll")] private static extern bool OpenProcessToken(nint process, uint access, out nint token);
@@ -775,7 +871,9 @@ public sealed partial class Controller : IDisposable
     }
     public void Dispose() {
         supplementalLifetime.Cancel(); Task.WhenAll(supplementalTasks).GetAwaiter().GetResult();
-        gameObserver.Dispose(); if (NativeEngine.Present && started) NativeEngine.Core_Stop();
+        gameObserver.Dispose();
+        try { SuspendVmwareNetwork(); } catch (Exception ex) { Log("暫停 VMware 轉送未完成：" + ex.Message); }
+        if (NativeEngine.Present && started) NativeEngine.Core_Stop();
         supplementalLifetime.Dispose(); supplementalGate.Dispose(); probeGate.Dispose(); Gate.Dispose();
     }
 }

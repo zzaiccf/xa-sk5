@@ -56,6 +56,11 @@ public sealed class AutomaticProbeSchedule
         if (!queued.Add(id)) { if (!priority) return; pending.Remove(id); }
         if (priority) pending.AddFirst(id); else pending.AddLast(id);
     }
+    public void Invalidate(Guid id)
+    {
+        active.Remove(id); supplements.Remove(id); nextChecks.Remove(id);
+        pending.Remove(id); queued.Remove(id);
+    }
     public bool TryStart(out ProbeJob job)
     {
         job = default;

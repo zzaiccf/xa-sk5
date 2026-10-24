@@ -23,10 +23,12 @@ public partial class AutoProxyWindow : Window
     private string ldPath;
     private string vendorKind = "LDPlayer";
     private bool ready;
+    private readonly CancellationTokenSource lifetime = new();
     public TargetInstance[] DiscoveredTargets => discovered.Values.ToArray();
     public string MuMuConsolePath => vendorKind == "MuMu" ? EmulatorPath.Text.Trim() : mumuPath;
     public string LdConsolePath => vendorKind == "LDPlayer" ? EmulatorPath.Text.Trim() : ldPath;
     public AutoProxyRule? Rule { get; private set; }
+    public bool VmwareRequested { get; private set; }
     public AutoProxyWindow(AutoProxyRule rule, string consolePath, int proxyCount, ProxyProfile[]? profiles = null,
         ProbeResult[]? probes = null, TargetInstance[]? targets = null, string mumuConsole = "", InstanceBinding[]? bindings = null)
     {
@@ -50,12 +52,16 @@ public partial class AutoProxyWindow : Window
             if (vendorKind == "MuMu") mumuPath = rule.ConsolePath; else ldPath = rule.ConsolePath;
             Vendor.SelectedIndex = vendorKind == "MuMu" ? 1 : 0;
         } else if (rule.Kind == "LDPlayer") ldPath = rule.ConsolePath;
-        Pattern.Text = rule.Pattern; ClientPath.Text = rule.ClientPath; Children.IsChecked = rule.IncludeChildren; Limit.Text = rule.PerProxy.ToString(); UpdateMode();
+        Pattern.Text = rule.Pattern; ClientPath.Text = rule.ClientPath; Limit.Text = rule.PerProxy.ToString(); UpdateMode();
         EmulatorPath.Text = vendorKind == "MuMu" ? mumuPath : ldPath;
         if (rule.Kind is "Emulator" or "EmulatorSequence" or "LDPlayer") EnableRule.IsChecked = rule.Enabled;
         ready = true;
+        Closed += (_, _) => lifetime.Cancel();
     }
-    private void ModeChanged(object sender, SelectionChangedEventArgs e) { if (Pattern is not null) UpdateMode(); }
+    private void ModeChanged(object sender, SelectionChangedEventArgs e) {
+        if (ready && Mode.SelectedIndex == 4) { VmwareRequested = true; DialogResult = true; return; }
+        if (Pattern is not null) UpdateMode();
+    }
     private void AllocationChanged(object sender, SelectionChangedEventArgs e) { if (Pattern is not null) UpdateMode(); }
     private void UpdateMode()
     {
@@ -73,12 +79,12 @@ public partial class AutoProxyWindow : Window
             PatternLabel.Visibility = Pattern.Visibility;
         }
         if (ClientPanel is not null) ClientPanel.Visibility = Mode.SelectedIndex == 3 ? Visibility.Visible : Visibility.Collapsed;
-        if (Children is not null) { Children.IsEnabled = Mode.SelectedIndex is 1 or 2; Children.Visibility = Children.IsEnabled ? Visibility.Visible : Visibility.Collapsed; }
+        if (Children is not null) Children.Visibility = Mode.SelectedIndex is 1 or 2 ? Visibility.Visible : Visibility.Collapsed;
         if (ModeNote is not null) ModeNote.Text = Mode.SelectedIndex switch {
             0 when !fixedMode => "先啟動的窗口先取得清單前方 IP；已有分配保留，關閉後釋放名額，重開重新排入。總計最多 10 個窗口；MuMu 首次辨識新窗口須保持介面開啟。",
             0 => "雷電與 MuMu 可同時配置。使用原始實例編號，未啟動也保留；總計最多 10 個窗口。僅支援可辨識的 NAT 網路程序。",
-            1 => "檔名採完全匹配；探索前可能直連，需啟動保護時請改用完整路徑。",
-            2 => "儲存後先攔截指定路徑的新連線，再分配代理；既有連線需重新建立。",
+            1 => "依檔名辨識登入器，自動接續它啟動的遊戲與子程序，沿用同一 IP；不必另外選遊戲組。",
+            2 => "依完整路徑辨識登入器，自動接續它啟動的遊戲與子程序，沿用同一 IP；既有連線需重新建立。",
             _ => "同組登入器與遊戲共用出口，僅接管這兩個指定程式。"
         };
     }
@@ -105,10 +111,13 @@ public partial class AutoProxyWindow : Window
     }
     private async void ReadEmulators(object sender, RoutedEventArgs e)
     {
+        if (!ReadInstances.IsEnabled) return;
+        var ct = lifetime.Token; string kind = vendorKind, path = EmulatorPath.Text.Trim();
         ReadInstances.IsEnabled = false; Error.Text = "正在讀取窗口…";
-        try { MergeTargets(await EmulatorCatalog.DiscoverAsync(vendorKind, EmulatorPath.Text.Trim(), CancellationToken.None)); Error.Text = ""; }
-        catch (Exception ex) { Error.Text = ex.Message; }
-        finally { ReadInstances.IsEnabled = true; }
+        try { var found = await System.Threading.Tasks.Task.Run(() => EmulatorCatalog.DiscoverAsync(kind, path, ct), ct); if (!ct.IsCancellationRequested) { MergeTargets(found); Error.Text = ""; } }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception ex) { if (!ct.IsCancellationRequested) Error.Text = ex.Message; }
+        finally { if (!ct.IsCancellationRequested) ReadInstances.IsEnabled = true; }
     }
     private void AddEmulator(object sender, RoutedEventArgs e)
     {
@@ -134,7 +143,7 @@ public partial class AutoProxyWindow : Window
         try {
             if (!int.TryParse(Limit.Text, out int count)) throw new InvalidOperationException("請輸入 1–10 的數字。");
             bool sequential = Mode.SelectedIndex == 0 && AllocationMode.SelectedIndex == 1;
-            var rule = new AutoProxyRule { Enabled = Mode.SelectedIndex != 0 || EnableRule.IsChecked == true, Kind = Mode.SelectedIndex == 0 ? sequential ? "EmulatorSequence" : "Emulator" : Mode.SelectedIndex == 3 ? "GameGroup" : "Process", Match = Mode.SelectedIndex >= 2 ? TargetMatch.ExecutablePath : TargetMatch.ExecutableName, Pattern = Pattern.Text.Trim(), ClientPath = Mode.SelectedIndex == 3 ? ClientPath.Text.Trim() : "", IncludeChildren = Children.IsEnabled && Children.IsChecked == true, PerProxy = count, ConsolePath = sequential ? EmulatorPath.Text.Trim() : consolePath, EmulatorKind = vendorKind,
+            var rule = new AutoProxyRule { Enabled = Mode.SelectedIndex != 0 || EnableRule.IsChecked == true, Kind = Mode.SelectedIndex == 0 ? sequential ? "EmulatorSequence" : "Emulator" : Mode.SelectedIndex == 3 ? "GameGroup" : "Process", Match = Mode.SelectedIndex >= 2 ? TargetMatch.ExecutablePath : TargetMatch.ExecutableName, Pattern = Pattern.Text.Trim(), ClientPath = Mode.SelectedIndex == 3 ? ClientPath.Text.Trim() : "", IncludeChildren = Mode.SelectedIndex is 1 or 2, PerProxy = count, ConsolePath = sequential ? EmulatorPath.Text.Trim() : consolePath, EmulatorKind = vendorKind,
                 EmulatorAssignments = Mode.SelectedIndex == 0 && !sequential ? mappings.Where(m => m.ProxyId != Guid.Empty).Select(m => new EmulatorAssignment(m.Kind, m.ConsolePath, m.Index, m.Name, m.ProxyId)).ToArray() : [] };
             if (rule.Kind == "Emulator" && rule.EmulatorAssignments.Length == 0) rule = rule with { Enabled = false };
             AutoProxyPlanner.Validate(rule); Rule = rule; DialogResult = true;

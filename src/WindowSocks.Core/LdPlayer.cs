@@ -29,7 +29,7 @@ public static class LdPlayer
     }
     public static ProcessIdentity? Identity(int pid)
     {
-        try { using var p = Process.GetProcessById(pid); return new(pid, p.StartTime.ToUniversalTime().ToFileTimeUtc()); }
+        try { using var p = Process.GetProcessById(pid); return p.HasExited ? null : new(pid, p.StartTime.ToUniversalTime().ToFileTimeUtc()); }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException) { return null; }
     }
     public static async Task<string> RunAsync(string console, IEnumerable<string> args, CancellationToken ct)
