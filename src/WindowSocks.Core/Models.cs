@@ -92,6 +92,7 @@ public sealed record Snapshot(ProxyProfile[] Proxies, InstanceBinding[] Bindings
     public string GlobalProxyStatus { get; init; } = "全局代理未啟用";
     // Null for older services; Enabled alone does not confirm that traffic can be routed.
     public bool? GlobalProxyRouting { get; init; }
+    public DateTimeOffset? GlobalProxyConnectedAt { get; init; }
 }
 public sealed record SavedConfig
 {

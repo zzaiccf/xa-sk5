@@ -97,6 +97,8 @@ public sealed partial class Controller
     private void UpdateSessions()
     {
         bool running = NativeEngine.Present && NativeEngine.Core_IsRunning() != 0;
+        globalSession.Synchronize(!stopping && config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId)
+            ? config.GlobalProxy.ProxyId : null, DateTimeOffset.UtcNow);
         sessions.Synchronize(config.Bindings.Select(b => new ProxySessionState(b.TargetKey, b.ProxyId,
             b.Kind == "Process" && b.IncludeChildren ? b.Processes : b.Processes.Where(p => LdPlayer.Identity(p.Pid) == p && IsOwned(p.Pid)).ToArray(),
             running && b.Enabled && !conflicts.Contains(b.TargetKey) && Healthy(b.ProxyId) && !DuplicateExit(b.ProxyId))), DateTimeOffset.UtcNow);

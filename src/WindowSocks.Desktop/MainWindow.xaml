@@ -34,7 +34,7 @@
       <StackPanel Grid.Column="1" Margin="0,0,16,0"><TextBlock Text="連接帳號／端口" Style="{StaticResource FieldLabel}" Margin="0,0,0,5"/><TextBlock x:Name="GlobalAccountPort" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/></StackPanel>
       <StackPanel Grid.Column="2"><TextBlock Text="連入 IP" Style="{StaticResource FieldLabel}" Margin="0,0,0,5"/><TextBlock x:Name="GlobalEntryIp" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/></StackPanel>
      </Grid>
-     <WrapPanel x:Name="GlobalPolicies" Grid.Row="3" Grid.ColumnSpan="2" Margin="28,11,0,0"><TextBlock x:Name="GlobalRemotePolicy" FontSize="11" Margin="0,0,20,0"/><TextBlock x:Name="GlobalLanPolicy" FontSize="11" Foreground="{StaticResource Muted}"/></WrapPanel>
+     <WrapPanel x:Name="GlobalPolicies" Grid.Row="3" Grid.ColumnSpan="2" Margin="28,11,0,0"><StackPanel Orientation="Horizontal" Margin="0,0,20,0" ToolTip="本次全局代理生效時長；停用、換線、核心重啟或線路受阻後重新計時。重新開啟介面仍沿用背景服務的起始時間。"><TextBlock Text="代理時長：" FontSize="11" Foreground="{StaticResource Muted}"/><TextBlock x:Name="GlobalDuration" Text="—" FontSize="11" FontFamily="Consolas"/></StackPanel><TextBlock x:Name="GlobalRemotePolicy" FontSize="11" Margin="0,0,20,0"/><TextBlock x:Name="GlobalLanPolicy" FontSize="11" Foreground="{StaticResource Muted}"/></WrapPanel>
     </Grid>
    </Border>
    <UniformGrid x:Name="SummaryCards" Grid.Row="2" Columns="3" Margin="0,0,-12,20">

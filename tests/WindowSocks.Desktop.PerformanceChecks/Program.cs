@@ -33,7 +33,7 @@ internal static partial class Program
         SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
         int exit = 1;
         Dispatcher.CurrentDispatcher.BeginInvoke(new Action(async () => {
-            try { if (Environment.GetCommandLineArgs().Contains("--bulk-actions")) await RunBulkActions(); else await Run(); exit = 0; }
+            try { if (Environment.GetCommandLineArgs().Contains("--global-duration")) await RunGlobalDuration(); else if (Environment.GetCommandLineArgs().Contains("--tray-behavior")) await RunTrayBehavior(); else if (Environment.GetCommandLineArgs().Contains("--bulk-actions")) await RunBulkActions(); else await Run(); exit = 0; }
             catch (Exception ex) { Console.Error.WriteLine(ex); }
             finally { Dispatcher.CurrentDispatcher.InvokeShutdown(); }
         }));
@@ -169,6 +169,7 @@ internal static partial class Program
     {
         private readonly Fixture fixture;
         public int Snapshots;
+        public void Disconnect() => Online = false;
         public FakeBackend(Fixture fixture) : base(Path.Combine(Output, "fixture-" + Guid.NewGuid().ToString("N")), fixture.Transport) {
             this.fixture = fixture; ConsolePath = @"C:\SyntheticMissingEmulator\ldconsole.exe"; MuMuConsolePath = "";
         }

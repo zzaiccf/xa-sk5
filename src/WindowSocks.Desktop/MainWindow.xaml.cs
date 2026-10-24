@@ -23,6 +23,8 @@ public partial class MainWindow : Window
     private readonly bool integrateShell;
     private readonly IProxyServiceSession serviceSession;
     private bool closingService, exitCleaned;
+    private DateTimeOffset lastBackgroundHint = DateTimeOffset.MinValue;
+    private readonly Action<string, string, int>? backgroundNotification;
     private bool startupChanging;
     private Snapshot? snapshot;
     private Snapshot? lastConnectedSnapshot;
@@ -35,6 +37,8 @@ public partial class MainWindow : Window
     private readonly Func<string, string, bool> confirmBulkAction;
     private readonly AutomaticProbeSchedule probeSchedule = new();
     private readonly CancellationTokenSource lifetime = new();
+    private readonly CancellationTokenSource startupRequest;
+    private Task serviceStart = Task.CompletedTask;
     private readonly Dictionary<ProbeJob, CancellationTokenSource> probeRequests = [];
     private bool probeWorkerRunning;
     private bool probeStatusPending, probeStatusIncomplete;
@@ -52,10 +56,12 @@ public partial class MainWindow : Window
     private bool ruleContextFromPointer, ruleContextOnRow;
     public MainWindow() : this(new Backend(), new DesktopStartupController(), true) { }
     public MainWindow(Backend backend, IDesktopStartupController? startup = null, bool integrateShell = false, IProxyServiceSession? serviceSession = null,
-        Func<string, string, bool>? confirmBulkAction = null)
+        Func<string, string, bool>? confirmBulkAction = null, Action<string, string, int>? backgroundNotification = null)
     {
         this.integrateShell = integrateShell;
         this.backend = backend ?? throw new ArgumentNullException(nameof(backend));
+        startupRequest = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        this.backgroundNotification = backgroundNotification;
         this.confirmBulkAction = confirmBulkAction ?? ((message, title) => MessageBox.Show(this, message, title, MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes);
         this.startup = startup ?? new PreviewStartupController();
         this.serviceSession = serviceSession ?? (integrateShell ? new DesktopProxySession(backend) : new PreviewProxySession());
@@ -63,13 +69,20 @@ public partial class MainWindow : Window
         RenderStartup();
         Activated += async (_, _) => { if (this.integrateShell && !taskbarRequesting) await RefreshTaskbar(); };
         trayIcon = LoadTrayIcon();
-        tray = new() { Icon = trayIcon, Visible = true, Text = "xa sk5" };
+        tray = new() { Icon = trayIcon, Visible = integrateShell, Text = "xa sk5" };
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("開啟 xa sk5", null, (_, _) => Dispatcher.Invoke(Restore));
-        menu.Items.Add("結束 xa sk5", null, (_, _) => Dispatcher.Invoke(Close));
+        menu.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(RequestExit));
         tray.ContextMenuStrip = menu; tray.DoubleClick += (_, _) => Dispatcher.Invoke(Restore);
         Loaded += async (_, _) => {
-            await Run("正在啟動代理元件並讀取節點…", async () => { await this.serviceSession.StartAsync(lifetime.Token); await Refresh(false, skipDiscovery: true); });
+            if (closingService || quitting) return;
+            if (this.integrateShell) try { DesktopTaskbar.RegisterExit(DesktopExecutable); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or COMException) { ShellHint.Text = "工作列選單未完成，仍可從右下角圖示選擇退出。"; }
+            await Run("正在啟動代理元件並讀取節點…", async () => {
+                serviceStart = this.serviceSession.StartAsync(startupRequest.Token); await serviceStart;
+                if (!closingService && !quitting) await Refresh(false, skipDiscovery: true);
+            });
+            if (closingService || quitting || lifetime.IsCancellationRequested) return;
             if (!lifetime.IsCancellationRequested) { discovery = DiscoverTargets(); _ = RefreshAfterDiscovery(discovery); }
             if (this.integrateShell) {
                 try {
@@ -87,8 +100,12 @@ public partial class MainWindow : Window
             } catch (Exception ex) when (ex is IOException or System.Text.Json.JsonException or UnauthorizedAccessException) { StatusText.Text = "已重新開啟；無法讀取更新結果，請查看更新紀錄。"; }
         };
         timer.Tick += async (_, _) => { if (!busy) await Run("", () => Refresh(false), false); }; timer.Start();
-        durationTimer.Tick += (_, _) => { foreach (var row in TargetGrid.Items.OfType<TargetRow>()) row.UpdateDuration(); }; durationTimer.Start();
+        durationTimer.Tick += (_, _) => { foreach (var row in TargetGrid.Items.OfType<TargetRow>()) row.UpdateDuration(); UpdateGlobalDuration(); }; durationTimer.Start();
         Closing += OnClosing;
+        StateChanged += (_, _) => {
+            if (WindowState == WindowState.Minimized && !closingService && !quitting) ShowBackgroundHint();
+            else if (WindowState != WindowState.Minimized) lastBackgroundHint = DateTimeOffset.MinValue;
+        };
     }
     private void Restore() { Show(); WindowState = WindowState.Normal; Activate(); }
     private void RenderStartup()
@@ -155,13 +172,38 @@ public partial class MainWindow : Window
         if (quitting) { CleanupExit(); return; }
         e.Cancel = true;
         if (closingService) return;
+        if (WindowState != WindowState.Minimized) WindowState = WindowState.Minimized;
+        else ShowBackgroundHint();
+    }
+    private void ShowBackgroundHint()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (now - lastBackgroundHint < TimeSpan.FromSeconds(3)) return;
+        lastBackgroundHint = now;
+        const string title = "xa sk5 已縮小，代理繼續運作";
+        const string message = "可從工作列還原視窗；右鍵工作列或右下角 xa sk5 圖示，選擇「退出」才會停止代理並結束程式。";
+        tray.BalloonTipTitle = title; tray.BalloonTipText = message; tray.BalloonTipIcon = System.Windows.Forms.ToolTipIcon.Info;
+        if (backgroundNotification is not null) backgroundNotification(title, message, 3000);
+        else if (integrateShell) tray.ShowBalloonTip(3000);
+    }
+    public void RequestExit()
+    {
+        if (quitting || closingService) return;
+        Restore();
         closingService = true; IsEnabled = false; timer.Stop(); durationTimer.Stop(); backend.StopProbes();
+        startupRequest.Cancel();
         StatusText.Text = "正在停止代理與背景服務…";
         Dispatcher.BeginInvoke(new Action(async () => await CloseWithService()));
     }
     private async Task CloseWithService()
     {
-        try { await serviceSession.StopAsync(CancellationToken.None); quitting = true; Close(); }
+        try {
+            // A stop sent before an outstanding start completes can leave a new
+            // background service behind after the UI exits. Settle startup first.
+            try { await serviceStart; } catch (Exception) { }
+            StatusText.Text = "正在停止代理與背景服務…";
+            await serviceSession.StopAsync(CancellationToken.None); quitting = true; Close();
+        }
         catch (Exception ex) {
             closingService = false; IsEnabled = true; timer.Start(); durationTimer.Start();
             StatusText.Text = "尚未完成關閉：" + ex.Message;
@@ -171,7 +213,7 @@ public partial class MainWindow : Window
     private void CleanupExit()
     {
         if (exitCleaned) return; exitCleaned = true;
-        timer.Stop(); durationTimer.Stop(); probeSchedule.Stop(); lifetime.Cancel(); backend.StopProbes();
+        timer.Stop(); durationTimer.Stop(); probeSchedule.Stop(); lifetime.Cancel(); startupRequest.Dispose(); backend.StopProbes();
         tray.Visible = false; tray.Dispose(); trayIcon.Dispose();
     }
     private static System.Drawing.Icon LoadTrayIcon()
@@ -189,8 +231,8 @@ public partial class MainWindow : Window
             while (busy) await Task.Delay(50);
         }
         busy = true; if (message.Length > 0) StatusText.Text = message;
-        try { await action(); if (message.Length > 0) StatusText.Text = "完成 · " + DateTime.Now.ToString("HH:mm:ss") + (probeSchedule.ActiveCount == 0 ? "" : $" · 實際 IP 自動檢測中（{probeSchedule.ActiveCount} 條並行）"); }
-        catch (Exception ex) { StatusText.Text = ex.Message; if (showError && !closingService && !quitting) MessageBox.Show(this, ex.Message, "xa sk5", MessageBoxButton.OK, MessageBoxImage.Information); }
+        try { await action(); if (message.Length > 0 && !closingService && !quitting) StatusText.Text = "完成 · " + DateTime.Now.ToString("HH:mm:ss") + (probeSchedule.ActiveCount == 0 ? "" : $" · 實際 IP 自動檢測中（{probeSchedule.ActiveCount} 條並行）"); }
+        catch (Exception ex) { if (!closingService && !quitting) StatusText.Text = ex.Message; if (showError && !closingService && !quitting) MessageBox.Show(this, ex.Message, "xa sk5", MessageBoxButton.OK, MessageBoxImage.Information); }
         finally { busy = false; }
     }
     private async Task Refresh(bool discover, bool skipDiscovery = false)
@@ -375,6 +417,7 @@ public partial class MainWindow : Window
         GlobalExitLabel.Text = state.ExitLabel; GlobalExitIp.Text = state.ExitIp; GlobalExitIp.ToolTip = state.ExitHint;
         GlobalAccountPort.Text = state.AccountPort; GlobalEntryIp.Text = state.EntryIp;
         GlobalRemotePolicy.Text = state.RemotePolicy; GlobalLanPolicy.Text = state.LanPolicy;
+        UpdateGlobalDuration();
         GlobalRemotePolicy.Foreground = state.RemotePolicy.Contains("待", StringComparison.Ordinal) ? Brush("#A36D14") : foreground;
         GlobalPolicies.Visibility = state.RemotePolicy.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         StopGlobal.IsEnabled = StopGlobalBanner.IsEnabled = state.CanStop;
@@ -386,6 +429,7 @@ public partial class MainWindow : Window
         tray.Text = "xa sk5 · " + state.Title;
         UpdateSummaryCards();
     }
+    private void UpdateGlobalDuration() => GlobalDuration.Text = GlobalProxyDisplay.Duration(snapshot, backend.Online, DateTimeOffset.UtcNow);
     private void WorkspaceSizeChanged(object sender, SizeChangedEventArgs e) => UpdateSummaryCards();
     private void UpdateSummaryCards()
     {

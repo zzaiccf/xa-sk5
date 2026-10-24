@@ -1,10 +1,18 @@
-# xa sk5 0.1.23
+# xa sk5 0.1.24
+
+全局代理狀態卡顯示本次代理時長，每秒更新並沿用背景服務的起始時間。工作列及系統匣右鍵加入「退出」；按 X 或最小化時保留代理並短暫提示。
 
 繁體中文 Windows x64 SOCKS5 代理工具，提供程序／子程序分流、模擬器配置、全局代理、節點檢測及 Windows 背景服務。
 
-[下載最新版](https://github.com/zzaiccf/xa-sk5/releases/latest) · [操作說明](docs/操作說明.html) · [發布與更新流程](docs/RELEASING.md) · [0.1.23 驗證範圍](docs/RELEASE-VALIDATION-0.1.23.md)
+[下載最新版](https://github.com/zzaiccf/xa-sk5/releases/latest) · [操作說明](docs/操作說明.html) · [發布與更新流程](docs/RELEASING.md) · [0.1.24 驗證範圍](docs/RELEASE-VALIDATION-0.1.24.md)
 
 這是工程預覽版。普通 Windows 程序的真實 TCP／UDP／DNS 轉送及程序接續已驗證；個別遊戲、模擬器與虛擬機仍須分別驗收。
+
+## 0.1.24 更新
+
+- 全局代理狀態卡加入「代理時長」，支援天數及時分秒。背景服務確認核心執行且節點可用後開始計時；停用、換線、核心重啟或線路受阻後重算，重新開啟介面接續原時間。服務斷線顯示「未確認」，舊服務沒有計時資料時顯示「待服務提供」。
+- 按 X、Alt+F4 或工作列「關閉視窗」縮小至工作列，代理維持運作。最小化及按 X 時要求 Windows 顯示短暫提示，同次縮小不重複通知。
+- 工作列及系統匣右鍵加入「退出」。等待背景服務停止才結束，停止失敗還原介面供重試，並處理啟動途中退出的交接。
 
 ## 0.1.23 更新
 
@@ -20,8 +28,8 @@
 
 發布頁只提供兩個附件：
 
-- `xa-sk5-Setup-0.1.23.exe`：安裝精靈、背景服務、捷徑與解除安裝項目；由 Windows 要求管理員授權。
-- `xa-sk5-0.1.23-win-x64.zip`：自帶 .NET 的完整可攜版。解壓全部檔案後執行 `xa sk5.exe`，保留同一資料夾內的 DLL。
+- `xa-sk5-Setup-0.1.24.exe`：安裝精靈、背景服務、捷徑與解除安裝項目；由 Windows 要求管理員授權。
+- `xa-sk5-0.1.24-win-x64.zip`：自帶 .NET 的完整可攜版。解壓全部檔案後執行 `xa sk5.exe`，保留同一資料夾內的 DLL。
 
 官方 WinDivert 2.2.2 x64 DLL／SYS 配對檔案包含於發布套件，建置時驗證 SYS 簽章。程式及安裝包目前沒有發布者程式碼簽章；SHA-256 完整性驗證不取代發布者簽章。
 
@@ -38,7 +46,7 @@
 
 全局代理提供區網及遠端控制程式直連選項，指定程序與暫停政策仍優先。啟用中的全局代理在各頁面顯示狀態；服務斷線或檢測失敗會顯示原因。
 
-關閉主視窗會停止代理服務後退出；最小化維持代理運作。開機啟動偏好可在設定頁取消，更新不會重新勾選已取消的設定。
+關閉主視窗與最小化維持代理運作；從工作列或系統匣右鍵選「退出」才會停止代理並結束程式。開機啟動偏好可在設定頁取消，更新不會重新勾選已取消的設定。
 
 ## 驗證與限制
 
@@ -57,6 +65,8 @@
 ./scripts/Test-PacketPathPerformance.ps1
 ./scripts/Test-RuleEditorPerformance.ps1
 ./scripts/Test-BulkActionsUi.ps1
+./scripts/Test-TrayBehavior.ps1
+./scripts/Test-GlobalDuration.ps1
 ```
 
 本機建置不會發布。官方 WinDivert 二進位快取置於 `third_party/WinDivert-2.2.2-A/x64`，不納入原始碼；建置不自動下載驅動或更改安全性設定。需要發布時依 [RELEASING.md](docs/RELEASING.md) 建立完整套件、測試更新器，再上傳草稿並公開。

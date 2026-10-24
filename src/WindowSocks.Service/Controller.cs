@@ -38,6 +38,7 @@ public sealed partial class Controller : IDisposable
     private ulong lastEventSequence;
     private bool childrenDirty;
     private readonly ProxySessionTracker sessions = new();
+    private readonly GlobalProxySessionTracker globalSession = new();
     private readonly RemoteDesktopListener remoteDesktop = new();
     private readonly SemaphoreSlim probeGate = new(ProbeTiming.MaxConcurrentProbes, ProbeTiming.MaxConcurrentProbes);
     private readonly Dictionary<Guid, Task<ProbeResult>> activeProbes = [];
@@ -239,6 +240,7 @@ public sealed partial class Controller : IDisposable
         if (started && NativeEngine.Core_IsRunning() != 0) return;
         if (!NativeEngine.Present) throw new InvalidOperationException("缺少 WindowSocksNative.dll，尚未啟用代理。");
         if (!NativeEngine.DriverPresent) throw new InvalidOperationException("缺少官方 WinDivert.dll／WinDivert64.sys，無法攔截流量。代理尚未啟用。");
+        globalSession.Synchronize(null, DateTimeOffset.UtcNow);
         if (started) { SuspendVmwareNetwork(); NativeEngine.Core_Stop(); started = false; }
         if (NativeEngine.Core_Start(Path.Combine(AppContext.BaseDirectory, "WinDivert.dll")) == 0) { engineError = $"驅動啟動失敗，Windows 錯誤 {NativeEngine.Core_LastError()}。"; throw new InvalidOperationException(engineError); }
         started = true; engineError = "核心執行中（實機相容性須驗收）";
@@ -584,7 +586,7 @@ public sealed partial class Controller : IDisposable
     private void ApplyRules()
     {
         if (stopping) return;
-        if (!NativeEngine.Present) { sessions.Synchronize([], DateTimeOffset.UtcNow); return; }
+        if (!NativeEngine.Present) { sessions.Synchronize([], DateTimeOffset.UtcNow); globalSession.Synchronize(null, DateTimeOffset.UtcNow); return; }
         // Build then atomically replace the quarantine set; releasing a binding must release its guard too.
         var guardPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         bool processStartupGuard = config.AutoProxy.Enabled && config.AutoProxy.Kind == "Process";
@@ -774,7 +776,7 @@ public sealed partial class Controller : IDisposable
         var visibleProbes = probes.Values.Where(p => !probeViews.ContainsKey(p.ProxyId)).Concat(probeViews.Values).ToArray();
         return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), visibleTargets, visibleProbes, statuses,
             new(true, NativeEngine.DriverPresent, NativeEngine.Present, running, AppReleasePackage.CurrentVersion + " 預覽版", NativeEngine.DriverPresent ? engineError : "缺少 WinDivert 驅動，未啟用攔截。", logs.ToArray()))
-            { SupportsBulkActions = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
+            { SupportsBulkActions = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyConnectedAt = globalSession.ConnectedAt, GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
     }
     private string GlobalStatus()
     {

@@ -79,4 +79,12 @@ public sealed record GlobalProxyDisplay
         };
     }
     private static GlobalProxyDisplay Warning(GlobalProxyDisplay result) => result with { Foreground = "#A36D14", Background = "#FFF8EB", Border = "#EED9AD" };
+
+    public static string Duration(Snapshot? current, bool online, DateTimeOffset now)
+    {
+        if (current is null || !online || !current.Diagnostics.ServiceOnline) return "未確認";
+        if (!current.GlobalProxy.Enabled || !current.Diagnostics.EngineRunning || current.GlobalProxyRouting == false) return "—";
+        if (current.GlobalProxyRouting is null || current.GlobalProxyConnectedAt is null) return "待服務提供";
+        return ProxySessionTracker.Duration(current.GlobalProxyConnectedAt, now);
+    }
 }
