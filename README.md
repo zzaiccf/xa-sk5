@@ -1,7 +1,8 @@
-# xa sk5 0.1.24
+# xa sk5 0.1.30
 
-全局代理狀態卡顯示本次代理時長，每秒更新並沿用背景服務的起始時間。工作列及系統匣右鍵加入「退出」；按 X 或最小化時保留代理並短暫提示。
+新增桌面沙盒引導設定、YongOrigin 相容設定、規則右鍵啟動／停止及預設間隔 10 秒的批量啟動。設定視窗立即開啟，慢速探索在背景執行；固定線路、取消與啟動前核驗仍保留。詳見 [沙盒操作說明](docs/SANDBOX-GUIDE.md)。
 
+包含統一「遊戲／程式」規則、捷徑與遊戲本體拖放匯入、各線路分配名額調整，以及活躍連線誤判閒置與封包錯誤 1232 的穩定性修正。需要更新主程式、背景服務及核心。
 繁體中文 Windows x64 SOCKS5 代理工具，提供程序／子程序分流、模擬器配置、全局代理、節點檢測及 Windows 背景服務。
 
 [下載最新版](https://github.com/zzaiccf/xa-sk5/releases/latest) · [操作說明](docs/操作說明.html) · [發布與更新流程](docs/RELEASING.md) · [0.1.24 驗證範圍](docs/RELEASE-VALIDATION-0.1.24.md)
@@ -28,8 +29,8 @@
 
 發布頁只提供兩個附件：
 
-- `xa-sk5-Setup-0.1.24.exe`：安裝精靈、背景服務、捷徑與解除安裝項目；由 Windows 要求管理員授權。
-- `xa-sk5-0.1.24-win-x64.zip`：自帶 .NET 的完整可攜版。解壓全部檔案後執行 `xa sk5.exe`，保留同一資料夾內的 DLL。
+- `xa-sk5-Setup-0.1.30.exe`：安裝精靈、背景服務、捷徑與解除安裝項目；由 Windows 要求管理員授權。
+- `xa-sk5-0.1.30-win-x64.zip`：自帶 .NET 的完整可攜版。解壓全部檔案後執行 `xa sk5.exe`，保留同一資料夾內的 DLL。
 
 官方 WinDivert 2.2.2 x64 DLL／SYS 配對檔案包含於發布套件，建置時驗證 SYS 簽章。程式及安裝包目前沒有發布者程式碼簽章；SHA-256 完整性驗證不取代發布者簽章。
 
@@ -64,6 +65,8 @@
 ./scripts/Build.ps1 -PayloadDirectory artifacts/local
 ./scripts/Test-PacketPathPerformance.ps1
 ./scripts/Test-RuleEditorPerformance.ps1
+./scripts/Test-UnifiedProgramRules.ps1
+./scripts/Test-LineCapacities.ps1
 ./scripts/Test-BulkActionsUi.ps1
 ./scripts/Test-TrayBehavior.ps1
 ./scripts/Test-GlobalDuration.ps1

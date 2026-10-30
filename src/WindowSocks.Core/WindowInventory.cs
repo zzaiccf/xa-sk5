@@ -3,7 +3,7 @@ namespace WindowSocks.Core;
 public sealed record WindowListItem(TargetInstance Target, Guid ProxyId, bool UseLocalNetwork, string Rule, string State, string Detail,
     DateTimeOffset? ConnectedAt = null, long? Sent = null, long? Received = null, uint? TcpConnections = null, uint? UdpAssociations = null)
 {
-    public string InstanceDetail => (Target.Kind switch { "VMware" => "VMware", "LDPlayer" => "雷電", "MuMu" => "MuMu", "GameGroup" => "遊戲組", _ => "程序" }) +
+    public string InstanceDetail => (Target.Kind switch { "Sandbox" => "桌面沙盒", "VMware" => "VMware", "LDPlayer" => "雷電", "MuMu" => "MuMu", "GameGroup" => "遊戲組", _ => "程序" }) +
         (Target.Processes.Length == 0 ? " · 未啟動" : " · PID " + string.Join(", ", Target.Processes.Select(p => p.Pid)));
 }
 
@@ -29,8 +29,10 @@ public static class WindowInventory
                 visible = target with { Name = name, Processes = live, Running = live.Length > 0 || status?.State.StartsWith("接續遊戲中", StringComparison.Ordinal) == true,
                     Detail = target.Detail + (live.Length == 0 ? "\n正在接續遊戲，保留原 IP。" : "\n目前成員 PID：" + string.Join(", ", live.Select(p => p.Pid))) };
             }
-            result.Add(new(visible, binding?.ProxyId ?? Guid.Empty, false, binding is null ? "未設定個別規則" : binding.AutoManaged ? "自動代理" : "手動分配",
-                status?.State ?? (target.Kind is "GameGroup" or "GameOrphan" ? "未分配 · 已封鎖" : snapshot.GlobalProxy.Enabled ? "依全局代理規則" : target.Running ? "執行中 · 未代理" : "未啟動"), visible.Detail,
+            var sandbox = snapshot.SandboxInstances.FirstOrDefault(p => p.TargetKey == target.Key);
+            var sandboxStatus = sandbox is null ? null : snapshot.SandboxStatuses.FirstOrDefault(s => s.Id == sandbox.Id);
+            result.Add(new(visible, sandbox?.ProxyId ?? binding?.ProxyId ?? Guid.Empty, false, sandbox is not null ? "沙盒固定線路" : binding is null ? "未設定個別規則" : binding.AutoManaged ? "自動代理" : "手動分配",
+                sandboxStatus?.State ?? status?.State ?? (target.Kind is "GameGroup" or "GameOrphan" ? "未分配 · 已封鎖" : snapshot.GlobalProxy.Enabled ? "依全局代理規則" : target.Running ? "執行中 · 未代理" : "未啟動"), sandboxStatus?.Detail ?? visible.Detail,
                 status?.ConnectedAt, status?.Sent, status?.Received, status?.TcpConnections, status?.UdpAssociations));
         }
         var observed = (discovered ?? []).GroupBy(v => v.Machine.Path, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);

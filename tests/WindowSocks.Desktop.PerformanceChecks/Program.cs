@@ -33,7 +33,7 @@ internal static partial class Program
         SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
         int exit = 1;
         Dispatcher.CurrentDispatcher.BeginInvoke(new Action(async () => {
-            try { if (Environment.GetCommandLineArgs().Contains("--global-duration")) await RunGlobalDuration(); else if (Environment.GetCommandLineArgs().Contains("--tray-behavior")) await RunTrayBehavior(); else if (Environment.GetCommandLineArgs().Contains("--bulk-actions")) await RunBulkActions(); else await Run(); exit = 0; }
+            try { if (Environment.GetCommandLineArgs().Contains("--sandbox-ui")) await RunSandboxUi(); else if (Environment.GetCommandLineArgs().Contains("--line-capacities")) await RunLineCapacities(); else if (Environment.GetCommandLineArgs().Contains("--unified-program-rules")) RunUnifiedProgramRules(); else if (Environment.GetCommandLineArgs().Contains("--global-duration")) await RunGlobalDuration(); else if (Environment.GetCommandLineArgs().Contains("--tray-behavior")) await RunTrayBehavior(); else if (Environment.GetCommandLineArgs().Contains("--bulk-actions")) await RunBulkActions(); else await Run(); exit = 0; }
             catch (Exception ex) { Console.Error.WriteLine(ex); }
             finally { Dispatcher.CurrentDispatcher.InvokeShutdown(); }
         }));
@@ -63,7 +63,7 @@ internal static partial class Program
             Check(!busy.IsCompleted && !fixture.Discovery.Task.IsCompleted, "Editor waited for unrelated work.");
             Invoke(main, "AutoProxyClick");
             Check(System.Windows.Application.Current.Windows.OfType<AutoProxyWindow>().Count() == 1, "Repeated add opened duplicate editors.");
-            foreach (int mode in new[] { 0, 1, 2, 3, 2 }) {
+            foreach (int mode in new[] { 0, 1, 0, 1 }) {
                 ((ComboBox)editor.FindName("Mode")).SelectedIndex = mode;
                 await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
                 Check(((ComboBox)editor.FindName("Mode")).SelectedIndex == mode, "Target type did not switch.");
@@ -74,7 +74,7 @@ internal static partial class Program
             editor.Close(); await Until(() => !(bool)typeof(MainWindow).GetField("ruleDialogOpen", Private)!.GetValue(main)!);
             Check(fixture.Saves == 0, "Cancelling the editor wrote a rule.");
             Invoke(main, "AutoProxyClick"); editor = await Editor<AutoProxyWindow>();
-            ((ComboBox)editor.FindName("Mode")).SelectedIndex = 2;
+            ((ComboBox)editor.FindName("Mode")).SelectedIndex = 1;
             ((TextBox)editor.FindName("Pattern")).Text = @"C:\SyntheticGame\Login.exe";
             ((TextBox)editor.FindName("Limit")).Text = "1";
             ((Button)editor.FindName("SaveRuleButton")).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
@@ -87,7 +87,7 @@ internal static partial class Program
             blocker = new(TaskCreationOptions.RunContinuationsAsynchronously);
             busy = (Task)typeof(MainWindow).GetMethod("Run", Private)!.Invoke(main, ["", new Func<Task>(() => blocker.Task), false])!;
             Invoke(main, "AutoProxyClick"); editor = await Editor<AutoProxyWindow>();
-            watch.Restart(); ((ComboBox)editor.FindName("Mode")).SelectedIndex = 4;
+            watch.Restart(); ((ComboBox)editor.FindName("Mode")).SelectedIndex = 2;
             var vmware = await Editor<VmwareWindow>(); watch.Stop(); report["vmwareFromAddMenuMs"] = watch.Elapsed.TotalMilliseconds;
             await Until(() => fixture.AdapterEntered > 0);
             Check(!fixture.Adapters.Task.IsCompleted, "Synthetic slow adapter lookup completed unexpectedly.");
@@ -132,7 +132,7 @@ internal static partial class Program
         var host = new ContentControl { Content = content, Width = width, Height = height, HorizontalContentAlignment = HorizontalAlignment.Stretch, VerticalContentAlignment = VerticalAlignment.Stretch, FontFamily = new FontFamily("Microsoft JhengHei UI"), FontSize = 13, Foreground = (Brush)System.Windows.Application.Current.FindResource("Ink") };
         var surface = new Border { Child = host, Background = (Brush)System.Windows.Application.Current.FindResource("Canvas") };
         surface.Measure(new Size(width, height)); surface.Arrange(new Rect(0, 0, width, height)); surface.UpdateLayout();
-        var save = (Button)window.FindName("SaveRuleButton"); var point = save.TransformToAncestor(surface).Transform(new Point());
+        var save = (Button)(window.FindName("SaveRuleButton") ?? window.FindName("StartBothButton")); var point = save.TransformToAncestor(surface).Transform(new Point());
         Check(point.X >= 0 && point.Y >= 0 && point.X + save.ActualWidth <= width && point.Y + save.ActualHeight <= height, "Save button was clipped.");
         var image = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32); image.Render(surface);
         var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(image)); using (var file = File.Create(Path.Combine(Output, name))) png.Save(file);
@@ -169,6 +169,12 @@ internal static partial class Program
     {
         private readonly Fixture fixture;
         public int Snapshots;
+        public readonly System.Collections.Concurrent.ConcurrentQueue<Guid> SandboxStarts = new();
+        public SandboxInstanceProfile[]? PreparedPair;
+        public override Task<bool> SandboxInstalled(CancellationToken ct) => Task.FromResult(true);
+        public override Task<bool> DetectYongOrigin(string path, CancellationToken ct) => Task.FromResult(path.Contains("SyntheticGame"));
+        public override Task StartSandbox(Guid id, CancellationToken ct = default) { SandboxStarts.Enqueue(id); return Task.CompletedTask; }
+        public override Task PrepareSandboxPair(SandboxInstanceProfile[] pair, IProgress<string>? progress, CancellationToken ct) { PreparedPair = pair; return Task.CompletedTask; }
         public void Disconnect() => Online = false;
         public FakeBackend(Fixture fixture) : base(Path.Combine(Output, "fixture-" + Guid.NewGuid().ToString("N")), fixture.Transport) {
             this.fixture = fixture; ConsolePath = @"C:\SyntheticMissingEmulator\ldconsole.exe"; MuMuConsolePath = "";

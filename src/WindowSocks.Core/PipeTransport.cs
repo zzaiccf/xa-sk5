@@ -9,6 +9,7 @@ namespace WindowSocks.Core;
 public static class PipeTransport
 {
     public const string Name = "WindowSocks.v1";
+    public const string SandboxName = "WindowSocks.Sandbox.v1";
     public const int Limit = 1024 * 1024;
     public static async Task WriteAsync<T>(Stream stream, T value, CancellationToken ct)
     {
@@ -24,10 +25,10 @@ public static class PipeTransport
         byte[] data = new byte[length]; await stream.ReadExactlyAsync(data, ct);
         return JsonSerializer.Deserialize<T>(data, Json.Options) ?? throw new IOException("無效訊息。");
     }
-    public static async Task<T> CallAsync<T>(Command command, CancellationToken ct = default)
+    public static async Task<T> CallAsync<T>(Command command, CancellationToken ct = default, string pipeName = Name)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct); timeout.CancelAfter(TimeSpan.FromSeconds(120));
-        await using var pipe = new NamedPipeClientStream(".", Name, PipeDirection.InOut, PipeOptions.Asynchronous);
+        await using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         await pipe.ConnectAsync(1500, timeout.Token);
         await WriteAsync(pipe, command, timeout.Token); var reply = await ReadAsync<Reply>(pipe, timeout.Token);
         if (!reply.Ok) throw new InvalidOperationException(reply.Error);

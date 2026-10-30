@@ -34,6 +34,7 @@ public sealed partial class Controller : IDisposable
     private readonly GameGroupObserver gameObserver;
     private readonly ProcessHandoffGrace processHandoffGrace = new();
     private readonly Func<DateTimeOffset> handoffClock;
+    private readonly SingleFlightQuery<VmwareDiscovered[]> vmwareInventory;
     private string gameWarning = "";
     private ulong lastEventSequence;
     private bool childrenDirty;
@@ -58,9 +59,10 @@ public sealed partial class Controller : IDisposable
     public Controller(string configurationDirectory, Func<ProxyProfile, bool, CancellationToken, Task<ProbeResult>>? measureProxy = null,
         Func<ProxyProfile, bool, CancellationToken, Task<ProbeResult>>? measureTcp = null,
         Func<ProxyProfile, ProbeResult, bool, CancellationToken, Task<ProbeResult>>? supplementProxy = null,
-        Func<DateTimeOffset>? handoffClock = null)
+        Func<DateTimeOffset>? handoffClock = null, Func<VmwareDiscovered[]>? discoverVmware = null)
     {
         this.handoffClock = handoffClock ?? (() => DateTimeOffset.UtcNow);
+        vmwareInventory = new(discoverVmware ?? ListVmware);
         this.measureProxy = measureProxy ?? MeasureProxy;
         this.measureTcp = measureTcp ?? ((profile, remote, ct) => ProxyProbe.RunTcpAsync(profile, new(RemoteStunDns: remote), ct));
         this.supplementProxy = supplementProxy ?? ((profile, result, remote, ct) => ProxyProbe.SupplementAsync(profile, result, new(RemoteStunDns: remote), ct));
@@ -81,7 +83,14 @@ public sealed partial class Controller : IDisposable
         }
         Log("背景服務啟動；等待程序身分及代理檢測。");
     }
-    private void Log(string text) { logs.Enqueue($"{DateTimeOffset.Now:HH:mm:ss}  {text}"); while (logs.Count > 100) logs.Dequeue(); }
+    private void Log(string text) {
+        string line = $"{DateTimeOffset.Now:O}  {text}"; logs.Enqueue(line); while (logs.Count > 100) logs.Dequeue();
+        try {
+            string path = Path.Combine(directory, "service-session.log");
+            if (File.Exists(path) && new FileInfo(path).Length > 2 * 1024 * 1024) File.Move(path, path + ".previous", true);
+            File.AppendAllText(path, line + Environment.NewLine);
+        } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+    }
     private void ConfigureProxies()
     {
         foreach (var p in config.Proxies)
@@ -91,9 +100,13 @@ public sealed partial class Controller : IDisposable
             if (NativeEngine.Present && NativeEngine.Core_SetProxy(id, host, checked((ushort)p.Port), p.Username, p.Password) == 0) throw new InvalidDataException("代理設定被核心拒絕。");
         }
     }
-    public async Task<Reply> Dispatch(Command cmd, CancellationToken ct)
+    public async Task<Reply> Dispatch(Command cmd, CancellationToken ct, int? callerPid = null)
     {
         if (Volatile.Read(ref stopping)) return cmd.Action == "stopService" ? Reply.Success(true) : Reply.Failure("代理服務正在結束。");
+        if (cmd.Action == "discoverVmware") {
+            try { return Reply.Success(await vmwareInventory.ReadAsync(TimeSpan.FromSeconds(8), ct)); }
+            catch (Exception ex) when (ex is not OutOfMemoryException) { return Reply.Failure("虛擬機清單暫時無法讀取：" + ex.Message); }
+        }
         // Network checks must not hold the configuration lock: imports and snapshots
         // remain available even when an upstream takes the full timeout to respond.
         if (cmd.Action is "probe" or "probeTcp") {
@@ -108,7 +121,17 @@ public sealed partial class Controller : IDisposable
             if (stopping) return cmd.Action == "stopService" ? Reply.Success(true) : Reply.Failure("代理服務正在結束。");
             switch (cmd.Action)
             {
+                case "saveSandbox": SaveSandbox(Json.Read<SandboxInstanceProfile>(cmd.Data)); return Reply.Success(true);
+                case "armSandbox": return Reply.Success(ArmSandbox(Json.Read<SandboxRequest>(cmd.Data).Id));
+                case "registerSandbox": return Reply.Success(RegisterSandbox(Json.Read<SandboxRegistration>(cmd.Data), callerPid));
+                case "reportSandboxLaunch": ReportSandboxLaunch(Json.Read<SandboxLaunchReport>(cmd.Data), callerPid); return Reply.Success(true);
+                case "reportSandboxNetwork": ReportSandboxNetwork(Json.Read<SandboxNetworkReport>(cmd.Data), callerPid); return Reply.Success(true);
+                case "refreshSandboxes": return Reply.Success(SandboxStatuses());
+                case "pauseSandbox": PauseSandbox(Json.Read<SandboxRequest>(cmd.Data).Id); return Reply.Success(true);
+                case "removeSandbox": RemoveSandbox(Json.Read<SandboxRequest>(cmd.Data).Id); return Reply.Success(true);
                 case "stopService":
+                    Log($"收到結束服務要求，來源 PID：{callerPid}。");
+                    StopManagedSandboxes();
                     SuspendVmwareNetwork();
                     supplementalLifetime.Cancel();
                     if (NativeEngine.Present) NativeEngine.Core_Stop();
@@ -116,7 +139,6 @@ public sealed partial class Controller : IDisposable
                     return Reply.Success(true);
                 case "deleteRule": DeleteRule(Json.Read<DeleteRuleRequest>(cmd.Data)); return Reply.Success(true);
                 case "vmwareAdapters": return Reply.Success(VmwareNetwork.Adapters());
-                case "discoverVmware": return Reply.Success(ListVmware());
                 case "setupVmware": return Reply.Success(await SetupVmware(Json.Read<VmwareSettings>(cmd.Data), ct));
                 case "pauseVmware": PauseVmware(); return Reply.Success(true);
                 case "prepareVmware": return Reply.Success(await PrepareVmware(Json.Read<VmwareSettings>(cmd.Data), ct));
@@ -143,7 +165,8 @@ public sealed partial class Controller : IDisposable
                     if (config.AutoProxy.EmulatorAssignments.Any(x => x.ProxyId == delId)) throw new InvalidOperationException("請先在固定窗口配置中移除此代理。");
                     if (!config.Vmware.RuleDeleted && config.Vmware.Machines.Any(m => m.ProxyId == delId) || vmwareRuntime.Any(m => m.ProxyId == delId)) throw new InvalidOperationException("請先移除 VMware 使用此節點的分配。");
                     if (config.GlobalProxy.Enabled && config.GlobalProxy.ProxyId == delId) throw new InvalidOperationException("請先停用使用此節點的全局代理。");
-                    config.Proxies.RemoveAll(x => x.Id == delId); probes.Remove(delId); probeViews.Remove(delId); store.Save(config); return Reply.Success(true);
+                    if (config.SandboxInstances.Any(p => p.ProxyId == delId)) throw new InvalidOperationException("請先移除使用此線路的沙盒規則。");
+                    config.Proxies.RemoveAll(x => x.Id == delId); config.AutoProxy = ProxyCapacity.Remove(config.AutoProxy, [delId]); probes.Remove(delId); probeViews.Remove(delId); store.Save(config); return Reply.Success(true);
                 case "syncTargets":
                     var discovered = Json.Read<TargetInstance[]>(cmd.Data);
                     if (discovered.Length > 500) throw new InvalidDataException("實例數超出限制。");
@@ -171,6 +194,7 @@ public sealed partial class Controller : IDisposable
                     return Reply.Success(true);
                 case "enable":
                     var enabled = GetBinding(cmd);
+                    if (enabled.Kind == "Sandbox") throw new InvalidOperationException("請由桌面沙盒頁啟動或停止實例。");
                     EnsureEngine();
                     // Quarantine before probing/launching; a failed test leaves this target blocked.
                     enabled.Enabled = false; ApplyRules();
@@ -179,9 +203,11 @@ public sealed partial class Controller : IDisposable
                     if (DuplicateExit(enabled.ProxyId)) { store.Save(config); throw new InvalidOperationException("與另一個綁定實例共用出口 IP，請改用不同代理。"); }
                     if (conflicts.Contains(enabled.TargetKey)) throw new InvalidOperationException("多個實例共用無法區分的程序，不支援獨立分流；目前保持封鎖。");
                     enabled.Enabled = true; enabled.AutoPaused = false; store.Save(config); ApplyRules(); return Reply.Success(true);
-                case "pause": var paused = GetBinding(cmd); paused.Enabled = false; paused.AutoPaused = true; ApplyRules(); store.Save(config); Log("已暫停並保留實例封鎖。"); return Reply.Success(true);
+                case "pause": var paused = GetBinding(cmd); if (paused.Kind == "Sandbox") { PauseSandbox(config.SandboxInstances.Single(p => p.TargetKey == paused.TargetKey).Id); return Reply.Success(true); } paused.Enabled = false; paused.AutoPaused = true; ApplyRules(); store.Save(config); Log("已暫停並保留實例封鎖。"); return Reply.Success(true);
                 case "unbind":
-                    var unbind = GetBinding(cmd); unbind.Enabled = false; ApplyRules();
+                    var unbind = GetBinding(cmd);
+                    if (unbind.Kind == "Sandbox") throw new InvalidOperationException("請先在桌面沙盒頁停止實例，再移除沙盒規則。");
+                    unbind.Enabled = false; ApplyRules();
                     if (unbind.AutoManaged) { if (!config.AutoExcludedTargets.Contains(unbind.TargetKey)) config.AutoExcludedTargets.Add(unbind.TargetKey); automaticUnassigned.Add(unbind.TargetKey); }
                     config.Bindings.Remove(unbind); ApplyRules(); store.Save(config); Log("已解除綁定，恢復原有網路；本目標不會被目前自動規則再次加入。"); return Reply.Success(true);
                 case "setLdPath":
@@ -207,6 +233,8 @@ public sealed partial class Controller : IDisposable
     }
     private void BindBatch(BatchBindRequest request)
     {
+        if (request.Items.Any(i => i.Target.Kind == "Sandbox" || config.SandboxInstances.Any(p => p.TargetKey == i.Target.Key || p.ProxyId == i.ProxyId)))
+            throw new InvalidOperationException("沙盒固定線路請在桌面沙盒頁調整，不能分配給其他窗口。");
         RefreshBindingChildren();
         request = new(request.Items.Select(i => i with { Target = CaptureEmulatorIdentity(ResolveHandoffTarget(i)) }).ToArray());
         var next = AssignmentPlanner.Prepare(config.Bindings, config.Proxies, request);
@@ -275,6 +303,9 @@ public sealed partial class Controller : IDisposable
     private void SetAutoProxy(AutoProxyRule rule)
     {
         rule = ProcessHandoffPolicy.Automatic(rule) with { Configured = true };
+        AutoProxyPlanner.Validate(rule);
+        if (rule.ProxyCapacities.Keys.Any(id => config.Proxies.All(p => p.Id != id)))
+            throw new InvalidOperationException("線路清單已變更，請重新開啟規則設定後再儲存數量。");
         if (rule.Kind == "Emulator") { SetFixedEmulators(rule); return; }
         if (rule.Kind == "EmulatorSequence") { SetSequentialEmulators(rule); return; }
         if (!rule.Enabled) {
@@ -292,8 +323,7 @@ public sealed partial class Controller : IDisposable
             !rule.Pattern.Equals(config.AutoProxy.Pattern, StringComparison.OrdinalIgnoreCase) ||
             !rule.ClientPath.Equals(config.AutoProxy.ClientPath, StringComparison.OrdinalIgnoreCase) ||
             !rule.ConsolePath.Equals(config.AutoProxy.ConsolePath, StringComparison.OrdinalIgnoreCase);
-        if (rule.Enabled && !changedScope && config.Bindings.Where(b => b.AutoManaged).GroupBy(b => b.ProxyId).Any(g => g.Count() > rule.PerProxy))
-            throw new InvalidOperationException("已有 IP 的分配數超過新上限，請先解除多餘綁定；不會自動替窗口換 IP。");
+        // Lowering a quota does not move or disconnect existing windows.
         foreach (var binding in config.Bindings.Where(b => b.AutoManaged)) {
             if (changedScope) { binding.AutoManaged = false; binding.Enabled = false; binding.AutoPaused = true; }
             else binding.Enabled = rule.Enabled && !binding.AutoPaused;
@@ -396,7 +426,7 @@ public sealed partial class Controller : IDisposable
             .Where(t => t.Processes.All(p => LdPlayer.Identity(p.Pid) == p && IsOwned(p.Pid)) && (t.Kind != "LDPlayer" || LdPlayer.IsNat(t.Path, t.Index))).ToArray();
         else if (rule.Kind == "LDPlayer") candidates = candidates.Where(t => LdPlayer.IsNat(t.Path, t.Index)).ToArray();
         else candidates = candidates.Where(t => t.Processes.Length > 0 && config.GameGroups.Any(g => g.Key == t.Key && g.ClientPath.Equals(rule.ClientPath, StringComparison.OrdinalIgnoreCase))).ToArray();
-        var additions = AutoProxyPlanner.Additions(candidates, config.Bindings, config.Proxies, rule.PerProxy, config.AutoExcludedTargets, launchOrder: rule.Kind == "EmulatorSequence")
+        var additions = AutoProxyPlanner.Additions(candidates, config.Bindings, config.Proxies, rule.PerProxy, config.AutoExcludedTargets, launchOrder: rule.Kind == "EmulatorSequence", capacities: rule.ProxyCapacities)
             .Select(item => item with { IncludeChildren = item.Target.Kind == "Process" && rule.IncludeChildren }).ToArray();
         if (additions.Length > 0) {
             BindBatch(new(additions));
@@ -409,7 +439,7 @@ public sealed partial class Controller : IDisposable
         if (changed) store.Save(config);
         int waiting = candidates.Count(t => config.Bindings.All(b => b.TargetKey != t.Key) && !config.AutoExcludedTargets.Contains(t.Key));
         autoStatus = config.Proxies.Count == 0 ? "等待代理匯入；目前未代理" :
-            (rule.Kind == "EmulatorSequence" ? "依啟動順序 · " : "") + $"每個 IP 最多 {rule.PerProxy} 個{(rule.Kind == "GameGroup" ? "遊戲組" : "目標")} · 自動管理 {config.Bindings.Count(b => b.AutoManaged)} 個 · 容量不足／規則衝突未分配 {waiting} 個" + gameWarning;
+            (rule.Kind == "EmulatorSequence" ? "依啟動順序 · " : "") + (rule.ProxyCapacities.Count > 0 ? "依各線路數量自動分配" : $"每條線路 {rule.PerProxy} 個目標") + $" · 自動管理 {config.Bindings.Count(b => b.AutoManaged)} 個 · 容量不足／規則衝突未分配 {waiting} 個" + gameWarning;
     }
     private async Task<ProbeResult> Probe(ProxyProfile p, CancellationToken ct)
     {
@@ -590,6 +620,10 @@ public sealed partial class Controller : IDisposable
         // Build then atomically replace the quarantine set; releasing a binding must release its guard too.
         var guardPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         bool processStartupGuard = config.AutoProxy.Enabled && config.AutoProxy.Kind == "Process";
+        foreach (var sandbox in config.SandboxInstances) {
+            guardPaths.Add("@dir:" + Path.TrimEndingDirectorySeparator(sandbox.WorkingDirectory) + "\\");
+            guardPaths.Add("@dir:" + Path.TrimEndingDirectorySeparator(sandbox.FileRoot) + "\\");
+        }
         if (processStartupGuard) guardPaths.Add(config.AutoProxy.Pattern);
         if (config.AutoProxy.Enabled && config.AutoProxy.Kind == "GameGroup") { guardPaths.Add(config.AutoProxy.Pattern); guardPaths.Add(config.AutoProxy.ClientPath); }
         foreach (var group in config.GameGroups.Where(g => config.Bindings.Any(b => b.TargetKey == g.Key))) { guardPaths.Add(group.LauncherPath); guardPaths.Add(group.ClientPath); }
@@ -681,11 +715,13 @@ public sealed partial class Controller : IDisposable
     public async Task Tick(CancellationToken ct)
     {
         Guid due = Guid.Empty;
+        var sandboxObservations = await ObserveSandboxes(ct);
         await Gate.WaitAsync(ct);
         try
         {
             if (stopping) return;
             SaveNetworkEvents();
+            ReconcileSandboxes(sandboxObservations);
             await CompleteVmwareSetup(ct);
             DiscoverGameGroups();
             RefreshBindingChildren();
@@ -776,7 +812,7 @@ public sealed partial class Controller : IDisposable
         var visibleProbes = probes.Values.Where(p => !probeViews.ContainsKey(p.ProxyId)).Concat(probeViews.Values).ToArray();
         return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), visibleTargets, visibleProbes, statuses,
             new(true, NativeEngine.DriverPresent, NativeEngine.Present, running, AppReleasePackage.CurrentVersion + " 預覽版", NativeEngine.DriverPresent ? engineError : "缺少 WinDivert 驅動，未啟用攔截。", logs.ToArray()))
-            { SupportsBulkActions = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyConnectedAt = globalSession.ConnectedAt, GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
+            { SupportsSandboxInstances = NativeEngine.SupportsSandboxGuards, SupportsSandboxExperience = true, SandboxInstances = config.SandboxInstances.ToArray(), SandboxStatuses = SandboxStatuses(), SupportsBulkActions = true, SupportsProxyCapacities = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyConnectedAt = globalSession.ConnectedAt, GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
     }
     private string GlobalStatus()
     {
@@ -867,13 +903,15 @@ public sealed partial class Controller : IDisposable
     [DllImport("kernel32.dll")] private static extern bool CloseHandle(nint handle);
     private bool IsOwned(int pid)
     {
+        if (LdPlayer.Identity(pid) is { } boxed && verifiedSandboxMembers.Contains(boxed)) return true;
         nint process = OpenProcess(0x1000, false, pid); if (process == 0) return false;
         try { if (!OpenProcessToken(process, 8, out var token)) return false; try { using var identity = new WindowsIdentity(token); return identity.User?.Value == OwnerSid; } finally { CloseHandle(token); } }
         finally { CloseHandle(process); }
     }
     public void Dispose() {
         supplementalLifetime.Cancel(); Task.WhenAll(supplementalTasks).GetAwaiter().GetResult();
-        gameObserver.Dispose();
+        try { StopManagedSandboxes(); } catch (Exception ex) { Log("停止沙盒未完成：" + ex.Message); }
+        gameObserver.Dispose(); sandboxRuntime?.Dispose();
         try { SuspendVmwareNetwork(); } catch (Exception ex) { Log("暫停 VMware 轉送未完成：" + ex.Message); }
         if (NativeEngine.Present && started) NativeEngine.Core_Stop();
         supplementalLifetime.Dispose(); supplementalGate.Dispose(); probeGate.Dispose(); Gate.Dispose();

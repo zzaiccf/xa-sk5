@@ -83,6 +83,11 @@ public sealed record Snapshot(ProxyProfile[] Proxies, InstanceBinding[] Bindings
     public bool SupportsRuleManagement { get; init; }
     public bool SupportsProcessHandoffs { get; init; }
     public bool SupportsBulkActions { get; init; }
+    public bool SupportsProxyCapacities { get; init; }
+    public bool SupportsSandboxInstances { get; init; }
+    public bool SupportsSandboxExperience { get; init; }
+    public SandboxInstanceProfile[] SandboxInstances { get; init; } = [];
+    public SandboxInstanceStatus[] SandboxStatuses { get; init; } = [];
     public VmwareState? Vmware { get; init; }
     public bool HasPendingEmulatorConfiguration { get; init; }
     public AutoProxyRule AutoProxy { get; init; } = new();
@@ -108,6 +113,7 @@ public sealed record SavedConfig
     public List<string> AutoExcludedTargets { get; set; } = [];
     public List<ProcessIdentity> AutoExcludedDescendants { get; set; } = [];
     public List<GameLaunchGroup> GameGroups { get; set; } = [];
+    public List<SandboxInstanceProfile> SandboxInstances { get; set; } = [];
     public string LdConsole { get; set; } = @"C:\LDPlayer\LDPlayer9\ldconsole.exe";
     public string MuMuConsole { get; set; } = "";
     public VmwareSettings Vmware { get; set; } = new();
@@ -155,6 +161,7 @@ public sealed record AutoProxyRule
     public string ClientPath { get; init; } = "";
     public bool IncludeChildren { get; init; }
     public int PerProxy { get; init; } = 1;
+    public Dictionary<Guid, int> ProxyCapacities { get; init; } = [];
     public string ConsolePath { get; init; } = @"C:\LDPlayer\LDPlayer9\ldconsole.exe";
     public string EmulatorKind { get; init; } = "LDPlayer";
     public EmulatorAssignment[] EmulatorAssignments { get; init; } = [];

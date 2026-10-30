@@ -5,6 +5,11 @@ namespace WindowSocks.Core;
 public static class NativeEngine
 {
     private const string Dll = "WindowSocksNative.dll";
+    private static readonly Lazy<bool> sandboxGuardSupport = new(() => {
+        if (!NativeLibrary.TryLoad(Path.Combine(AppContext.BaseDirectory, Dll), out var library)) return false;
+        try { return NativeLibrary.TryGetExport(library, "Core_SupportsSandboxGuards", out _); } finally { NativeLibrary.Free(library); }
+    });
+    public static bool SupportsSandboxGuards => Present && sandboxGuardSupport.Value;
     [StructLayout(LayoutKind.Sequential)] public struct Rule
     { public uint Pid, Proxy; public ulong Created; public uint Blocked, Reserved; }
     [StructLayout(LayoutKind.Sequential)] public struct Traffic

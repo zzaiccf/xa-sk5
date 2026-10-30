@@ -50,6 +50,9 @@ struct Key {
     bool operator<(const Key& b) const { return std::tie(src,dst,sp,dp,protocol) < std::tie(b.src,b.dst,b.sp,b.dp,b.protocol); }
 };
 static bool gatewayDhcpResponse(const Key& key,uint32_t index);
+// Activity can advance on another thread after the caller samples its clock.
+// Such a timestamp is fresh, not an unsigned wraparound worth years of idle time.
+static uint64_t elapsedSince(uint64_t now,uint64_t timestamp) { return now>=timestamp?now-timestamp:0; }
 struct Flow {
     uint64_t id=++nextFlow,opened=GetTickCount64();
     Key key{}; RouteRule rule{}; uint16_t alias{}; uint64_t socketCreated{}; WINDIVERT_ADDRESS address{};
@@ -118,7 +121,8 @@ static std::atomic<uint32_t> lastError{0};
 struct PacketMetrics {
     std::atomic<uint64_t> packets{0},bytes{0},impostor{0},loopback{0},icmp{0},batches{0},ownerQueries{0},ownerUs{0},ownerMaxUs{0},
         classifyUs{0},classifyMaxUs{0},sendUs{0},sendMaxUs{0},ageUs{0},ageMaxUs{0},ageSamples{0},unknown{0},overflow{0},parseErrors{0},
-        routeUs{0},routeWaitUs{0},guardUs{0},guardWaitUs{0},ancestryWalks{0},ancestryUs{0},imageUs{0},parentQueries{0},parentErrors{0};
+        routeUs{0},routeWaitUs{0},guardUs{0},guardWaitUs{0},ancestryWalks{0},ancestryUs{0},imageUs{0},parentQueries{0},parentErrors{0},
+        sendFailures{0},sendHostUnreachable{0},expiredImpostors{0},lastSendError{0};
 };
 static PacketMetrics packetMetrics;
 static std::wstring telemetryPath,telemetryDirectory;
@@ -148,10 +152,17 @@ static void saveTelemetry(){
     FILE* file=nullptr;if(_wfopen_s(&file,telemetryPath.c_str(),L"a")||!file)return;
     SYSTEMTIME now;GetSystemTime(&now);
     auto& m=packetMetrics;
-    fprintf(file,"{\"utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"native\":\"0.1.23\",\"pid\":%lu,\"packets\":%llu,\"bytes\":%llu,\"batches\":%llu,\"impostor\":%llu,\"loopback\":%llu,\"icmp\":%llu,\"ownerQueries\":%llu,\"ownerUs\":%llu,\"ownerMaxUs\":%llu,\"classifyUs\":%llu,\"classifyMaxUs\":%llu,\"sendUs\":%llu,\"sendMaxUs\":%llu,\"ageUs\":%llu,\"ageMaxUs\":%llu,\"ageSamples\":%llu,\"unknown\":%llu,\"overflow\":%llu,\"parseErrors\":%llu}\n",
+    fprintf(file,"{\"utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"native\":\"0.1.30\",\"pid\":%lu,\"packets\":%llu,\"bytes\":%llu,\"batches\":%llu,\"impostor\":%llu,\"loopback\":%llu,\"icmp\":%llu,\"ownerQueries\":%llu,\"ownerUs\":%llu,\"ownerMaxUs\":%llu,\"classifyUs\":%llu,\"classifyMaxUs\":%llu,\"sendUs\":%llu,\"sendMaxUs\":%llu,\"ageUs\":%llu,\"ageMaxUs\":%llu,\"ageSamples\":%llu,\"unknown\":%llu,\"overflow\":%llu,\"parseErrors\":%llu}\n",
         now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,now.wMilliseconds,GetCurrentProcessId(),m.packets.load(),m.bytes.load(),m.batches.load(),m.impostor.load(),m.loopback.load(),m.icmp.load(),m.ownerQueries.load(),m.ownerUs.load(),m.ownerMaxUs.load(),m.classifyUs.load(),m.classifyMaxUs.load(),m.sendUs.load(),m.sendMaxUs.load(),m.ageUs.load(),m.ageMaxUs.load(),m.ageSamples.load(),m.unknown.load(),m.overflow.load(),m.parseErrors.load());
-    fprintf(file,"{\"utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"detail\":true,\"routeUs\":%llu,\"routeWaitUs\":%llu,\"guardUs\":%llu,\"guardWaitUs\":%llu,\"ancestryWalks\":%llu,\"ancestryUs\":%llu,\"imageUs\":%llu,\"parentQueries\":%llu,\"parentErrors\":%llu}\n",now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,now.wMilliseconds,m.routeUs.load(),m.routeWaitUs.load(),m.guardUs.load(),m.guardWaitUs.load(),m.ancestryWalks.load(),m.ancestryUs.load(),m.imageUs.load(),m.parentQueries.load(),m.parentErrors.load());
+    fprintf(file,"{\"utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"detail\":true,\"routeUs\":%llu,\"routeWaitUs\":%llu,\"guardUs\":%llu,\"guardWaitUs\":%llu,\"ancestryWalks\":%llu,\"ancestryUs\":%llu,\"imageUs\":%llu,\"parentQueries\":%llu,\"parentErrors\":%llu,\"sendFailures\":%llu,\"sendHostUnreachable\":%llu,\"expiredImpostors\":%llu,\"lastSendError\":%llu}\n",
+        now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,now.wMilliseconds,m.routeUs.load(),m.routeWaitUs.load(),m.guardUs.load(),m.guardWaitUs.load(),m.ancestryWalks.load(),m.ancestryUs.load(),m.imageUs.load(),m.parentQueries.load(),m.parentErrors.load(),m.sendFailures.load(),m.sendHostUnreachable.load(),m.expiredImpostors.load(),m.lastSendError.load());
     fclose(file);
+}
+static void lifecycleEvent(const char* phase){
+    if(telemetryDirectory.empty())return;FILE* file=nullptr;auto path=telemetryDirectory+L"\\core-lifecycle.log";
+    WIN32_FILE_ATTRIBUTE_DATA info{};if(GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&info)&&info.nFileSizeLow>1024*1024)MoveFileExW(path.c_str(),(path+L".previous").c_str(),MOVEFILE_REPLACE_EXISTING);
+    if(_wfopen_s(&file,path.c_str(),L"a")||!file)return;SYSTEMTIME now;GetSystemTime(&now);
+    fprintf(file,"%04u-%02u-%02uT%02u:%02u:%02uZ pid=%lu phase=%s error=%u\n",now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,GetCurrentProcessId(),phase,lastError.load());fclose(file);
 }
 
 static uint16_t be16(const uint8_t* p) { return (uint16_t)((p[0]<<8)|p[1]); }
@@ -219,15 +230,26 @@ static bool guarded(uint32_t pid) {
     if(guardResults.size()>=4096)guardResults.clear();
     auto result=[&](bool value){guardResults[key]=value;return value;};
     HANDLE p=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);if(!p)return false;
+    wchar_t path[32768]; DWORD n=32768;uint64_t querying=qpcUs();bool ok=QueryFullProcessImageNameW(p,0,path,&n)!=0;packetMetrics.imageUs+=qpcUs()-querying;
+    if(!ok){CloseHandle(p);return false;}
+    // Sandboxie restricts token inspection. Exact managed directories must remain fail-closed even before membership discovery.
+    for(const auto& g:guards) if(g.rfind(L"@dir:",0)==0) {
+        const auto prefix=g.substr(5);
+        if(!prefix.empty()&&prefix.back()==L'\\'&&_wcsnicmp(path,prefix.c_str(),prefix.size())==0){CloseHandle(p);return result(true);}
+    }
     if(!ownerSid.empty()) {
         HANDLE token=nullptr; bool owned=false;
         if(OpenProcessToken(p,TOKEN_QUERY,&token)){DWORD bytes=0;GetTokenInformation(token,TokenUser,nullptr,0,&bytes);std::vector<uint8_t> info(bytes);if(bytes&&GetTokenInformation(token,TokenUser,info.data(),bytes,&bytes))owned=EqualSid(((TOKEN_USER*)info.data())->User.Sid,ownerSid.data())!=0;CloseHandle(token);}
         if(!owned){CloseHandle(p);return result(false);}
     }
-    wchar_t path[32768]; DWORD n=32768;uint64_t querying=qpcUs();bool ok=QueryFullProcessImageNameW(p,0,path,&n)!=0;packetMetrics.imageUs+=qpcUs()-querying;CloseHandle(p);
-    if(!ok)return false;
+    CloseHandle(p);
     const wchar_t* name=wcsrchr(path,L'\\');name=name?name+1:path;
-    for(const auto& g:guards) if(_wcsicmp(wcspbrk(g.c_str(),L"\\/")?path:name,g.c_str())==0) return result(true);
+    for(const auto& g:guards) {
+        if(g.rfind(L"@dir:",0)==0) {
+            const auto prefix=g.substr(5);
+            if(!prefix.empty()&&prefix.back()==L'\\'&&_wcsnicmp(path,prefix.c_str(),prefix.size())==0)return result(true);
+        } else if(_wcsicmp(wcspbrk(g.c_str(),L"\\/")?path:name,g.c_str())==0) return result(true);
+    }
     return result(false);
 }
 // Layout documented by Microsoft for NtQueryInformationProcess(ProcessBasicInformation).
@@ -435,10 +457,24 @@ static void checksums(std::span<uint8_t> p,WINDIVERT_ADDRESS& address,bool modif
     if(modified||((p[0]>>4)==4&&!address.IPChecksum)||(!address.TCPChecksum&&!address.UDPChecksum))
         wdChecksums(p.data(),(UINT)p.size(),&address,0);
 }
+// WinDivert rejects impostor packets when its loop-protection decrement exhausts
+// TTL/HopLimit. Drop only that packet; never reset the engine or replay a batch.
+static bool expiredImpostor(std::span<const uint8_t> p,const WINDIVERT_ADDRESS& address) {
+    if(!address.Impostor||p.empty())return false;
+    bool expired=((p[0]>>4)==4&&p.size()>=20&&p[8]<=1)||((p[0]>>4)==6&&p.size()>=40&&p[7]<=1);
+    if(expired)++packetMetrics.expiredImpostors;
+    return expired;
+}
+static bool fatalSendError(DWORD error) {
+    ++packetMetrics.sendFailures;packetMetrics.lastSendError=error;
+    if(error==ERROR_HOST_UNREACHABLE){++packetMetrics.sendHostUnreachable;return false;}
+    lastError=error;return true;
+}
 static bool inject(std::span<uint8_t> p,WINDIVERT_ADDRESS address,bool modified=true) {
     std::lock_guard lk(sendMutex); if(divert==INVALID_HANDLE_VALUE)return false;
+    if(expiredImpostor(p,address))return false;
     checksums(p,address,modified);
-    if(!wdSend(divert,p.data(),(UINT)p.size(),nullptr,&address)){lastError=GetLastError();return false;}return true;
+    if(!wdSend(divert,p.data(),(UINT)p.size(),nullptr,&address)){fatalSendError(GetLastError());return false;}return true;
 }
 static SOCKET openLocal(uint32_t destination,uint16_t port,bool udp=false) {
     SOCKET s=socket(AF_INET,udp?SOCK_DGRAM:SOCK_STREAM,udp?IPPROTO_UDP:IPPROTO_TCP);if(s==INVALID_SOCKET)return s;
@@ -481,7 +517,7 @@ static void udpWorker(std::shared_ptr<Flow> f) {
     if(udp==INVALID_SOCKET||(!local&&connect(udp,(sockaddr*)&relay,sizeof(relay)))){f->close(UdpFailed,WSAGetLastError());return;}
     f->connected=true;trace(*f,Connected);
     configure_udp_socket(udp,262144,1000);
-    while(active&&f->alive&&stillBound(*f)&&GetTickCount64()-f->last<60000) {
+    while(active&&f->alive&&stillBound(*f)&&elapsedSince(GetTickCount64(),f->last.load())<60000) {
         std::deque<std::vector<uint8_t>> pending;
         {std::lock_guard lk(f->queueMutex);pending.swap(f->queue);}
         for(auto& payload:pending) {
@@ -553,15 +589,19 @@ API uint32_t Core_RelayForTest(SOCKET accepted,SOCKET remote,uint32_t pid,uint64
 }
 static void acceptLoop() {
     while(active) {
-        sockaddr_in peer{};int len=sizeof(peer);SOCKET s=accept(listener,(sockaddr*)&peer,&len);if(s==INVALID_SOCKET)break;
+        fd_set ready;FD_ZERO(&ready);FD_SET(listener,&ready);timeval timeout{0,200000};
+        int count=select(0,&ready,nullptr,nullptr,&timeout);if(!active)break;if(count==0)continue;if(count<0)break;
+        sockaddr_in peer{};int len=sizeof(peer);SOCKET s=accept(listener,(sockaddr*)&peer,&len);
+        if(s==INVALID_SOCKET){if(WSAGetLastError()==WSAEWOULDBLOCK)continue;break;}
+        u_long blocking=0;ioctlsocket(s,FIONBIO,&blocking);
         std::shared_ptr<Flow> f;
         {std::lock_guard lk(flowMutex);auto it=aliases.find(ntohs(peer.sin_port));if(it!=aliases.end()&&(it->second->gatewayInterface?it->second->key.src:it->second->key.dst)==peer.sin_addr.s_addr)f=it->second;}
         if(!f||!f->alive||f->client!=INVALID_SOCKET){closesocket(s);continue;}
         spawn([f,s](){tcpWorker(f,s);});
     }
 }
-static void prune() {
-    uint64_t now=GetTickCount64();closeGoneUdpSockets();std::lock_guard lk(flowMutex);
+static void prune(uint64_t now=GetTickCount64()) {
+    closeGoneUdpSockets();std::lock_guard lk(flowMutex);
     // A closed application socket can disappear from the owner table before its final FIN is captured.
     // Do not leave a relay and its connection counter alive indefinitely when that happens.
     std::set<Key> tcpSockets;bool tableValid=false;DWORD bytes=0;
@@ -576,8 +616,9 @@ static void prune() {
     }
     for(auto it=flows.begin();it!=flows.end();) {
         auto f=it->second;
-        if(f->alive&&!f->gatewayInterface&&f->key.protocol==6&&tableValid&&now-f->opened>1000&&!tcpSockets.count(f->key))f->close(SocketGone);
-        if((!f->alive&&now-f->last>5000)||(f->key.protocol==17&&now-f->last>60000)||(f->key.protocol==6&&now-f->last>1800000)) {
+        if(f->alive&&!f->gatewayInterface&&f->key.protocol==6&&tableValid&&elapsedSince(now,f->opened)>1000&&!tcpSockets.count(f->key))f->close(SocketGone);
+        const uint64_t idle=elapsedSince(now,f->last.load());
+        if((!f->alive&&idle>5000)||(f->key.protocol==17&&idle>60000)||(f->key.protocol==6&&idle>1800000)) {
             f->close(IdleExpired);if(f->alias)aliases.erase(f->alias);it=flows.erase(it);
         }else ++it;
     }
@@ -606,6 +647,7 @@ struct PassThroughBatch {
     std::vector<uint8_t> bytes;std::vector<WINDIVERT_ADDRESS> addresses;
     PassThroughBatch(){bytes.reserve(256*1024);addresses.reserve(64);}
     void append(std::span<uint8_t> p,WINDIVERT_ADDRESS addr) {
+        if(expiredImpostor(p,addr))return;
         checksums(p,addr,false);bytes.insert(bytes.end(),p.begin(),p.end());addresses.push_back(addr);
     }
     bool flush() {
@@ -613,7 +655,10 @@ struct PassThroughBatch {
         if(divert==INVALID_HANDLE_VALUE)return false;
         uint64_t begin=qpcUs();bool ok=wdSendEx(divert,bytes.data(),(UINT)bytes.size(),nullptr,0,addresses.data(),(UINT)(addresses.size()*sizeof(WINDIVERT_ADDRESS)),nullptr)!=0;
         uint64_t elapsed=qpcUs()-begin;packetMetrics.sendUs+=elapsed;peak(packetMetrics.sendMaxUs,elapsed);
-        if(!ok)lastError=GetLastError();bytes.clear();addresses.clear();return ok;
+        bool fatal=!ok&&fatalSendError(GetLastError());
+        // SendEx can partially inject before failing. Never replay the buffer:
+        // continuing with the next receive avoids duplicate TCP/UDP delivery.
+        bytes.clear();addresses.clear();return !fatal;
     }
 };
 static bool processPacket(std::span<uint8_t> p,WINDIVERT_ADDRESS addr,OwnerBatch& owners,PassThroughBatch* direct=nullptr) {
@@ -665,7 +710,7 @@ static bool processPacket(std::span<uint8_t> p,WINDIVERT_ADDRESS addr,OwnerBatch
         auto it=flows.find(key);
         if(it!=flows.end()){
             f=it->second;
-            if(f->rule.pid!=rule.pid||f->rule.created!=rule.created||f->rule.proxy!=rule.proxy||f->socketCreated!=socketBirth||(!f->alive&&GetTickCount64()-f->last>1000)){
+            if(f->rule.pid!=rule.pid||f->rule.created!=rule.created||f->rule.proxy!=rule.proxy||f->socketCreated!=socketBirth||(!f->alive&&elapsedSince(GetTickCount64(),f->last.load())>1000)){
                 f->close();if(f->alias)aliases.erase(f->alias);flows.erase(it);f.reset();
             }
         }
@@ -811,6 +856,7 @@ API int Core_ProcessHandoffMode(uint32_t pid,uint64_t birth){std::shared_lock lk
 API int Core_SetOwner(const wchar_t* sid){PSID parsed=nullptr;if(!ConvertStringSidToSidW(sid,&parsed))return 0;DWORD size=GetLengthSid(parsed);std::unique_lock lk(stateMutex);ownerSid.assign((uint8_t*)parsed,(uint8_t*)parsed+size);unrelatedProcesses.clear();guardResults.clear();LocalFree(parsed);return 1;}
 API int Core_RouteForTest(uint32_t pid,uint64_t birth,int ipv6,uint32_t* proxy) {RouteRule r{};int action=policyAction(pid,birth,ipv6!=0,r);if(proxy)*proxy=r.proxy;return action;}
 API int Core_RoutePacketForTest(uint32_t pid,uint64_t birth,int ipv6,uint16_t localPort,uint32_t* proxy) {RouteRule r{};int action=policyAction(pid,birth,ipv6!=0,r,localPort);if(proxy)*proxy=r.proxy;return action;}
+API int Core_SupportsSandboxGuards(){return 1;}
 API void Core_ClearGuards(){std::unique_lock lk(stateMutex);guards.clear();guardResults.clear();}
 API void Core_AddGuard(const wchar_t* path){if(!path)return;std::unique_lock lk(stateMutex);for(const auto& g:guards)if(_wcsicmp(g.c_str(),path)==0)return;guards.emplace_back(path);guardResults.clear();}
 API void Core_SetGuards(const wchar_t* paths){std::vector<std::wstring> next;if(paths){for(auto p=paths;*p;p+=wcslen(p)+1)next.emplace_back(p);}std::unique_lock lk(stateMutex);if(guards!=next){guards.swap(next);guardResults.clear();}}
@@ -840,20 +886,22 @@ API int Core_Start(const wchar_t* libraryPath) {
     wdParsePacket=(decltype(wdParsePacket))GetProcAddress(driverLibrary,"WinDivertHelperParsePacket");if(!wdParsePacket){lastError=ERROR_PROC_NOT_FOUND;return failed();}
     listener=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);sockaddr_in local{};local.sin_family=AF_INET;local.sin_addr.s_addr=INADDR_ANY;
     if(bind(listener,(sockaddr*)&local,sizeof(local))||listen(listener,SOMAXCONN)){lastError=WSAGetLastError();return failed();}
+    u_long nonblocking=1;if(ioctlsocket(listener,FIONBIO,&nonblocking)){lastError=WSAGetLastError();return failed();}
     int len=sizeof(local);getsockname(listener,(sockaddr*)&local,&len);listenPort=ntohs(local.sin_port);
     divert=wdOpen("outbound and (ip or ipv6)",WINDIVERT_LAYER_NETWORK,100,0);
     if(divert==INVALID_HANDLE_VALUE){lastError=GetLastError();return failed();}
     {std::lock_guard lk(retryMutex);deferredPackets.clear();}
     auto safe=[](auto task){return std::thread([task](){try{task();}catch(...){lastError=ERROR_UNHANDLED_EXCEPTION;}});};
-    startTelemetry();active=true;captureThread=safe(captureLoop);acceptThread=safe(acceptLoop);pruneThread=safe(pruneLoop);retryThread=safe(retryLoop);return 1;
+    startTelemetry();active=true;captureThread=safe(captureLoop);acceptThread=safe(acceptLoop);pruneThread=safe(pruneLoop);retryThread=safe(retryLoop);lifecycleEvent("started");return 1;
 }
 API void Core_Stop() {
+    lifecycleEvent("stop-requested");
     std::lock_guard lifecycle(lifecycleMutex);stopGateway();if(!active.exchange(false))return;
     closesocket(listener);listener=INVALID_SOCKET;
     {std::lock_guard lk(flowMutex);for(auto& [k,f]:flows)f->close(EngineStopped);}
     wdShutdown(divert,WINDIVERT_SHUTDOWN_RECV);
     retryWake.notify_all();
-    if(captureThread.joinable())captureThread.join();if(acceptThread.joinable())acceptThread.join();
+    lifecycleEvent("join-capture");if(captureThread.joinable())captureThread.join();lifecycleEvent("join-listener");if(acceptThread.joinable())acceptThread.join();
     if(pruneThread.joinable())pruneThread.join();if(retryThread.joinable())retryThread.join();
     saveTelemetry();telemetryPath.clear();
     {std::lock_guard lk(retryMutex);deferredPackets.clear();}
@@ -861,6 +909,7 @@ API void Core_Stop() {
     {std::lock_guard lk(sendMutex);wdClose(divert);divert=INVALID_HANDLE_VALUE;}
     {std::lock_guard lk(flowMutex);flows.clear();aliases.clear();}
     if(driverLibrary){FreeLibrary(driverLibrary);driverLibrary=nullptr;}WSACleanup();
+    lifecycleEvent("stopped");
 }
 API int Core_Connect(SOCKET socket,const char* destination,uint16_t port,const char* user,const char* password) {
     if(!destination||!user||!password||strlen(user)>255||strlen(password)>255)return -1;

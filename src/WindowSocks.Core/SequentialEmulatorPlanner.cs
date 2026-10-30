@@ -22,8 +22,7 @@ public static class SequentialEmulatorPlanner
             if (!inScope) { result.Add(binding with { AutoManaged = false, Enabled = false, AutoPaused = true }); continue; }
             if (IsLive(binding, identity)) result.Add(binding with { Enabled = rule.Enabled && !binding.AutoPaused });
         }
-        if (result.Where(b => b.AutoManaged).GroupBy(b => b.ProxyId).Any(g => g.Count() > rule.PerProxy))
-            throw new InvalidOperationException("已有 IP 的分配數超過新上限，請先解除多餘綁定；不會自動替窗口換 IP。");
+        // A reduced capacity applies to future additions. Keep live windows on their current IP.
         return result;
     }
 }

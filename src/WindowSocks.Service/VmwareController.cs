@@ -15,7 +15,9 @@ public sealed partial class Controller
     private VmwareDiscovered[] ListVmware()
     {
         var found = new List<VmwareDiscovered>();
+        if (EmulatorProcessesPresent(["vmware-vmx.exe"])) {
         using var search = new ManagementObjectSearcher("SELECT ProcessId,ExecutablePath,CommandLine FROM Win32_Process WHERE Name='vmware-vmx.exe'");
+        search.Options.Timeout = TimeSpan.FromSeconds(3);
         using var processes = search.Get();
         foreach (ManagementObject row in processes) using (row) {
             int pid = checked((int)(uint)row["ProcessId"]);
@@ -24,6 +26,7 @@ public sealed partial class Controller
                 var vm = VmwareVmx.Read(path);
                 found.Add(new(vm, identity, "執行中 · PID " + pid + " · " + DateTime.FromFileTimeUtc(identity.CreatedFileTime).ToLocalTime().ToString("MM/dd HH:mm:ss")));
             }
+        }
         }
         using var profile = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + OwnerSid);
         string? root = profile?.GetValue("ProfileImagePath") as string;

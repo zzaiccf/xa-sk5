@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
@@ -13,12 +15,14 @@ public partial class AssignmentWindow : Window
 {
     private readonly ProxyProfile[] proxies;
     private readonly ProbeResult[] probes;
-    private readonly Choice[] choices;
+    private Choice[] choices;
+    private readonly CancellationTokenSource lifetime = new();
     private readonly bool online;
     private bool ready;
     public BatchBindRequest? Request { get; private set; }
     public bool EnableImmediately => EnableAfter.IsChecked == true;
-    public AssignmentWindow(ProxyProfile[] proxies, TargetInstance[] candidates, bool online, bool selectAll = false, int perProxy = 1, ProbeResult[]? probes = null)
+    public AssignmentWindow(ProxyProfile[] proxies, TargetInstance[] candidates, bool online, bool selectAll = false, int perProxy = 1, ProbeResult[]? probes = null,
+        Func<CancellationToken, Task<TargetInstance[]>>? loadCandidates = null)
     {
         this.proxies = proxies; this.probes = probes ?? []; this.online = online; choices = candidates.DistinctBy(t => t.Key).Select(t => new Choice(t)).ToArray();
         InitializeComponent(); Candidates.ItemsSource = choices;
@@ -30,6 +34,19 @@ public partial class AssignmentWindow : Window
         ModeHint.Text = online ? "共用節點會使用相同出口；既有連線需重新連線。" : "離線模式：僅儲存分配，尚未啟用代理。";
         ModeHint.ToolTip = online ? "其他獨占綁定不會自動改成共用；同一程序的多個窗口只算一個目標，重開程序後須重新選取。" : "不會攔截或封鎖流量。安裝服務後到設定頁移交，再啟用。";
         ready = true; Update();
+        Closed += (_, _) => lifetime.Cancel();
+        if (loadCandidates is not null) Loaded += async (_, _) => {
+            string hint = ModeHint.Text; ModeHint.Text = "正在背景載入其他程序，可先選取目前列表…";
+            try {
+                var loaded = await Task.Run(() => loadCandidates(lifetime.Token), lifetime.Token);
+                if (lifetime.IsCancellationRequested) return;
+                var added = loaded.Where(t => !choices.Any(c => c.Target.Key == t.Key)).DistinctBy(t => t.Key).Select(t => new Choice(t)).ToArray();
+                foreach (var choice in added) choice.PropertyChanged += (_, e) => { if (e.PropertyName == nameof(Choice.Selected)) Update(); };
+                choices = choices.Concat(added).ToArray(); Candidates.ItemsSource = choices; FilterChanged(this, new RoutedEventArgs());
+                ModeHint.Text = hint;
+            } catch (OperationCanceledException) { }
+            catch (Exception ex) { if (!lifetime.IsCancellationRequested) ModeHint.Text = "程序載入未完成：" + ex.Message; }
+        };
     }
     private void Change(object sender, TextChangedEventArgs e) { if (ready) Update(); }
     private void FilterChanged(object sender, RoutedEventArgs e)

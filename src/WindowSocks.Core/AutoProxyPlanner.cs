@@ -4,7 +4,7 @@ public static class AutoProxyPlanner
 {
     public static void Validate(AutoProxyRule rule)
     {
-        if (rule.PerProxy is < 1 or > 10) throw new InvalidOperationException("每個 IP 可分配 1–10 個目標。");
+        ProxyCapacity.Validate(rule.PerProxy, rule.ProxyCapacities);
         if (rule.Kind is not ("LDPlayer" or "Emulator" or "EmulatorSequence" or "Process" or "GameGroup")) throw new InvalidOperationException("請選擇模擬器、一般程序或遊戲組。");
         if (rule.IncludeChildren && rule.Kind != "Process") throw new InvalidOperationException("子程序代理僅適用一般程序規則。");
         if (rule.Kind == "Emulator") { FixedEmulatorPlanner.Validate(rule.EmulatorAssignments, allowEmpty: !rule.Enabled); return; }
@@ -52,9 +52,10 @@ public static class AutoProxyPlanner
     }
 
     public static AssignmentItem[] Additions(IEnumerable<TargetInstance> candidates, IEnumerable<InstanceBinding> current,
-        IEnumerable<ProxyProfile> profiles, int perProxy, IEnumerable<string> excluded, bool launchOrder = false)
+        IEnumerable<ProxyProfile> profiles, int perProxy, IEnumerable<string> excluded, bool launchOrder = false,
+        IReadOnlyDictionary<Guid, int>? capacities = null)
     {
-        if (perProxy is < 1 or > 10) throw new InvalidOperationException("每個 IP 可分配 1–10 個目標。");
+        ProxyCapacity.Validate(perProxy, capacities ?? new Dictionary<Guid, int>());
         var bindings = current.ToArray(); var skip = excluded.Concat(bindings.Select(b => b.TargetKey)).ToHashSet(StringComparer.Ordinal);
         var usedProcesses = bindings.SelectMany(b => b.Processes.Concat(b.IncludeChildren ? b.Descendants : [])).ToHashSet();
         var counts = bindings.GroupBy(b => b.ProxyId).ToDictionary(g => g.Key, g => g.Count());
@@ -67,7 +68,7 @@ public static class AutoProxyPlanner
         foreach (var target in ordered) {
             if (bindings.Length + items.Count >= 10) break;
             if (skip.Contains(target.Key) || target.Processes.Any(usedProcesses.Contains)) continue;
-            var proxy = pool.FirstOrDefault(id => counts.GetValueOrDefault(id) < perProxy);
+            var proxy = pool.FirstOrDefault(id => counts.GetValueOrDefault(id) < ProxyCapacity.For(id, perProxy, capacities));
             if (proxy == Guid.Empty) break;
             items.Add(new(target, proxy)); counts[proxy] = counts.GetValueOrDefault(proxy) + 1;
             skip.Add(target.Key); foreach (var p in target.Processes) usedProcesses.Add(p);

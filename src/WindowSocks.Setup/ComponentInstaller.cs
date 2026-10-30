@@ -79,6 +79,8 @@ internal static partial class Program
             }
             if (!sameDirectory) {
                 foreach (string file in Directory.EnumerateFiles(stagedApp, "*", SearchOption.AllDirectories)) {
+                    // Driver files are handled below after signature checks; an unchanged loaded driver cannot be overwritten.
+                    if (ComponentPackage.DriverFiles.Contains(Path.GetRelativePath(stagedApp, file), StringComparer.OrdinalIgnoreCase)) continue;
                     string destination = ComponentPackage.ContainedPath(InstallDirectory, Path.GetRelativePath(stagedApp, file));
                     RejectLinkedPath(destination); Directory.CreateDirectory(Path.GetDirectoryName(destination)!); File.Copy(file, destination, overwrite: true);
                 }

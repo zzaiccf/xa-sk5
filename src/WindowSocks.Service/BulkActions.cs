@@ -12,9 +12,11 @@ public sealed partial class Controller
     {
         ProxyPoolUsage.RequireUnused(config, vmwareRuntime);
         Guid[] ids = config.Proxies.Select(p => p.Id).ToArray();
-        var next = config with { Proxies = [], LastProbes = [], ServiceProxyExpirations = [] };
+        var next = config with { Proxies = [], LastProbes = [], ServiceProxyExpirations = [], AutoProxy = ProxyCapacity.Remove(config.AutoProxy, ids),
+            PendingEmulatorRule = config.PendingEmulatorRule is { } pending ? ProxyCapacity.Remove(pending, ids) : null };
         store.Save(next); // A failed save leaves the current pool intact.
         config.Proxies = next.Proxies; config.LastProbes = next.LastProbes; config.ServiceProxyExpirations = next.ServiceProxyExpirations;
+        config.AutoProxy = next.AutoProxy; config.PendingEmulatorRule = next.PendingEmulatorRule;
         foreach (Guid id in ids) {
             epochs[id] = ++epoch; probes.Remove(id); probeViews.Remove(id); retries.Remove(id); lastReady.Remove(id);
             activeChecks.Remove((id, false)); activeChecks.Remove((id, true)); supplementalChecks.Remove(id);

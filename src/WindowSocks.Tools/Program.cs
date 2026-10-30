@@ -1,11 +1,75 @@
 using System.Text.Json;
 using WindowSocks.Core;
 
+if (args.Length > 0 && args[0] == "sandbox-bootstrap") {
+    try { await SandboxBootstrap.Run(Guid.Parse(args[1]), args[2]); }
+    catch (Exception ex) {
+        try { await PipeTransport.CallAsync<bool>(Command.Create("reportSandboxLaunch", new SandboxLaunchReport(Guid.Parse(args[1]), false, ex is System.ComponentModel.Win32Exception native ? $"Windows 錯誤 {native.NativeErrorCode}" : ex.GetType().Name)), pipeName: PipeTransport.SandboxName); } catch { }
+        string folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WindowSocks");
+        Directory.CreateDirectory(folder);
+        await File.WriteAllTextAsync(Path.Combine(folder, "sandbox-bootstrap-error.txt"), DateTimeOffset.Now.ToString("O") + Environment.NewLine + ex);
+        Environment.ExitCode = 1;
+    }
+    return;
+}
 Console.InputEncoding = new System.Text.UTF8Encoding(false);
 Console.OutputEncoding = new System.Text.UTF8Encoding(false);
 if (args.Length == 0) { Console.WriteLine("WindowSocks.Tools probe | import-local | identity <pid> | pipe <action>\n代理資料從標準輸入讀取，不放在命令列參數。"); return; }
 switch (args[0])
 {
+    case "sandbox-broker":
+        using (var runtime = new SandboxieRuntime()) {
+            while (await Console.In.ReadLineAsync() is { } requestLine) {
+                if (requestLine.Length > PipeTransport.Limit) break;
+                Reply reply;
+                try {
+                    var request = JsonSerializer.Deserialize<SandboxBrokerRequest>(requestLine, Json.Options) ?? throw new InvalidDataException();
+                    if (request.Action == "list") {
+                        if (!System.Text.RegularExpressions.Regex.IsMatch(request.Box, "^Xa_[0-9a-f]{24}$")) throw new InvalidDataException("沙盒名稱無效。");
+                        reply = Reply.Success(runtime.Processes(request.Box));
+                    } else if (request.Action == "query") reply = Reply.Success(runtime.Query(request.Pid));
+                    else if (request.Action == "terminate" && request.Profile is { } owned) {
+                        SandboxInstances.Validate(owned); _ = new System.Security.Principal.SecurityIdentifier(request.OwnerSid);
+                        runtime.TerminateOwned(owned, request.OwnerSid); reply = Reply.Success(true);
+                    } else throw new InvalidDataException("不支援的沙盒查詢。");
+                } catch (Exception ex) when (ex is not OutOfMemoryException) { reply = Reply.Failure(ex.Message); }
+                Console.WriteLine(JsonSerializer.Serialize(reply, Json.Options));
+            }
+        }
+        break;
+    case "sandbox-start":
+        var launchId = Guid.Parse(args[1]);
+        var launchState = await PipeTransport.CallAsync<Snapshot>(Command.Create("snapshot", new { }));
+        var launchProfile = launchState.SandboxInstances.Single(p => p.Id == launchId);
+        var launchProbe = await PipeTransport.CallAsync<ProbeResult>(Command.Create("probe", new ProxyRequest(launchProfile.ProxyId)));
+        if (!launchProbe.Ready) throw new IOException(launchProbe.Message);
+        var launchTicket = await PipeTransport.CallAsync<SandboxLaunchTicket>(Command.Create("armSandbox", new SandboxRequest(launchId)));
+        var launchInfo = new System.Diagnostics.ProcessStartInfo(Path.Combine(SandboxieRuntime.InstallDirectory, "Start.exe")) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = launchProfile.WorkingDirectory };
+        foreach (string arg in new[] { "/box:" + launchProfile.BoxName, "/hide_window", Environment.ProcessPath!, "sandbox-bootstrap", launchId.ToString(), launchTicket.Token }) launchInfo.ArgumentList.Add(arg);
+        using (System.Diagnostics.Process.Start(launchInfo)) { }
+        Console.WriteLine("已提出沙盒啟動，請查核實際程序與窗口。"); break;
+    case "sandbox-traffic":
+        var trafficId = Guid.Parse(args[1]);
+        var trafficIdentity = LdPlayer.Identity(Environment.ProcessId)!.Value;
+        bool trafficRouted = false;
+        for (int attempt = 0; attempt < 30; attempt++) {
+            var trafficStates = await PipeTransport.CallAsync<SandboxInstanceStatus[]>(Command.Create("refreshSandboxes", new { }), pipeName: PipeTransport.SandboxName);
+            if (trafficStates.Any(s => s.Id == trafficId && s.State == "代理執行中" && s.Processes.Contains(trafficIdentity))) { trafficRouted = true; break; }
+            await Task.Delay(500);
+        }
+        if (!trafficRouted) throw new IOException("此沙盒測試程序尚未完成代理核驗。");
+        var trafficResult = await TransparentTrafficProbe.RunAsync(false);
+        await File.WriteAllTextAsync(args[2], JsonSerializer.Serialize(new { at = DateTimeOffset.UtcNow, identity = trafficIdentity, result = trafficResult }, Json.Options)); break;
+    case "sandbox-bootstrap":
+        await SandboxBootstrap.Run(Guid.Parse(args[1]), args[2]); break;
+    case "sandbox-processes":
+        using (var sandbox = new SandboxieRuntime()) Console.WriteLine(JsonSerializer.Serialize(sandbox.Processes(args[1]), Json.Options)); break;
+    case "sandbox-prepare":
+        var sandboxProfile = JsonSerializer.Deserialize<SandboxInstanceProfile>(await Console.In.ReadToEndAsync(), Json.Options) ?? throw new InvalidDataException();
+        await SandboxPreparation.Prepare(sandboxProfile.SourceLauncherPath, sandboxProfile, new Progress<string>(s => Console.Error.WriteLine(s)), default);
+        Console.WriteLine(JsonSerializer.Serialize(sandboxProfile, Json.Options)); break;
+    case "sandbox-config-command":
+        Console.WriteLine(await SandboxieRuntime.Command(args[1], args.Skip(2), default)); break;
     case "vmware-discover":
         Console.WriteLine(JsonSerializer.Serialize((await VmwareDiscovery.Running()).Concat(VmwareDiscovery.Registered()).DistinctBy(v => v.Machine.Path, StringComparer.OrdinalIgnoreCase), Json.Options)); break;
     case "check-update":

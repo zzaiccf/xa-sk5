@@ -64,7 +64,7 @@ public sealed class SequentialEmulatorTests
         var other = next.Single(b => b.TargetKey == outside.Key); Assert.False(other.AutoManaged); Assert.False(other.Enabled);
         Assert.True(oldOther.Enabled); // Planning cannot mutate installed policies before validation succeeds.
     }
-    [Fact] public void InvalidScopeMixedFixedRulesAndLowerCapacityAreRejected()
+    [Fact] public void InvalidScopesAreRejectedButLowerCapacityKeepsLiveWindows()
     {
         var rule = Rule(); AutoProxyPlanner.Validate(rule); AutoProxyPlanner.Validate(Rule("MuMu"));
         Assert.Throws<InvalidOperationException>(() => AutoProxyPlanner.Validate(rule with { EmulatorKind = "unknown" }));
@@ -72,7 +72,8 @@ public sealed class SequentialEmulatorTests
         Assert.Throws<InvalidOperationException>(() => AutoProxyPlanner.Validate(rule with { IncludeChildren = true }));
         Assert.Throws<InvalidOperationException>(() => AutoProxyPlanner.Validate(rule with { EmulatorAssignments = [new("LDPlayer", rule.ConsolePath, 1, "one", Guid.NewGuid())] }));
         var id = Guid.NewGuid(); var targets = new[] { Target(1, 100), Target(2, 200) };
-        Assert.Throws<InvalidOperationException>(() => SequentialEmulatorPlanner.Prepare(rule, targets.Select(t => Binding(t, id)), pid => targets.Single(t => t.Processes[0].Pid == pid).Processes[0]));
+        var retained = SequentialEmulatorPlanner.Prepare(rule, targets.Select(t => Binding(t, id)), pid => targets.Single(t => t.Processes[0].Pid == pid).Processes[0]);
+        Assert.Equal(2, retained.Count); Assert.All(retained, b => Assert.Equal(id, b.ProxyId));
     }
     [Fact] public async Task DisabledSequenceRulePersistsWithoutStartingDriverOrAssigningClosedWindows()
     {

@@ -11,15 +11,16 @@ public static class ProxyRules
         var rows = new List<ProxyRuleItem>(); var rule = state.AutoProxy;
         if (HasAutomatic(rule, state.Bindings)) {
             bool fixedMode = rule.Kind == "Emulator";
-            string type = rule.Kind switch { "GameGroup" => "遊戲組", "Process" => "一般程序", _ => "模擬器" };
+            string type = rule.Kind switch { "GameGroup" or "Process" => "遊戲／程式", _ => "模擬器" };
             string name = rule.Kind switch { "Process" => rule.Pattern, "GameGroup" => rule.Pattern + " ＋ " + rule.ClientPath, "Emulator" => "模擬器固定分配", "EmulatorSequence" when rule.EmulatorKind == "MuMu" => "MuMu 啟動順序", _ => "雷電啟動順序" };
-            rows.Add(new("automatic", name, type, fixedMode ? "固定窗口" : rule.Kind is "LDPlayer" or "EmulatorSequence" ? "依啟動順序" : "自動匹配", fixedMode ? "依固定對應" : $"每 IP {rule.PerProxy} 個窗口", fixedMode ? $"{rule.EmulatorAssignments.Length} 個固定窗口" : $"{state.Bindings.Count(b => b.AutoManaged)} 個管理中", state.HasPendingEmulatorConfiguration ? "等待服務套用" : rule.Enabled ? "已啟用" : "已暫停", state.AutoProxyStatus));
+            rows.Add(new("automatic", name, type, fixedMode ? "固定窗口" : rule.Kind is "LDPlayer" or "EmulatorSequence" ? "依啟動順序" : "自動匹配", fixedMode ? "依固定對應" : rule.ProxyCapacities.Count > 0 ? "各線路自訂數量" : $"每條線路 {rule.PerProxy} 個", fixedMode ? $"{rule.EmulatorAssignments.Length} 個固定窗口" : $"{state.Bindings.Count(b => b.AutoManaged)} 個管理中", state.HasPendingEmulatorConfiguration ? "等待服務套用" : rule.Enabled ? "已啟用" : "已暫停", state.AutoProxyStatus));
         }
         if (state.Vmware is { } vm && vm.Settings.Machines.Length > 0 && !vm.Settings.RuleDeleted) {
             var settings = vm.Settings;
             rows.Add(new("vmware", "VMware 虛擬機代理", "虛擬機", settings.ByStartup ? "依啟動順序" : "固定虛擬機", settings.ByStartup ? $"每 IP {settings.PerProxy} 個窗口" + (settings.OverflowToLocal ? " · 超額本地" : "") : "依固定對應", $"{settings.Machines.Length} 台虛擬機", !state.Diagnostics.ServiceOnline ? "待服務連線" : settings.PendingPreparation ? settings.PreparationError.Length > 0 ? "已儲存 · 準備未完成" : "已儲存 · 等待準備" : !settings.Enabled ? "已暫停" : !vm.Prepared ? "尚未準備" : "已啟用", string.Join("、", settings.Machines.Select(m => m.Name.Length > 0 ? m.Name : System.IO.Path.GetFileNameWithoutExtension(m.VmxPath))) + "；" + vm.Detail));
         }
-        rows.AddRange(state.Bindings.Where(b => !b.AutoManaged).Select(b => new ProxyRuleItem("binding:" + b.TargetKey, b.Name, EmulatorCatalog.IsEmulator(b.Kind) ? "模擬器" : "一般程序", "指定代理", b.SharedProxy ? "共用 IP" : "專用 IP", "1 個窗口", b.Enabled ? "已啟用" : "已暫停", b.Path)));
+        rows.AddRange(state.SandboxInstances.Select(p => new ProxyRuleItem(p.TargetKey, p.Name, "桌面沙盒", "固定線路", "專用 IP", "1 個隔離實例", state.SandboxStatuses.FirstOrDefault(s => s.Id == p.Id)?.State ?? "未啟動", p.LauncherPath)));
+        rows.AddRange(state.Bindings.Where(b => !b.AutoManaged && b.Kind != "Sandbox").Select(b => new ProxyRuleItem("binding:" + b.TargetKey, b.Name, EmulatorCatalog.IsEmulator(b.Kind) ? "模擬器" : "一般程序", "指定代理", b.SharedProxy ? "共用 IP" : "專用 IP", "1 個窗口", b.Enabled ? "已啟用" : "已暫停", b.Path)));
         return rows.ToArray();
     }
     public static SavedConfig Delete(SavedConfig current, string key)

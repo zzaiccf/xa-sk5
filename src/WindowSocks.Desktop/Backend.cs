@@ -9,17 +9,20 @@ using WindowSocks.Core;
 
 namespace WindowSocks.Desktop;
 
-public class Backend
+public partial class Backend
 {
     private readonly ConfigStore store;
     private readonly SavedConfig config;
     private readonly Func<Command, CancellationToken, Task<Reply>>? serviceTransport;
     private readonly Dictionary<Guid, ProbeResult> probes = new();
     private bool supportsTcpFirst;
+    private CloseProxyProcessesPlan? sandboxClosePlan;
     private readonly SemaphoreSlim supplementalGate = new(ProbeTiming.MaxSupplementalProbes, ProbeTiming.MaxSupplementalProbes);
     private CancellationTokenSource supplementalLifetime = new();
     public bool Online { get; protected set; }
     public bool HasLocalProxies => config.Proxies.Count > 0;
+    public Snapshot EditorState => new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), [], probes.Values.ToArray(), [],
+        new(false, false, false, false, AppReleasePackage.CurrentVersion, "正在讀取服務狀態", [])) { AutoProxy = config.AutoProxy, SandboxInstances = config.SandboxInstances.ToArray(), GlobalProxy = config.GlobalProxy };
     public string ConsolePath { get => config.LdConsole; set { config.LdConsole = value; store.Save(config); } }
     public string MuMuConsolePath { get => config.MuMuConsole; set { config.MuMuConsole = value; store.Save(config); } }
     public Backend() : this(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WindowSocks")) { }
@@ -133,7 +136,7 @@ public class Backend
         }
         else {
             if (config.Bindings.Any(b => b.ProxyId == id)) throw new InvalidOperationException("請先解除使用此代理的分配。");
-            config.Proxies.RemoveAll(p => p.Id == id); probes.Remove(id); config.LastProbes = probes.Values.ToList(); store.Save(config);
+            config.Proxies.RemoveAll(p => p.Id == id); config.AutoProxy = ProxyCapacity.Remove(config.AutoProxy, [id]); probes.Remove(id); config.LastProbes = probes.Values.ToList(); store.Save(config);
         }
     }
     public virtual async Task<ClearProxyPoolResult> ClearProxyPool()
@@ -146,9 +149,10 @@ public class Backend
         }
         ProxyPoolUsage.RequireUnused(config);
         Guid[] ids = config.Proxies.Select(p => p.Id).ToArray();
-        var next = config with { Proxies = [], LastProbes = [] };
+        var next = config with { Proxies = [], LastProbes = [], AutoProxy = ProxyCapacity.Remove(config.AutoProxy, ids),
+            PendingEmulatorRule = config.PendingEmulatorRule is { } pending ? ProxyCapacity.Remove(pending, ids) : null };
         store.Save(next); StopProbes();
-        config.Proxies = next.Proxies; config.LastProbes = next.LastProbes; probes.Clear();
+        config.Proxies = next.Proxies; config.LastProbes = next.LastProbes; config.AutoProxy = next.AutoProxy; config.PendingEmulatorRule = next.PendingEmulatorRule; probes.Clear();
         return new(ids);
     }
     private async Task RequireBulkActions()
@@ -160,12 +164,24 @@ public class Backend
     public virtual async Task<CloseProxyProcessesPlan> PrepareCloseProxyProcesses()
     {
         await RequireBulkActions();
-        return await Call<CloseProxyProcessesPlan>(Command.Create("prepareCloseProxyProcesses", new { }));
+        sandboxClosePlan = await Call<CloseProxyProcessesPlan>(Command.Create("prepareCloseProxyProcesses", new { }));
+        return sandboxClosePlan;
     }
     public virtual async Task<CloseProxyProcessesResult> CloseProxyProcesses(Guid token)
     {
         if (!Online) throw new InvalidOperationException("背景服務未連線，無法關閉代理進程。");
-        return await Call<CloseProxyProcessesResult>(Command.Create("closeProxyProcesses", new CloseProxyProcessesRequest(token)));
+        var plan = sandboxClosePlan; sandboxClosePlan = null;
+        var closedBoxes = new List<ProcessCloseOutcome>();
+        if (plan is not null && plan.Token == token && plan.ExpiresAt > DateTimeOffset.UtcNow) {
+            foreach (var scope in plan.Targets.Where(s => s.Key.StartsWith("sandbox:", StringComparison.Ordinal))) {
+                if (!Guid.TryParseExact(scope.Key[8..], "N", out var id)) continue;
+                var live = scope.Processes.Where(p => LdPlayer.Identity(p.Pid) == p).ToHashSet();
+                await StopSandbox(id);
+                closedBoxes.AddRange(scope.Processes.Select(p => new ProcessCloseOutcome(p, live.Contains(p) ? "closed" : "exited", "沙盒程序已停止")));
+            }
+        }
+        var result = await Call<CloseProxyProcessesResult>(Command.Create("closeProxyProcesses", new CloseProxyProcessesRequest(token)));
+        return result with { Processes = result.Processes.Concat(closedBoxes).DistinctBy(p => p.Identity).ToArray() };
     }
     public async Task Assign(BatchBindRequest request)
     {
@@ -197,6 +213,11 @@ public class Backend
     {
         rule = ProcessHandoffPolicy.Automatic(rule) with { Configured = true };
         AutoProxyPlanner.Validate(rule);
+        if (rule.ProxyCapacities.Count > 0) {
+            var capacitiesState = Online ? await Call<Snapshot>(Command.Create("snapshot", new { })) : null;
+            if (capacitiesState?.SupportsProxyCapacities != true)
+                throw new InvalidOperationException("各線路分配數量需要 0.1.26 以上背景服務，請先到設定安裝／修復新版元件後再儲存。");
+        }
         if (rule.Kind is "Emulator" or "EmulatorSequence") {
             var state = Online ? await Call<Snapshot>(Command.Create("snapshot", new { })) : null;
             if (state is null || (rule.Kind == "EmulatorSequence" ? !state.SupportsSequentialEmulators : !state.SupportsFixedEmulators)) {

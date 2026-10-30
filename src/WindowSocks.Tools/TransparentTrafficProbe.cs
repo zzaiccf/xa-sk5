@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using WindowSocks.Core;
 
 // Deliberately uses ordinary sockets with no SOCKS configuration. This checks the installed interception path.
+internal sealed record TransparentTrafficResult(int Pid, string? TcpExit, string? UdpExit, bool Dns, long ElapsedMs, List<string> Errors, DateTimeOffset At);
 internal static class TransparentTrafficProbe
 {
     public static async Task<string> TcpExitAsync(int timeoutSeconds = 18)
@@ -22,7 +23,7 @@ internal static class TransparentTrafficProbe
         if (!IPAddress.TryParse(text, out var address) || address.AddressFamily != AddressFamily.InterNetwork) throw new IOException("出口回覆不是 IPv4。");
         return text;
     }
-    public static async Task<object> RunAsync(bool dnsOnly = false)
+    public static async Task<TransparentTrafficResult> RunAsync(bool dnsOnly = false)
     {
         string? tcpExit = null, udpExit = null; bool dns = false;
         var errors = new List<string>(); var watch = Stopwatch.StartNew();
@@ -51,6 +52,6 @@ internal static class TransparentTrafficProbe
             dns = response.Length >= 12 && response[0] == query[0] && response[1] == query[1] && (response[2] & 0x80) != 0 && (response[3] & 15) == 0 && BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(6)) > 0;
             if (!dns) errors.Add("DNS: InvalidResponse");
         } catch (Exception ex) { errors.Add("DNS: " + ex.GetType().Name); }
-        return new { pid = Environment.ProcessId, tcpExit, udpExit, dns, elapsedMs = watch.ElapsedMilliseconds, errors, at = DateTimeOffset.Now };
+        return new(Environment.ProcessId, tcpExit, udpExit, dns, watch.ElapsedMilliseconds, errors, DateTimeOffset.Now);
     }
 }

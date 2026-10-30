@@ -6,6 +6,7 @@ public sealed partial class Controller
 {
     private void DeleteRule(DeleteRuleRequest request)
     {
+        if (request.Key.StartsWith("sandbox:", StringComparison.Ordinal) && Guid.TryParseExact(request.Key[8..], "N", out var sandboxId)) { RemoveSandbox(sandboxId); return; }
         var original = config with { }; var previousRuntime = vmwareRuntime;
         var next = ProxyRules.Delete(config, request.Key);
         try {

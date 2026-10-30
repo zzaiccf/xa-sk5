@@ -1,0 +1,8 @@
+<Window x:Class="WindowSocks.Desktop.SandboxLaunchWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Style="{StaticResource {x:Type Window}}" Title="啟動遊戲" Width="650" Height="460" MinWidth="540" MinHeight="380" WindowStartupLocation="CenterOwner">
+ <Grid Margin="24"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <StackPanel><TextBlock Text="啟動遊戲" FontSize="24" FontWeight="SemiBold"/><TextBlock x:Name="DescriptionText" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,8,0,14"/></StackPanel>
+  <TextBlock Grid.Row="1" x:Name="LaunchProgress" Text="正在安排啟動…" TextWrapping="Wrap" Margin="0,0,0,12"/>
+  <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="LaunchResults" TextWrapping="Wrap"/></ScrollViewer>
+  <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0"><Button x:Name="CancelLaunch" Content="取消啟動" Click="Cancel"/><Button x:Name="CloseButton" Content="關閉" Click="CloseWindow"/></StackPanel>
+ </Grid>
+</Window>

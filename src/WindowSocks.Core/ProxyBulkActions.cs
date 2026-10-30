@@ -25,6 +25,7 @@ public static class ProxyPoolUsage
         var reasons = new List<string>();
         if (config.GlobalProxy.Enabled && ids.Contains(config.GlobalProxy.ProxyId)) reasons.Add("全局代理正在使用節點");
         if (config.Bindings.Any(b => ids.Contains(b.ProxyId))) reasons.Add("仍有窗口綁定節點（包含暫停或未啟動的窗口）");
+        if (config.SandboxInstances.Any(p => ids.Contains(p.ProxyId))) reasons.Add("沙盒實例仍使用節點");
         if (config.AutoProxy.EmulatorAssignments.Any(a => ids.Contains(a.ProxyId)) ||
             config.PendingEmulatorRule?.EmulatorAssignments.Any(a => ids.Contains(a.ProxyId)) == true)
             reasons.Add("固定模擬器規則仍使用節點");

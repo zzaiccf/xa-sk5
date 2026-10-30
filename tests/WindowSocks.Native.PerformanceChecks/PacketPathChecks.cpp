@@ -8,13 +8,14 @@
 static unsigned checks=0,checksumCalls=0,sendCalls=0,batchSends=0,received=0,delivered=0;
 static unsigned totalPackets=0;
 static bool firstUnknown=false;
+static DWORD singleSendError=0,batchSendError=0;
 static std::vector<uint8_t> fixture;
 static WINDIVERT_ADDRESS lastAddress{};
 static std::vector<uint8_t> lastPacket;
 static decltype(wdChecksums) officialChecksums;
 static void require(bool value,const char* message){++checks;if(!value)throw std::runtime_error(message);}
 static BOOL fakeChecksums(void* p,UINT n,WINDIVERT_ADDRESS* a,UINT64 flags){++checksumCalls;return officialChecksums(p,n,a,flags);}
-static BOOL fakeSend(HANDLE,const void* p,UINT n,UINT*,const WINDIVERT_ADDRESS* a){++sendCalls;lastPacket.assign((const uint8_t*)p,(const uint8_t*)p+n);lastAddress=*a;return TRUE;}
+static BOOL fakeSend(HANDLE,const void* p,UINT n,UINT*,const WINDIVERT_ADDRESS* a){++sendCalls;lastPacket.assign((const uint8_t*)p,(const uint8_t*)p+n);lastAddress=*a;if(singleSendError){SetLastError(singleSendError);return FALSE;}return TRUE;}
 static BOOL fakeShutdown(HANDLE,WINDIVERT_SHUTDOWN){return TRUE;}
 static BOOL fakeClose(HANDLE){return TRUE;}
 static BOOL fakeSendEx(HANDLE,const void* p,UINT n,UINT*,UINT64,const WINDIVERT_ADDRESS* a,UINT addrLength,OVERLAPPED*){
@@ -24,6 +25,7 @@ static BOOL fakeSendEx(HANDLE,const void* p,UINT n,UINT*,UINT64,const WINDIVERT_
         require(a[i].Timestamp==delivered-addrLength/sizeof(WINDIVERT_ADDRESS)+i+(firstUnknown?1:0),"packet/address order must be preserved");
         require(memcmp((const uint8_t*)p+i*fixture.size(),fixture.data(),fixture.size())==0,"direct packet must be unchanged");
     }
+    if(batchSendError){DWORD error=batchSendError;batchSendError=0;SetLastError(error);return FALSE;}
     return TRUE;
 }
 static BOOL fakeRecvEx(HANDLE,void* p,UINT capacity,UINT* n,UINT64,WINDIVERT_ADDRESS* a,UINT* addrLength,OVERLAPPED*){
@@ -44,7 +46,7 @@ static std::vector<uint8_t> packet(bool udp=false,bool ipv6=false){
     if(udp)put16(p.data()+off+4,20);else{p[off+12]=0x50;p[off+13]=2;}
     return p;
 }
-static void reset(){Core_ReplacePolicy(nullptr,0,L"\0");received=delivered=batchSends=sendCalls=checksumCalls=0;tcpOwners.clear();firstUnknown=false;}
+static void reset(){Core_ReplacePolicy(nullptr,0,L"\0");received=delivered=batchSends=sendCalls=checksumCalls=0;tcpOwners.clear();firstUnknown=false;singleSendError=batchSendError=0;lastError=0;}
 static uint32_t parentPid(){
     uint32_t parent=0;HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);PROCESSENTRY32W e{};e.dwSize=sizeof(e);
     if(Process32FirstW(snap,&e))do{if(e.th32ProcessID==GetCurrentProcessId())parent=e.th32ParentProcessID;}while(Process32NextW(snap,&e));CloseHandle(snap);return parent;
@@ -67,6 +69,31 @@ static void batchLoopChecks(){
     require(out.addresses.size()==1,"inventory traffic stays direct");
     addr.UDPChecksum=0;require(processPacket(p,addr,b,&out),"offloaded packet still passes");
     require(checksumCalls==1,"offloaded/invalid checksums must still be completed");
+}
+static void sendFailureChecks(){
+    reset();active=true;auto p=packet();WINDIVERT_ADDRESS addr{};addr.IPChecksum=addr.TCPChecksum=1;
+    auto retained=std::make_shared<Flow>();retained->key={inet_addr("192.0.2.10"),inet_addr("198.51.100.10"),40000,443,6};retained->connected=true;
+    flows[retained->key]=retained;
+    singleSendError=ERROR_HOST_UNREACHABLE;
+    require(!inject(p,addr,false),"a rejected packet must report injection failure");
+    require(Core_IsRunning()!=0&&retained->alive,"a packet-local 1232 must not restart the engine or close unrelated relays");
+    singleSendError=0;require(inject(p,addr,false),"later packets must still inject after 1232");
+    auto droppedBefore=packetMetrics.expiredImpostors.load();
+    for(bool ipv6:{false,true})for(uint8_t hop:{0,1,2}){
+        auto expired=packet(false,ipv6);expired[ipv6?7:8]=hop;addr.Impostor=1;unsigned before=sendCalls;
+        require(inject(expired,addr,false)==(hop>1),"impostor loop protection must reject only exhausted TTL/HopLimit");
+        require(sendCalls==before+(hop>1?1:0),"expired impostors must not enter the driver");
+        PassThroughBatch filtered;filtered.append(expired,addr);
+        require(filtered.addresses.size()==(hop>1?1:0),"expired impostors must not poison a pass-through batch");
+        addr.Impostor=0;require(inject(expired,addr,false),"ordinary low-TTL packets must retain Windows routing behavior");
+    }
+    require(packetMetrics.expiredImpostors==droppedBefore+8,"expired-impostor diagnostics must count both injection paths");
+    singleSendError=ERROR_INVALID_HANDLE;require(!inject(p,addr,false)&&Core_IsRunning()==0,"invalid capture handles must remain fatal");
+    flows.clear();retained.reset();reset();fixture=packet();totalPackets=192;active=true;batchSendError=ERROR_HOST_UNREACHABLE;captureLoop();
+    require(received==192&&batchSends==3&&lastError==0,"batch 1232 must allow later receive batches without re-sending the rejected batch");
+    reset();fixture=packet();totalPackets=192;active=true;batchSendError=ERROR_INVALID_HANDLE;captureLoop();
+    require(received==64&&batchSends==1&&lastError==ERROR_INVALID_HANDLE,"fatal batch errors must still stop capture");
+    reset();active=false;
 }
 static void policyChecks(uint32_t pid,uint64_t birth){
     reset();Core_SetProxy(910,"127.0.0.1",1080,"","");RouteRule rule{pid,910,birth,1,0};Core_ReplacePolicy(&rule,1,L"\0");
@@ -94,6 +121,33 @@ static void policyChecks(uint32_t pid,uint64_t birth){
     for(unsigned i=0;i<2;i++){t->table[i]={};t->table[i].dwLocalPort=htons(41001);t->table[i].dwOwningPid=pid;t->table[i].liCreateTimestamp.QuadPart=birth+i;}
     uint64_t socketBirth=0;Key key{inet_addr("192.0.2.1"),inet_addr("198.51.100.1"),41001,443,17};
     require(owner(key,socketBirth,false,&ambiguous)==UINT32_MAX,"same-port sockets with different births must remain ambiguous");
+}
+static void concurrentActivityChecks(){
+    reset();
+    auto add=[](uint8_t protocol,uint16_t port,uint64_t last,bool alive=true,bool gateway=true){
+        auto f=std::make_shared<Flow>();f->key={inet_addr("192.0.2.1"),inet_addr("198.51.100.1"),port,443,protocol};
+        f->gatewayInterface=gateway?1:0;f->last=last;f->alive=alive;f->alias=port;
+        flows[f->key]=f;aliases[f->alias]=f;return f;
+    };
+    // Model an activity update arriving after prune sampled its clock. Future
+    // timestamps make this real cleanup-path regression deterministic.
+    const uint64_t now=3600000;
+    auto tcp=add(6,42001,now+60000),udp=add(17,42002,now+60000);
+    auto closed=add(6,42003,now+60000,false);
+    auto opening=add(6,42004,now,true,false);opening->opened=now+60000;
+    prune(now);
+    require(tcp->alive&&flows.count(tcp->key)&&aliases.count(tcp->alias),"concurrent TCP activity must not underflow into idle expiration");
+    require(udp->alive&&flows.count(udp->key),"concurrent UDP activity must not underflow into idle expiration");
+    require(flows.count(closed->key),"recently closed flow must retain its grace period despite a newer activity timestamp");
+    require(opening->alive,"a flow opened after the cleanup clock sample must retain its socket discovery grace period");
+    tcp->last=now;udp->last=now;closed->last=now;opening->gatewayInterface=1;
+    prune(now);require(flows.size()==4,"recent activity and closed-flow grace periods must be retained");
+    tcp->last=now-1800000;udp->last=now-60000;closed->last=now-5000;
+    prune(now);require(flows.size()==4,"cleanup must honor the exact idle and closed-grace boundaries");
+    prune(now+1);
+    require(!tcp->alive&&!udp->alive&&flows.size()==1&&flows.count(opening->key),"truly idle TCP/UDP and expired closed flows must still be removed");
+    require(aliases.size()==1&&aliases.count(opening->alias),"cleanup must release only expired flow aliases");
+    flows.clear();aliases.clear();
 }
 static void socketReuseChecks(){
     reset();sockaddr_in a{};a.sin_family=AF_INET;a.sin_addr.s_addr=inet_addr("127.0.0.1");int n=sizeof(a);
@@ -184,7 +238,7 @@ static void telemetryChecks(){
     if(find!=INVALID_HANDLE_VALUE){do{++count;}while(FindNextFileW(find,&entry));FindClose(find);}
     require(count==16,"rotation must retain only sixteen generated segments");require(GetFileAttributesW((directory+L"\\user-document.txt").c_str())!=INVALID_FILE_ATTRIBUTES,"rotation must preserve unrelated documents");
     FILE* file=nullptr;_wfopen_s(&file,telemetryPath.c_str(),L"rb");require(file!=nullptr,"new telemetry segment must contain a record");char line[4096]{};bool written=fgets(line,sizeof(line),file)!=nullptr;fclose(file);
-    require(written&&strstr(line,"\"native\":\"0.1.23\"")&&strstr(line,"\"ageMaxUs\""),"rotated record must include version and queue timing");
+    require(written&&strstr(line,"\"native\":\"0.1.30\"")&&strstr(line,"\"ageMaxUs\""),"rotated record must include version and queue timing");
     telemetryPath.clear();telemetryDirectory.clear();
     // Delete only files in this exact directory created above; no recursive move/delete.
     find=FindFirstFileW((directory+L"\\*").c_str(),&entry);if(find!=INVALID_HANDLE_VALUE){do{if(!(entry.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY))DeleteFileW((directory+L"\\"+entry.cFileName).c_str());}while(FindNextFileW(find,&entry));FindClose(find);}require(RemoveDirectoryW(directory.c_str())!=0,"isolated telemetry files must be cleaned up");
@@ -198,7 +252,7 @@ int main(int argc,char** argv){
         wdChecksums=fakeChecksums;wdSend=fakeSend;wdSendEx=fakeSendEx;wdRecvEx=fakeRecvEx;divert=(HANDLE)1;
         WSADATA ws;WSAStartup(MAKEWORD(2,2),&ws);listenPort=18000;
         uint32_t pid=parentPid();uint64_t birth=created(pid);require(pid&&birth,"live parent identity required");
-        batchLoopChecks();policyChecks(pid,birth);socketReuseChecks();followedTreeChecks(pid,birth);retryChecks();reportBenchmark();shutdownChecks();reset();telemetryChecks();
+        batchLoopChecks();sendFailureChecks();policyChecks(pid,birth);concurrentActivityChecks();socketReuseChecks();followedTreeChecks(pid,birth);retryChecks();reportBenchmark();shutdownChecks();reset();telemetryChecks();
         printf("PASS: %u packet-path assertions; no capture handle opened.\n",checks);WSACleanup();return 0;
     }catch(const std::exception& e){fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
 }
