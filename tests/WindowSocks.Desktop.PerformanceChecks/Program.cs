@@ -132,7 +132,7 @@ internal static partial class Program
         var host = new ContentControl { Content = content, Width = width, Height = height, HorizontalContentAlignment = HorizontalAlignment.Stretch, VerticalContentAlignment = VerticalAlignment.Stretch, FontFamily = new FontFamily("Microsoft JhengHei UI"), FontSize = 13, Foreground = (Brush)System.Windows.Application.Current.FindResource("Ink") };
         var surface = new Border { Child = host, Background = (Brush)System.Windows.Application.Current.FindResource("Canvas") };
         surface.Measure(new Size(width, height)); surface.Arrange(new Rect(0, 0, width, height)); surface.UpdateLayout();
-        var save = (Button)(window.FindName("SaveRuleButton") ?? window.FindName("StartBothButton")); var point = save.TransformToAncestor(surface).Transform(new Point());
+        var save = (Button)(window.FindName("SaveRuleButton") ?? window.FindName("PrepareButton")); var point = save.TransformToAncestor(surface).Transform(new Point());
         Check(point.X >= 0 && point.Y >= 0 && point.X + save.ActualWidth <= width && point.Y + save.ActualHeight <= height, "Save button was clipped.");
         var image = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32); image.Render(surface);
         var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(image)); using (var file = File.Create(Path.Combine(Output, name))) png.Save(file);
@@ -170,11 +170,20 @@ internal static partial class Program
         private readonly Fixture fixture;
         public int Snapshots;
         public readonly System.Collections.Concurrent.ConcurrentQueue<Guid> SandboxStarts = new();
-        public SandboxInstanceProfile[]? PreparedPair;
+        public SandboxInstanceProfile[]? PreparedProfiles;
+        public SandboxieSetupState EnvironmentStatus = new(true, false, "合成：已安裝");
+        public int Installs;
+        public override Task<SandboxieSetupState> SandboxEnvironment(CancellationToken ct) => Task.FromResult(EnvironmentStatus);
+        public override Task EnsureSandboxInstalled(IProgress<UpdateProgress>? progress, CancellationToken ct) { Installs++; EnvironmentStatus = new(true, false, "合成：安裝完成"); return Task.CompletedTask; }
+        public override Task<SandboxInstanceProfile[]> ResumeSandboxPreparation(string source, Guid[] proxies, SandboxInstanceProfile[] existing, CancellationToken ct) => Task.FromResult(SandboxPreparation.Resume(source, proxies, existing, Path.Combine(Output, "drafts")));
         public override Task<bool> SandboxInstalled(CancellationToken ct) => Task.FromResult(true);
         public override Task<bool> DetectYongOrigin(string path, CancellationToken ct) => Task.FromResult(path.Contains("SyntheticGame"));
         public override Task StartSandbox(Guid id, CancellationToken ct = default) { SandboxStarts.Enqueue(id); return Task.CompletedTask; }
-        public override Task PrepareSandboxPair(SandboxInstanceProfile[] pair, IProgress<string>? progress, CancellationToken ct) { PreparedPair = pair; return Task.CompletedTask; }
+        public override Task PrepareSandboxes(SandboxInstanceProfile[] profiles, IProgress<string>? progress, CancellationToken ct) {
+            SandboxPreparation.ValidateBatch(profiles); PreparedProfiles = profiles;
+            fixture.State = fixture.State with { SandboxInstances = fixture.State.SandboxInstances.Where(p => !profiles.Any(next => next.Id == p.Id)).Concat(profiles).ToArray() };
+            return Task.CompletedTask;
+        }
         public void Disconnect() => Online = false;
         public FakeBackend(Fixture fixture) : base(Path.Combine(Output, "fixture-" + Guid.NewGuid().ToString("N")), fixture.Transport) {
             this.fixture = fixture; ConsolePath = @"C:\SyntheticMissingEmulator\ldconsole.exe"; MuMuConsolePath = "";

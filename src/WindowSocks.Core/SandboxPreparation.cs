@@ -24,22 +24,45 @@ public static class SandboxPreparation
             }
         }
         foreach (var (drive, bytes) in required) if (new DriveInfo(drive).AvailableFreeSpace < bytes)
-            throw new IOException($"{drive} 空間不足，兩個副本尚需約 {Math.Ceiling(bytes / 1073741824d)} GB（含預留空間）。");
+            throw new IOException($"{drive} 空間不足，所選副本尚需約 {Math.Ceiling(bytes / 1073741824d)} GB（含預留空間）。");
     }
-    public static SandboxInstanceProfile[] ResumePair(string source, Guid a, Guid b, SandboxInstanceProfile[] existing)
+    public const int MaximumInstances = 10;
+    public static void ValidateBatch(SandboxInstanceProfile[] profiles)
     {
-        string folder = Path.Combine(SandboxInstances.StorageRoot, "Preparation"); Directory.CreateDirectory(folder);
+        if (profiles.Length is < 1 or > MaximumInstances) throw new InvalidOperationException("請選擇 1–10 個沙盒實例。");
+        if (profiles.Select(p => p.Id).Distinct().Count() != profiles.Length || profiles.Select(p => p.ProxyId).Distinct().Count() != profiles.Length)
+            throw new InvalidOperationException("每個實例必須使用不同的身分與固定線路。");
+        foreach (var profile in profiles) SandboxInstances.Validate(profile);
+    }
+    public static string NextName(string source, IEnumerable<string> names)
+    {
+        var used = names.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        string name = Path.GetFileName(Path.GetDirectoryName(source)) ?? "遊戲";
+        if (name.Length > 78) name = name[..78];
+        return Enumerable.Range(0, MaximumInstances).Select(i => name + " " + (char)('A' + i)).First(n => !used.Contains(n));
+    }
+    // Existing profiles stay first and retain identity; only additional draft slots are resumed.
+    // The caller supplies lines in the displayed order, never in start/stop order.
+    public static SandboxInstanceProfile[] Resume(string source, Guid[] proxies, SandboxInstanceProfile[] existing, string? preparationDirectory = null)
+    {
+        source = Path.GetFullPath(source);
+        if (proxies.Length is < 1 or > MaximumInstances || proxies.Any(p => p == Guid.Empty) || proxies.Distinct().Count() != proxies.Length)
+            throw new InvalidOperationException("請為 1–10 個實例各選擇一條不同的線路。");
+        var saved = existing.Where(p => p.SourceLauncherPath.Equals(source, StringComparison.OrdinalIgnoreCase)).OrderBy(p => p.Name, StringComparer.Ordinal).ThenBy(p => p.Id).ToArray();
+        if (saved.Length > proxies.Length) throw new InvalidOperationException("已保存的實例不可在準備頁縮減，請到規則管理移除。");
+        string folder = preparationDirectory ?? Path.Combine(SandboxInstances.StorageRoot, "Preparation"); Directory.CreateDirectory(folder);
         string key = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(source).ToUpperInvariant())));
         string path = Path.Combine(folder, key + ".json");
         var pending = File.Exists(path) ? JsonSerializer.Deserialize<SandboxInstanceProfile[]>(File.ReadAllText(path), Json.Options) ?? [] : [];
-        var combined = (existing.Length == 2 ? existing : existing.Concat(pending)).Where(p => p.SourceLauncherPath.Equals(source, StringComparison.OrdinalIgnoreCase)).DistinctBy(p => p.Id).OrderBy(p => p.Name, StringComparer.Ordinal).ToList();
-        string name = Path.GetFileName(Path.GetDirectoryName(source)) ?? "遊戲";
-        if (combined.Count == 0) combined.Add(SandboxInstances.Create(name + " A", source, a));
-        if (combined.Count == 1) combined.Add(SandboxInstances.Create(name + (combined[0].Name.EndsWith(" B", StringComparison.Ordinal) ? " A" : " B"), source, b));
-        if (combined.Count != 2) throw new InvalidOperationException("此遊戲的沙盒實例超過兩個，請先整理規則。");
-        var result = combined.OrderBy(p => p.Name, StringComparer.Ordinal).ToArray();
-        result[0] = result[0] with { ProxyId = a }; result[1] = result[1] with { ProxyId = b };
-        foreach (var profile in result) SandboxInstances.Validate(profile);
+        var combined = saved.ToList();
+        foreach (var profile in pending) {
+            if (combined.Count == proxies.Length) break;
+            if (profile.SourceLauncherPath.Equals(source, StringComparison.OrdinalIgnoreCase) && !combined.Any(p => p.Id == profile.Id || p.Name.Equals(profile.Name, StringComparison.OrdinalIgnoreCase)) &&
+                !File.Exists(Path.Combine(Path.GetDirectoryName(profile.WorkingDirectory)!, "prepared.json"))) combined.Add(profile);
+        }
+        while (combined.Count < proxies.Length) combined.Add(SandboxInstances.Create(NextName(source, combined.Select(p => p.Name)), source, proxies[combined.Count]));
+        var result = combined.Select((p, i) => p with { ProxyId = proxies[i] }).ToArray();
+        ValidateBatch(result);
         File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(result, Json.Options)); File.Move(path + ".tmp", path, true);
         return result;
     }

@@ -2,6 +2,7 @@ namespace WindowSocks.Core;
 
 public static class SandboxCompatibility
 {
+    private static readonly string[] BorderColors = ["#4070FF", "#E88B24", "#229954", "#9B59B6", "#E74C3C", "#00A6A6", "#D4AC0D", "#C75498", "#607D8B", "#795548"];
     public static string PreferLauncher(string path)
     {
         string name = Path.GetFileName(path);
@@ -24,7 +25,7 @@ public static class SandboxCompatibility
             ["HideOtherBoxes"] = ["y"], ["AutoDelete"] = ["n"],
             ["OpenPipePath"] = [@"WindowSocks.Tools.exe,\Device\NamedPipe\WindowSocks.Sandbox.v1"],
             ["FakeAdminRights"] = [p.SimulateAdmin ? "y" : "n"], ["BoxNameTitle"] = ["y"], ["BoxAlias"] = [p.Name],
-            ["BorderColor"] = [p.Name.EndsWith(" B", StringComparison.Ordinal) ? "#E88B24,on,3" : "#4070FF,on,3"]
+            ["BorderColor"] = [BorderColors[p.Name.Length >= 2 && p.Name[^2] == ' ' && p.Name[^1] is >= 'A' and <= 'J' ? p.Name[^1] - 'A' : 0] + ",on,3"]
         };
         // Null preserves older manually configured boxes until the user saves a preset.
         if (p.IsolateDeviceIdentity == true) {

@@ -16,18 +16,21 @@ public partial class Backend
     public Task<SandboxLaunchOutcome[]> StartSandboxes(Guid[] ids, int intervalSeconds, IProgress<string>? progress, CancellationToken ct) =>
         Task.Run(() => sandboxLaunchQueue.RunAsync(ids, intervalSeconds, StartSandbox, progress, ct), ct);
     public virtual Task<bool> SandboxInstalled(CancellationToken ct) => Task.Run(() => SandboxieRuntime.Installed, ct);
+    public virtual Task<SandboxieSetupState> SandboxEnvironment(CancellationToken ct) => Task.Run(SandboxieInstaller.Inspect, ct);
+    public virtual Task EnsureSandboxInstalled(IProgress<UpdateProgress>? progress, CancellationToken ct) => Task.Run(() => new SandboxieInstaller().EnsureInstalled(progress, ct), ct);
+    public virtual Task<SandboxInstanceProfile[]> ResumeSandboxPreparation(string source, Guid[] proxies, SandboxInstanceProfile[] existing, CancellationToken ct) => Task.Run(() => SandboxPreparation.Resume(source, proxies, existing), ct);
     public virtual Task<bool> DetectYongOrigin(string path, CancellationToken ct) => Task.Run(() => SandboxCompatibility.IsYongOrigin(path), ct);
-    public virtual async Task PrepareSandboxPair(SandboxInstanceProfile[] pair, IProgress<string>? progress, CancellationToken ct)
+    public virtual async Task PrepareSandboxes(SandboxInstanceProfile[] profiles, IProgress<string>? progress, CancellationToken ct)
     {
         if (!await sandboxPreparationGate.WaitAsync(0, ct).ConfigureAwait(false)) throw new InvalidOperationException("先前的準備或取消尚未完成，請稍後重試。");
-        try { await PrepareSandboxPairCore(pair, progress, ct).ConfigureAwait(false); }
+        try { await PrepareSandboxesCore(profiles, progress, ct).ConfigureAwait(false); }
         finally { sandboxPreparationGate.Release(); }
     }
-    private async Task PrepareSandboxPairCore(SandboxInstanceProfile[] pair, IProgress<string>? progress, CancellationToken ct)
+    private async Task PrepareSandboxesCore(SandboxInstanceProfile[] pair, IProgress<string>? progress, CancellationToken ct)
     {
         var state = await SandboxSnapshot(ct).ConfigureAwait(false);
         if (!state.SupportsSandboxExperience) throw new InvalidOperationException("請先到設定安裝／修復 0.1.30 以上背景服務，再建立遊戲環境。");
-        if (pair.Length != 2 || pair.Select(p => p.ProxyId).Distinct().Count() != 2) throw new InvalidOperationException("請選擇兩條不同線路。");
+        SandboxPreparation.ValidateBatch(pair);
         if (state.SandboxInstances.Select(p => p.Id).Concat(pair.Select(p => p.Id)).Distinct().Count() > 10 ||
             state.Bindings.Select(b => b.TargetKey).Concat(pair.Select(p => p.TargetKey)).Distinct().Count() > 10)
             throw new InvalidOperationException("最多管理十個實例，請先移除不使用的規則。");
