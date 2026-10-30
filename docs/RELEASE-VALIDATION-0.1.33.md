@@ -29,7 +29,20 @@
 - **PASS**：最終 `--sandbox-storage` 再跑，dispatcher 25 ms，artifacts/storage-ui-release 截圖；選取其他實例時清掉上一項結果文字，避免誤讀。
 - **PASS**：`dotnet run --project tests/WindowSocks.Desktop.PerformanceChecks -c Release -- --sandbox-ui`，三開／十列、安裝、選線、取消、批量與右鍵啟動回歸，另驗證右鍵移除開啟正確實例、關窗不刪除。開窗 1033 ms，dispatcher 31 ms。
 - **PASS**：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-PacketPathPerformance.ps1 -OutputDirectory artifacts/packet-path-0.1.33`，157644 assertions，未開 capture handle。
-- **待記錄**：完整 dotnet test、完整建置套件與雜湊結果。
+- **PASS**：`scripts/Build-Package.ps1 -PayloadDirectory artifacts/release-payload-0.1.33 -OutputDirectory artifacts/release/0.1.33`，exit 0。流程先重建 native，再跑完整 dotnet test：**472/472，0 FAIL、0 skip，3 分 16 秒**（core-tests.trx）。其後建置所有產品與安裝包；354 檔版本及內容 hash 核對通過，ZIP 355 entries，禁止項目 0，最終 Setup `--verify-payload` exit 0，未安裝。
+- **PASS**：交付程式複製到 `C:\SOCKS5 Client\artifacts\local-sandbox-0.1.33`，執行該目錄 `WindowSocks.Tools.exe verify-release <目錄> 0.1.33`：354 檔通過。Core ProductVersion 為 `0.1.33+3391fbfb262be0a95aaf807369a107d831788693`，符合產品提交。
+- **PASS**：交付套件複製到 `C:\SOCKS5 Client\artifacts\release\0.1.33`，逐一核對來源與交付目錄 SHA-256 相同。`artifacts/delivery-hashes.json` 保存結果。首次讀 SHA256SUMS 時 Setup 驗證仍進行、檔案尚未產生；等待建置 exit 0 後才執行正式核對，沒有略過任何驗證。
+
+## 本機交付
+
+產品來源提交：`3391fbfb262be0a95aaf807369a107d831788693`。建置後提交僅更新本驗證文件，不改產品或已核對的套件。提交白名單 24 檔，禁止路徑 0、私密樣式 0，`git diff --cached --check` 通過；沒有 push/tag/草稿/發布。
+
+| 交付檔 | Bytes | SHA-256 |
+|---|---:|---|
+| xa-sk5-Setup-0.1.33.exe | 123416576 | AE5961B4740607522067E7B20673C2595C9B9C74EB2DBB7E834937BA1B81B53E |
+| xa-sk5-0.1.33-win-x64.zip | 73159123 | AA37B27571003E5F66AFDF3859F9F93F5BFC0F798FD3C29F4CA93D1657C1A922 |
+
+靜態核對固定版 Sandboxie 的 [Process_Enumerate](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/core/drv/process_api.c) 與 [SbieIni query](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/apps/ini/query.c)：程序列舉依既有程序的盒名篩選，不要求盒設定仍存在；因此移除 section 後仍能再次核對成員數。query 未加 /boxes 可列出停用盒，Enabled 值為逐行輸出。此核對支持完成順序設計，不能代替下列實機驗收。
 
 ## 實機驗收清單（NOT RUN）
 
