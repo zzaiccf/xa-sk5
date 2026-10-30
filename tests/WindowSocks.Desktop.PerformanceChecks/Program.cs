@@ -33,7 +33,7 @@ internal static partial class Program
         SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
         int exit = 1;
         Dispatcher.CurrentDispatcher.BeginInvoke(new Action(async () => {
-            try { if (Environment.GetCommandLineArgs().Contains("--sandbox-ui")) await RunSandboxUi(); else if (Environment.GetCommandLineArgs().Contains("--line-capacities")) await RunLineCapacities(); else if (Environment.GetCommandLineArgs().Contains("--unified-program-rules")) RunUnifiedProgramRules(); else if (Environment.GetCommandLineArgs().Contains("--global-duration")) await RunGlobalDuration(); else if (Environment.GetCommandLineArgs().Contains("--tray-behavior")) await RunTrayBehavior(); else if (Environment.GetCommandLineArgs().Contains("--bulk-actions")) await RunBulkActions(); else await Run(); exit = 0; }
+            try { if (Environment.GetCommandLineArgs().Contains("--sandbox-storage")) await RunSandboxStorage(); else if (Environment.GetCommandLineArgs().Contains("--sandbox-ui")) await RunSandboxUi(); else if (Environment.GetCommandLineArgs().Contains("--line-capacities")) await RunLineCapacities(); else if (Environment.GetCommandLineArgs().Contains("--unified-program-rules")) RunUnifiedProgramRules(); else if (Environment.GetCommandLineArgs().Contains("--global-duration")) await RunGlobalDuration(); else if (Environment.GetCommandLineArgs().Contains("--tray-behavior")) await RunTrayBehavior(); else if (Environment.GetCommandLineArgs().Contains("--bulk-actions")) await RunBulkActions(); else await Run(); exit = 0; }
             catch (Exception ex) { Console.Error.WriteLine(ex); }
             finally { Dispatcher.CurrentDispatcher.InvokeShutdown(); }
         }));
@@ -132,7 +132,7 @@ internal static partial class Program
         var host = new ContentControl { Content = content, Width = width, Height = height, HorizontalContentAlignment = HorizontalAlignment.Stretch, VerticalContentAlignment = VerticalAlignment.Stretch, FontFamily = new FontFamily("Microsoft JhengHei UI"), FontSize = 13, Foreground = (Brush)System.Windows.Application.Current.FindResource("Ink") };
         var surface = new Border { Child = host, Background = (Brush)System.Windows.Application.Current.FindResource("Canvas") };
         surface.Measure(new Size(width, height)); surface.Arrange(new Rect(0, 0, width, height)); surface.UpdateLayout();
-        var save = (Button)(window.FindName("SaveRuleButton") ?? window.FindName("PrepareButton")); var point = save.TransformToAncestor(surface).Transform(new Point());
+        var save = (Button)(window.FindName("SaveRuleButton") ?? window.FindName("PrepareButton") ?? window.FindName("RemoveStorageButton")); var point = save.TransformToAncestor(surface).Transform(new Point());
         Check(point.X >= 0 && point.Y >= 0 && point.X + save.ActualWidth <= width && point.Y + save.ActualHeight <= height, "Save button was clipped.");
         var image = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32); image.Render(surface);
         var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(image)); using (var file = File.Create(Path.Combine(Output, name))) png.Save(file);
@@ -173,6 +173,20 @@ internal static partial class Program
         public SandboxInstanceProfile[]? PreparedProfiles;
         public SandboxieSetupState EnvironmentStatus = new(true, false, "合成：已安裝");
         public int Installs;
+        public SandboxStorageEntry[] StorageEntries = [];
+        public TaskCompletionSource? StorageScanWait;
+        public int StorageScanCalls, RemovalCalls;
+        public Guid? RemovedId;
+        public bool DeletedFiles, WaitForRemoval, FailRemoval;
+        public override async Task<SandboxStorageEntry[]> SandboxStorageSnapshot(CancellationToken ct) {
+            StorageScanCalls++; if (StorageScanWait is { } wait) await wait.Task.WaitAsync(ct); return StorageEntries;
+        }
+        public override async Task RemoveSandboxData(SandboxInstanceProfile profile, bool deleteFiles, IProgress<string>? progress, CancellationToken ct) {
+            RemovalCalls++; RemovedId = profile.Id; DeletedFiles = deleteFiles;
+            if (WaitForRemoval) await Task.Delay(Timeout.Infinite, ct);
+            if (FailRemoval) throw new IOException("合成：檔案仍被占用");
+            StorageEntries = deleteFiles ? StorageEntries.Where(r => r.Profile?.Id != profile.Id).ToArray() : StorageEntries.Select(r => r.Profile?.Id == profile.Id ? r with { Registered = false } : r).ToArray();
+        }
         public override Task<SandboxieSetupState> SandboxEnvironment(CancellationToken ct) => Task.FromResult(EnvironmentStatus);
         public override Task EnsureSandboxInstalled(IProgress<UpdateProgress>? progress, CancellationToken ct) { Installs++; EnvironmentStatus = new(true, false, "合成：安裝完成"); return Task.CompletedTask; }
         public override Task<SandboxInstanceProfile[]> ResumeSandboxPreparation(string source, Guid[] proxies, SandboxInstanceProfile[] existing, CancellationToken ct) => Task.FromResult(SandboxPreparation.Resume(source, proxies, existing, Path.Combine(Output, "drafts")));

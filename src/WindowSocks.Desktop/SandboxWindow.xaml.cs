@@ -162,6 +162,14 @@ public partial class SandboxWindow : Window
     private async void StartAll(object sender, RoutedEventArgs e) => await Work(ct => LaunchProfiles(CurrentProfiles(), ct));
     private async void StopSelected(object sender, RoutedEventArgs e) { if (Instances.SelectedItem is InstanceRow row) await Work(_ => backend.StopSandbox(row.Profile.Id)); }
     private async void RefreshClick(object sender, RoutedEventArgs e) => await RefreshState();
+    private async void ManageStorage(object sender, RoutedEventArgs e)
+    {
+        if (busy) return;
+        var before = CurrentProfiles().Select(p => p.Id).ToArray();
+        var dialog = new SandboxStorageWindow(backend, (Instances.SelectedItem as InstanceRow)?.Profile.Id) { Owner = this };
+        dialog.ShowDialog(); await RefreshState();
+        if (!before.SequenceEqual(CurrentProfiles().Select(p => p.Id))) LoadAssignments();
+    }
     private void CancelPreparation(object sender, RoutedEventArgs e) => operation?.Cancel();
     private void CloseWindow(object sender, RoutedEventArgs e) => Close();
     private async void Browse(object sender, RoutedEventArgs e) {

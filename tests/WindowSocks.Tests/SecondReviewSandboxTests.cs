@@ -36,6 +36,44 @@ public sealed class SecondReviewSandboxTests : IDisposable
         Assert.True(new ConfigStore(root).Load().SandboxInstances.Single(x=>x.Id==a.Id).Enabled);
         runtime.Members=[];
     }
+    [Fact] public async Task CleanupReservationIsDurableAndPreventsRearmingOrOrdinaryRemoval(){
+        Setup();await WaitInitialization();
+        var begin=await controller.Dispatch(Command.Create("beginSandboxRemoval",new SandboxRequest(b.Id)),default);
+        Assert.True(begin.Ok,begin.Error);
+        var saved=new ConfigStore(root).Load().SandboxInstances.Single(p=>p.Id==b.Id);
+        Assert.True(saved.RemovalPending);Assert.False(saved.Enabled);
+        foreach(string action in new[]{"armSandbox","removeSandbox"}){
+            var reply=await controller.Dispatch(Command.Create(action,new SandboxRequest(b.Id)),default);
+            Assert.False(reply.Ok);Assert.Contains("清理",reply.Error);
+        }
+        Assert.True((await controller.Dispatch(Command.Create("beginSandboxRemoval",new SandboxRequest(b.Id)),default)).Ok);
+        Assert.True((await controller.Dispatch(Command.Create("finishSandboxRemoval",new {Id=b.Id,DeleteFiles=false}),default)).Ok);
+        Assert.DoesNotContain(new ConfigStore(root).Load().SandboxInstances,p=>p.Id==b.Id);
+        Assert.Contains(new ConfigStore(root).Load().SandboxInstances,p=>p.Id==a.Id);
+    }
+    [Fact] public async Task CleanupRejectsRunningMemberAndProtectsPendingProfileAfterRestart(){
+        Setup();await WaitInitialization();
+        runtime.Members=[new(LdPlayer.Identity(Environment.ProcessId)!.Value,b.BoxName,WindowsIdentity.GetCurrent().User!.Value,1)];
+        var running=await controller.Dispatch(Command.Create("beginSandboxRemoval",new SandboxRequest(b.Id)),default);
+        Assert.False(running.Ok);Assert.False(new ConfigStore(root).Load().SandboxInstances.Single(p=>p.Id==b.Id).RemovalPending);
+        runtime.Members=[];
+        Assert.True((await controller.Dispatch(Command.Create("beginSandboxRemoval",new SandboxRequest(b.Id)),default)).Ok);
+        controller.Dispose();controller=new(root,sandboxRuntime:runtime,engineLifecycle:new Engine(),sandboxFirewall:firewall,discoverSandboxImages:ps=>ps.Select(p=>p.LauncherPath).ToArray());await WaitInitialization();
+        foreach(var command in new[]{Command.Create("armSandbox",new SandboxRequest(b.Id)),Command.Create("saveSandbox",b),Command.Create("deleteRule",new DeleteRuleRequest(b.TargetKey))}) {
+            var result=await controller.Dispatch(command,default);Assert.False(result.Ok);Assert.Contains("清理",result.Error);
+        }
+    }
+    [Fact] public async Task CleanupCannotFinishPermanentRemovalWhileFilesRemain(){
+        Setup();await WaitInitialization();
+        string folder=Path.Combine(root,b.Id.ToString("N"));Directory.CreateDirectory(Path.Combine(folder,"Game"));
+        var p=b with {WorkingDirectory=Path.Combine(folder,"Game"),FileRoot=Path.Combine(folder,"Box"),LauncherPath=Path.Combine(folder,"Game","Launcher.exe")};
+        var config=(SavedConfig)typeof(Controller).GetField("config",BindingFlags.NonPublic|BindingFlags.Instance)!.GetValue(controller)!;
+        config.SandboxInstances=config.SandboxInstances.Select(x=>x.Id==b.Id?p:x).ToList();
+        Assert.True((await controller.Dispatch(Command.Create("beginSandboxRemoval",new SandboxRequest(b.Id)),default)).Ok);
+        var finish=await controller.Dispatch(Command.Create("finishSandboxRemoval",new SandboxRemovalRequest(b.Id,true)),default);
+        Assert.False(finish.Ok);Assert.Contains("副本資料",finish.Error);
+        Assert.True(new ConfigStore(root).Load().SandboxInstances.Single(x=>x.Id==b.Id).RemovalPending);
+    }
     [Theory][InlineData("saveSandbox")][InlineData("removeSandbox")][InlineData("deleteRule")]
     public async Task N3_DiscoveryDoesNotHoldGate(string command){
         Setup();await WaitInitialization();

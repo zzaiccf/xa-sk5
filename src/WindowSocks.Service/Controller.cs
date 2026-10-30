@@ -120,7 +120,11 @@ public sealed partial class Controller : IDisposable
         if (cmd.Action == "snapshot") return Volatile.Read(ref cachedSnapshot);
         if(cmd.Action=="deleteRule"&&Json.Read<DeleteRuleRequest>(cmd.Data).Key is var ruleKey&&ruleKey.StartsWith("sandbox:",StringComparison.Ordinal)&&Guid.TryParseExact(ruleKey[8..],"N",out var boxId))
             cmd=Command.Create("removeSandbox",new SandboxRequest(boxId));
-        if(cmd.Action is "saveSandbox" or "removeSandbox"){
+        if(cmd.Action == "beginSandboxRemoval") {
+            try {return Reply.Success(await BeginSandboxRemoval(Json.Read<SandboxRequest>(cmd.Data).Id,ct));}
+            catch(Exception ex) when(ex is not OutOfMemoryException){return Reply.Failure(ex.Message);}
+        }
+        if(cmd.Action is "saveSandbox" or "removeSandbox" or "finishSandboxRemoval"){
             try {await MutateSandboxOutsideGate(cmd,ct);return Reply.Success(true);}
             catch(Exception ex) when(ex is not OutOfMemoryException){return Reply.Failure(ex.Message);}
         }
@@ -874,7 +878,7 @@ public sealed partial class Controller : IDisposable
         var visibleProbes = probes.Values.Where(p => !probeViews.ContainsKey(p.ProxyId)).Concat(probeViews.Values).ToArray();
         return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), visibleTargets, visibleProbes, statuses,
             new(true, NativeEngine.DriverPresent, NativeEngine.Present, running, AppReleasePackage.CurrentVersion + " 預覽版", NativeEngine.DriverPresent ? engineError : "缺少 WinDivert 驅動，未啟用攔截。", logs.ToArray()))
-            { SupportsSandboxInstances = NativeEngine.SupportsSandboxGuards, SupportsSandboxSafety = NativeEngine.SupportsP0RoutingSafety, SupportsSandboxExperience = true, SandboxInstances = config.SandboxInstances.ToArray(), SandboxStatuses = SandboxStatuses(), SupportsBulkActions = true, SupportsProxyCapacities = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyConnectedAt = globalSession.ConnectedAt, GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
+            { SupportsSandboxInstances = NativeEngine.SupportsSandboxGuards, SupportsSandboxSafety = NativeEngine.SupportsP0RoutingSafety, SupportsSandboxExperience = true, SupportsSandboxRemoval = true, SandboxInstances = config.SandboxInstances.ToArray(), SandboxStatuses = SandboxStatuses(), SupportsBulkActions = true, SupportsProxyCapacities = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyConnectedAt = globalSession.ConnectedAt, GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
     }
     private uint GlobalPolicyState() => !config.GlobalProxy.Enabled ? 0u : Healthy(config.GlobalProxy.ProxyId) ? 1u : 2u;
     private string GlobalStatus()

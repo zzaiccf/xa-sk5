@@ -27,6 +27,17 @@ public static class SandboxPreparation
             throw new IOException($"{drive} 空間不足，所選副本尚需約 {Math.Ceiling(bytes / 1073741824d)} GB（含預留空間）。");
     }
     public const int MaximumInstances = 10;
+    public static void ForgetDraft(SandboxInstanceProfile profile, string? preparationDirectory = null)
+    {
+        string folder = preparationDirectory ?? Path.Combine(SandboxInstances.StorageRoot, "Preparation");
+        string key = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(profile.SourceLauncherPath).ToUpperInvariant())));
+        string file = Path.Combine(folder, key + ".json");
+        AppReleasePackage.RejectLinks(file);
+        if (!File.Exists(file)) return;
+        if (new FileInfo(file).Length > 128 * 1024) throw new IOException("準備紀錄過大，未修改。");
+        var pending = JsonSerializer.Deserialize<SandboxInstanceProfile[]>(File.ReadAllText(file), Json.Options) ?? [];
+        SandboxStorage.WriteJson(file, pending.Where(p => p.Id != profile.Id).ToArray());
+    }
     public static void ValidateBatch(SandboxInstanceProfile[] profiles)
     {
         if (profiles.Length is < 1 or > MaximumInstances) throw new InvalidOperationException("請選擇 1–10 個沙盒實例。");
@@ -76,6 +87,9 @@ public static class SandboxPreparation
             throw new InvalidOperationException("副本必須位於 xa sk5 專用沙盒目錄。");
         if (new DirectoryInfo(source).Attributes.HasFlag(FileAttributes.ReparsePoint)) throw new InvalidOperationException("來源目錄不可使用重新解析點。");
         AppReleasePackage.RejectLinks(profile.WorkingDirectory); AppReleasePackage.RejectLinks(profile.FileRoot);
+        string instanceRoot = new SandboxStorage().InstanceRoot(profile);
+        Directory.CreateDirectory(instanceRoot);
+        SandboxStorage.WriteJson(Path.Combine(instanceRoot, "instance.json"), profile);
         string manifest = Path.Combine(Path.GetDirectoryName(profile.WorkingDirectory)!, "prepared.json");
         if (File.Exists(manifest) && File.Exists(profile.LauncherPath)) {
             progress?.Report(profile.Name + " · 保留已準備的副本與遊戲更新，套用設定…");

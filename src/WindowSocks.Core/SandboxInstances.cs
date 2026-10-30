@@ -19,6 +19,7 @@ public sealed record SandboxInstanceProfile
     public string FileRoot { get; init; } = "";
     public Guid ProxyId { get; init; }
     public bool Enabled { get; init; }
+    public bool RemovalPending { get; init; }
     public bool SimulateAdmin { get; init; }
     public bool? IsolateDeviceIdentity { get; init; }
     public string TargetKey => "sandbox:" + Id.ToString("N");
@@ -28,6 +29,7 @@ public sealed record SandboxInstanceStatus(Guid Id, string State, string Detail,
     public SandboxNetworkReport? Network { get; init; }
 }
 public sealed record SandboxRequest(Guid Id);
+public sealed record SandboxRemovalRequest(Guid Id, bool DeleteFiles);
 public sealed record SandboxLaunchTicket(SandboxInstanceProfile Instance, string Token);
 public sealed record SandboxRegistration(Guid Id, string Token, ProcessIdentity Process);
 public sealed record SandboxLaunchReport(Guid Id, bool Started, string Detail);

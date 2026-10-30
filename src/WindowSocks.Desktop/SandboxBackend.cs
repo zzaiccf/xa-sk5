@@ -70,6 +70,7 @@ public partial class Backend
     {
         var state = await SandboxSnapshot(ct).ConfigureAwait(false);
         var profile = state.SandboxInstances.Single(p => p.Id == id);
+        if (profile.RemovalPending) throw new InvalidOperationException("此實例正在清理，請到儲存空間頁完成移除。");
         var current = state.SandboxStatuses.FirstOrDefault(s => s.Id == id);
         if (current is { Processes.Length: > 0 }) {
             if (current.State == "代理執行中") return;

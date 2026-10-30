@@ -537,6 +537,7 @@ public partial class MainWindow : Window
         else {
             contextRuleKey = item.Key; ContextDeleteRule.IsEnabled = !busy;
             bool sandbox = snapshot?.SandboxInstances.Any(p => p.TargetKey == item.Key) == true;
+            ContextDeleteRule.Header = sandbox ? "移除實例／清理資料…" : "刪除此規則";
             ContextStartSandbox.Visibility = ContextStartSandboxGroup.Visibility = ContextStopSandbox.Visibility = sandbox ? Visibility.Visible : Visibility.Collapsed;
             ContextStartSandbox.IsEnabled = ContextStartSandboxGroup.IsEnabled = ContextStopSandbox.IsEnabled = !backend.SandboxLaunchBusy;
         }
@@ -545,6 +546,9 @@ public partial class MainWindow : Window
     private async void DeleteRuleClick(object sender, RoutedEventArgs e)
     {
         string? key = contextRuleKey; if (key is null) return;
+        if (key.StartsWith("sandbox:", StringComparison.Ordinal) && Guid.TryParseExact(key[8..], "N", out var id)) {
+            var dialog = new SandboxStorageWindow(backend, id) { Owner = this }; dialog.ShowDialog(); await Run("", () => Refresh(false, skipDiscovery: true), showError: false); return;
+        }
         await Run("正在刪除規則…", async () => { await backend.DeleteRule(key); await Refresh(false, skipDiscovery: true); StatusText.Text = "規則已刪除。"; });
     }
     private void Navigate(object sender, RoutedEventArgs e)

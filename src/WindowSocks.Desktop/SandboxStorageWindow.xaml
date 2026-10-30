@@ -1,0 +1,17 @@
+<Window x:Class="WindowSocks.Desktop.SandboxStorageWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Style="{StaticResource {x:Type Window}}" Title="沙盒儲存空間與移除" Width="980" Height="730" MinWidth="800" MinHeight="650" WindowStartupLocation="CenterOwner">
+ <Grid Margin="24"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <StackPanel Margin="0,0,0,14"><TextBlock Text="沙盒儲存空間與移除" FontSize="24" FontWeight="SemiBold"/><TextBlock Text="列出已保存實例、保留資料及準備中斷的副本。原始遊戲與其他實例不在清理範圍。" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,6,0,6"/><DockPanel><Button x:Name="RefreshStorageButton" Content="重新掃描" Click="RefreshClick" DockPanel.Dock="Right"/><TextBlock x:Name="StorageSummary" Text="正在背景計算資料大小…" VerticalAlignment="Center" TextWrapping="Wrap"/></DockPanel></StackPanel>
+  <DataGrid Grid.Row="1" x:Name="StorageRows" IsReadOnly="True" SelectionMode="Single" SelectionChanged="SelectionChanged"><DataGrid.Columns>
+   <DataGridTextColumn Header="實例" Binding="{Binding Name}" Width="1.2*"/><DataGridTextColumn Header="資料大小" Binding="{Binding Size}" Width="170"/><DataGridTextColumn Header="狀態" Binding="{Binding State}" Width="1.6*"/><DataGridTextColumn Header="資料位置" Binding="{Binding Path}" Width="2*"/>
+  </DataGrid.Columns></DataGrid>
+  <Border Grid.Row="2" Style="{StaticResource Card}" Padding="16" Margin="0,14,0,0"><StackPanel>
+   <TextBlock x:Name="SelectedName" FontWeight="SemiBold" Text="請先選取實例"/>
+   <TextBox x:Name="SelectedPath" IsReadOnly="True" TextWrapping="Wrap" Margin="0,6,0,6"/>
+   <RadioButton x:Name="KeepFiles" Content="只移除設定，保留副本與沙盒資料（仍占用空間，可稍後清理）" IsChecked="True" Checked="ModeChanged" Margin="0,4"/>
+   <RadioButton x:Name="DeleteFiles" Content="移除設定，並永久刪除這個實例的遊戲副本與沙盒資料" Checked="ModeChanged" Margin="0,4"/>
+   <CheckBox x:Name="ConfirmPermanent" Content="我了解副本內的存檔、更新與資料會永久刪除，不會進入資源回收筒。" IsEnabled="False" Checked="ModeChanged" Unchecked="ModeChanged" Margin="20,6,0,4"/>
+   <TextBlock Text="請先正常關閉遊戲並停止選取實例。清理失敗或取消時保留紀錄，下次可重新掃描後重試。資料大小為檔案總量，實際釋放空間依檔案系統而異。" TextWrapping="Wrap" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,6,0,0"/>
+  </StackPanel></Border>
+  <StackPanel Grid.Row="3" Margin="0,14,0,0"><TextBlock x:Name="StorageProgress" TextWrapping="Wrap" MaxHeight="70"/><WrapPanel HorizontalAlignment="Right" Margin="0,8,0,0"><Button x:Name="RemoveStorageButton" Content="移除選取實例" Click="RemoveClick" IsEnabled="False"/><Button x:Name="CancelStorageButton" Content="取消工作" Click="CancelClick" IsEnabled="False"/><Button Content="關閉" Click="CloseClick"/></WrapPanel></StackPanel>
+ </Grid>
+</Window>

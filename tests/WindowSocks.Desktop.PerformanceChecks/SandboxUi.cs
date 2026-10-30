@@ -127,6 +127,11 @@ internal static partial class Program
             launch = await Editor<SandboxLaunchWindow>();
             launch.Close();
             Check(fixture.Saves == 0, "Launch changed automatic rules.");
+            backend.StorageEntries = [new(a, System.IO.Path.GetDirectoryName(a.WorkingDirectory)!, 123, true, "")];
+            Invoke(main, "DeleteRuleClick"); var storage = await Editor<SandboxStorageWindow>();
+            await Until(() => ((DataGrid)storage.FindName("StorageRows")).SelectedItem is SandboxStorageEntry);
+            Check(((SandboxStorageEntry)((DataGrid)storage.FindName("StorageRows")).SelectedItem).Profile?.Id == a.Id, "Right-click removal selected the wrong instance.");
+            storage.Close(); Check(backend.RemovalCalls == 0 && fixture.Saves == 0, "Closing removal dialog deleted a rule.");
         } finally {
             fixture.Discovery.TrySetResult([]);
             typeof(MainWindow).GetField("quitting", Private)!.SetValue(main, true); main.Close();

@@ -17,13 +17,13 @@
      </Grid>
     </DataTemplate></ItemsControl.ItemTemplate></ItemsControl></ScrollViewer>
     <WrapPanel Margin="0,8,0,5"><Button x:Name="AddInstanceButton" Content="＋ 新增實例" Click="AddInstance"/><Button x:Name="RemoveDraftButton" Content="移除最後新增" Click="RemoveDraft"/><TextBlock x:Name="InstanceCountText" VerticalAlignment="Center" Margin="8,0,0,0"/></WrapPanel>
-    <TextBlock Text="已保存實例會保留身分與線路；要刪除已保存實例，請到規則管理操作。全程式最多管理 10 個實例。" FontSize="11" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,0,0,12"/>
+    <TextBlock Text="已保存實例會保留身分與線路；要刪除已保存實例，請用「移除實例／儲存空間」。全程式最多管理 10 個實例。" FontSize="11" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,0,0,12"/>
     <CheckBox x:Name="SimulateAdmin" Content="模擬管理員相容模式（適用需要管理員權限的登入器）" Margin="0,0,0,12"/>
     <WrapPanel><Button x:Name="PrepareButton" Content="3. 準備環境／保存" Style="{StaticResource PrimaryButton}" Click="Prepare"/><Button x:Name="CancelWork" Content="取消目前工作" Click="CancelPreparation" IsEnabled="False"/></WrapPanel>
     <TextBlock Text="每個實例各有一份遊戲副本，完成後不必重建。可取消並接續；原始遊戲不變。保存前請先停止此遊戲的所有實例。" TextWrapping="Wrap" FontSize="11" Foreground="{StaticResource Muted}" Margin="0,10,0,0"/>
    </StackPanel></Border>
    <WrapPanel Margin="0,16,0,8"><TextBlock Text="批量間隔" VerticalAlignment="Center"/><TextBox x:Name="LaunchInterval" Text="10" Width="55" Margin="8,0"/><TextBlock Text="秒（上一個完成後再等候）" VerticalAlignment="Center"/></WrapPanel>
-   <WrapPanel Margin="0,0,0,12"><Button x:Name="StartSelectedButton" Content="啟動選取實例" Click="StartSelected"/><Button x:Name="StartAllButton" Content="批量啟動此遊戲" Click="StartAll"/><Button x:Name="StopButton" Content="停止選取實例" Click="StopSelected"/><Button Content="重新整理" Click="RefreshClick"/></WrapPanel>
+   <WrapPanel Margin="0,0,0,12"><Button x:Name="StartSelectedButton" Content="啟動選取實例" Click="StartSelected"/><Button x:Name="StartAllButton" Content="批量啟動此遊戲" Click="StartAll"/><Button x:Name="StopButton" Content="停止選取實例" Click="StopSelected"/><Button Content="移除實例／儲存空間" Click="ManageStorage"/><Button Content="重新整理" Click="RefreshClick"/></WrapPanel>
    <TextBlock Text="準備完成後，也可回到「規則管理」右鍵實例 → 啟動。已在執行的實例會略過；遊戲帳密仍在遊戲視窗輸入。" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,0,0,10"/>
    <DataGrid x:Name="Instances" Height="190" SelectionMode="Single" IsReadOnly="True"><DataGrid.RowStyle><Style TargetType="DataGridRow"><Setter Property="ToolTip" Value="{Binding Detail}"/></Style></DataGrid.RowStyle><DataGrid.Columns>
     <DataGridTextColumn Header="實例" Binding="{Binding Profile.Name}" Width="140" ElementStyle="{StaticResource CellText}"/>

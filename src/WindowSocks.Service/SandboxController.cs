@@ -54,6 +54,12 @@ public sealed partial class Controller
         try{
             if(stopping||sandboxStopping)throw new InvalidOperationException("服務正在停止沙盒。");
             profile=saving?Json.Read<SandboxInstanceProfile>(command.Data):SandboxProfile(Json.Read<SandboxRequest>(command.Data).Id);
+            if(config.SandboxInstances.FirstOrDefault(p=>p.Id==profile.Id)?.RemovalPending==true && command.Action!="finishSandboxRemoval")throw new InvalidOperationException("此實例正在清理，請從儲存空間頁重試完成。");
+            if(saving&&profile.RemovalPending)throw new InvalidOperationException("不可由保存設定建立清理狀態。");
+            if(command.Action=="finishSandboxRemoval") {
+                if(!profile.RemovalPending)throw new InvalidOperationException("尚未保留清理工作。");
+                if(Json.Read<SandboxRemovalRequest>(command.Data).DeleteFiles && (Directory.Exists(Path.GetDirectoryName(profile.WorkingDirectory)!) || File.Exists(Path.GetDirectoryName(profile.WorkingDirectory)!)))throw new IOException("仍有副本資料，保留清理紀錄以供重試。");
+            }
             SandboxInstances.Validate(profile);revision=sandboxMembershipRevision;
             next=config.SandboxInstances.Where(p=>p.Id!=profile.Id).Concat(saving?[profile]:Array.Empty<SandboxInstanceProfile>()).ToArray();
         }finally{Gate.Release();}
@@ -98,6 +104,22 @@ public sealed partial class Controller
         } finally{sandboxPoll.Release();}
     }
     private ISandboxRuntime SandboxRuntime => sandboxRuntime;
+    private async Task<SandboxInstanceProfile> BeginSandboxRemoval(Guid id,CancellationToken ct)
+    {
+        SandboxInstanceProfile profile;long revision;
+        await Gate.WaitAsync(ct);
+        try {if(stopping||sandboxStopping)throw new InvalidOperationException("服務正在停止。");profile=SandboxProfile(id);revision=sandboxMembershipRevision;if(sandboxTickets.ContainsKey(id))throw new InvalidOperationException("請先停止正在啟動的沙盒。");}
+        finally{Gate.Release();}
+        if(await Task.Run(()=>SandboxRuntime.Processes(profile.BoxName).Length>0,ct))throw new InvalidOperationException("沙盒仍在執行，請先正常關閉遊戲並停止此實例，再移除。");
+        await Gate.WaitAsync(ct);
+        try {
+            if(stopping||sandboxStopping||revision!=sandboxMembershipRevision||sandboxTickets.ContainsKey(id))throw new InvalidOperationException("實例狀態已變更，未開始清理。");
+            var pending=profile with{Enabled=false,RemovalPending=true};
+            var next=config with {SandboxInstances=config.SandboxInstances.Select(p=>p.Id==id?pending:p).ToList(),Bindings=config.Bindings.Select(b=>b.TargetKey==profile.TargetKey?b with{Enabled=false}:b).ToList()};
+            store.Save(next);config.SandboxInstances=next.SandboxInstances;config.Bindings=next.Bindings;sandboxMembershipRevision++;
+            ApplyRules();return pending;
+        } finally {try{PublishSnapshot();}finally{Gate.Release();}}
+    }
     private string SandboxRoutingStamp() => System.Text.Json.JsonSerializer.Serialize(new {
         Bindings=config.Bindings.Where(b=>b.Kind=="Sandbox"),Profiles=config.SandboxInstances,
         Tickets=sandboxTickets.Where(t=>t.Value.Expires>handoffClock()).Select(t=>t.Key),Errors=sandboxErrors,
@@ -107,7 +129,7 @@ public sealed partial class Controller
     {
         SandboxInstanceProfile profile;SandboxInstanceProfile[] profiles;long revision;
         await Gate.WaitAsync(ct);
-        try { if(stopping||sandboxStopping)throw new InvalidOperationException("服務正在停止沙盒。");if(!sandboxFirewallReady)throw new InvalidOperationException("正在背景建立 WFP 防護，完成後即可啟動。");profile=SandboxProfile(id);profiles=config.SandboxInstances.ToArray();revision=sandboxMembershipRevision; }
+        try { if(stopping||sandboxStopping)throw new InvalidOperationException("服務正在停止沙盒。");profile=SandboxProfile(id);if(profile.RemovalPending)throw new InvalidOperationException("此實例正在清理，請先完成移除。");if(!sandboxFirewallReady)throw new InvalidOperationException("正在背景建立 WFP 防護，完成後即可啟動。");profiles=config.SandboxInstances.ToArray();revision=sandboxMembershipRevision; }
         finally { Gate.Release(); }
         await Task.Run(()=>SandboxRuntime.ValidateSettings(profile),ct).WaitAsync(TimeSpan.FromSeconds(1),ct);
         await Task.Run(()=>SandboxRuntime.VerifyCompatibility(),ct).WaitAsync(TimeSpan.FromSeconds(1),ct);
@@ -157,6 +179,7 @@ public sealed partial class Controller
     private SandboxLaunchTicket CommitSandboxArm(Guid id,bool running)
     {
         var profile = SandboxProfile(id); SandboxInstances.Validate(profile);
+        if(profile.RemovalPending)throw new InvalidOperationException("此實例正在清理，不能啟動。");
         ProxyOwnershipLedger.From(config,vmwareRuntime).Require(profile.ProxyId,profile.TargetKey,"Sandbox");
         sandboxIdentityUnavailable.Remove(id);
         if (!NativeEngine.SupportsP0RoutingSafety) throw new InvalidOperationException("桌面沙盒需要 0.1.31 原生核心的封包身分保護，請安裝／修復元件。");
@@ -366,7 +389,7 @@ public sealed partial class Controller
     }
     private SandboxInstanceStatus[] SandboxStatuses() => config.SandboxInstances.Select(p => {
         var binding = config.Bindings.FirstOrDefault(b => b.TargetKey == p.TargetKey); var members = binding?.Processes ?? [];
-        return new SandboxInstanceStatus(p.Id, !sandboxFirewallReady ? "正在建立 WFP 防護 · 沙盒暫停" : sandboxIdentityUnavailable.Contains(p.Id) ? "身分查詢不可用 · 已封鎖 · 自動重試" : members.Length > 0 && NativeEngine.Core_IsRunning() == 0 ? "代理核心未執行 · 請停止沙盒" : sandboxLaunchErrors.ContainsKey(p.Id) ? "啟動失敗 · 已封鎖" : sandboxErrors.ContainsKey(p.Id) ? binding?.Enabled==true ? "身分查詢重試 · 保留既有線路" : "沙盒身分查詢失敗 · 已封鎖" : sandboxTickets.ContainsKey(p.Id) ? "正在啟動" :
+        return new SandboxInstanceStatus(p.Id, p.RemovalPending ? "清理未完成 · 請重試移除" : !sandboxFirewallReady ? "正在建立 WFP 防護 · 沙盒暫停" : sandboxIdentityUnavailable.Contains(p.Id) ? "身分查詢不可用 · 已封鎖 · 自動重試" : members.Length > 0 && NativeEngine.Core_IsRunning() == 0 ? "代理核心未執行 · 請停止沙盒" : sandboxLaunchErrors.ContainsKey(p.Id) ? "啟動失敗 · 已封鎖" : sandboxErrors.ContainsKey(p.Id) ? binding?.Enabled==true ? "身分查詢重試 · 保留既有線路" : "沙盒身分查詢失敗 · 已封鎖" : sandboxTickets.ContainsKey(p.Id) ? "正在啟動" :
             members.Length == 0 ? "未啟動" : !p.Enabled ? "已暫停 · 已封鎖" : !Healthy(p.ProxyId) || DuplicateExit(p.ProxyId) ? "線路異常 · 已封鎖" : !sandboxNetworkChecks.ContainsKey(p.Id) ? "正在驗證出口" : "代理執行中",
             sandboxLaunchErrors.GetValueOrDefault(p.Id, sandboxErrors.GetValueOrDefault(p.Id, sandboxStages.GetValueOrDefault(p.Id, p.BoxName))), members) { Network = sandboxNetworkChecks.GetValueOrDefault(p.Id) };
     }).ToArray();
