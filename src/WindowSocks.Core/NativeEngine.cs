@@ -77,6 +77,15 @@ public static class NativeEngine
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern void Core_GetProcessStats(uint pid, ulong birth, out Traffic traffic, out uint tcp, out uint udp);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern uint Core_GetFlowEvents([Out] FlowEvent[] events, uint capacity);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern uint Core_RelayForTest(nuint accepted, nuint upstream, uint pid, ulong birth);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int Core_ReadRelayMetrics([Out] ulong[] values, uint capacity);
+    public static RelayPerformance? ReadRelayPerformance()
+    {
+        if (!Present) return null;
+        try {
+            var values = new ulong[5];
+            return Core_ReadRelayMetrics(values, (uint)values.Length) == values.Length ? new(values[0], values[1], values[2], values[3], values[4]) : null;
+        } catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException or BadImageFormatException) { return null; }
+    }
     public static FlowEvent[] FlowEvents()
     {
         if (!Present) return [];

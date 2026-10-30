@@ -240,8 +240,11 @@ static void telemetryChecks(){
     WIN32_FIND_DATAW entry{};HANDLE find=FindFirstFileW((directory+L"\\packet-*.jsonl").c_str(),&entry);unsigned count=0;
     if(find!=INVALID_HANDLE_VALUE){do{++count;}while(FindNextFileW(find,&entry));FindClose(find);}
     require(count==16,"rotation must retain only sixteen generated segments");require(GetFileAttributesW((directory+L"\\user-document.txt").c_str())!=INVALID_FILE_ATTRIBUTES,"rotation must preserve unrelated documents");
-    FILE* file=nullptr;_wfopen_s(&file,telemetryPath.c_str(),L"rb");require(file!=nullptr,"new telemetry segment must contain a record");char line[4096]{};bool written=fgets(line,sizeof(line),file)!=nullptr;fclose(file);
+    FILE* file=nullptr;_wfopen_s(&file,telemetryPath.c_str(),L"rb");require(file!=nullptr,"new telemetry segment must contain a record");char line[4096]{};bool written=fgets(line,sizeof(line),file)!=nullptr;
     require(written&&strstr(line,"\"native\":\"" XA_VERSION "\"")&&strstr(line,"\"ageMaxUs\""),"rotated record must include version and queue timing");
+    require(fgets(line,sizeof(line),file)!=nullptr&&strstr(line,"\"detail\":true"),"packet detail record must remain available");
+    require(fgets(line,sizeof(line),file)!=nullptr&&strstr(line,"\"relay\":true")&&strstr(line,"\"tcpQueueMaxUs\"")&&strstr(line,"\"tcpWouldBlock\"")&&strstr(line,"\"tcpStallTimeouts\""),"relay waiting and timeout counters must be persisted for remote diagnostics");
+    fclose(file);
     telemetryPath.clear();telemetryDirectory.clear();
     // Delete only files in this exact directory created above; no recursive move/delete.
     find=FindFirstFileW((directory+L"\\*").c_str(),&entry);if(find!=INVALID_HANDLE_VALUE){do{if(!(entry.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY))DeleteFileW((directory+L"\\"+entry.cFileName).c_str());}while(FindNextFileW(find,&entry));FindClose(find);}require(RemoveDirectoryW(directory.c_str())!=0,"isolated telemetry files must be cleaned up");

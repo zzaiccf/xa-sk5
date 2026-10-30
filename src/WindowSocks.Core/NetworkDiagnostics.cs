@@ -24,6 +24,11 @@ public sealed record DiagnosticBundle(DateTimeOffset At, string Version, bool En
     NetworkFlowEvent[] FlowEvents, string[] Logs, string Note)
 {
     public DriverCompatibility? Compatibility { get; init; }
+    public RelayPerformance? RelayPerformance { get; init; }
+}
+public sealed record RelayPerformance(ulong QueueSamples, ulong QueueMicroseconds, ulong QueueMaxMicroseconds, ulong WouldBlock, ulong StallTimeouts)
+{
+    public string Note => "本服務程序啟動後累計；Queue 為 TCP 轉送佇列停留時間（包含排程），不是遊戲 ping。WouldBlock 是暫時背壓次數，不是丟包。StallTimeouts 表示某方向約 5 秒無傳送進度。";
 }
 public sealed record DriverCompatibility(string Mode, bool DriverFilesPresent, bool EngineRunning,
     string DllVersion, string DriverSha256, string Signature, string Assessment);

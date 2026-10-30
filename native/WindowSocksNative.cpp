@@ -150,7 +150,8 @@ struct PacketMetrics {
     std::atomic<uint64_t> packets{0},bytes{0},impostor{0},loopback{0},icmp{0},batches{0},ownerQueries{0},ownerUs{0},ownerMaxUs{0},
         classifyUs{0},classifyMaxUs{0},sendUs{0},sendMaxUs{0},ageUs{0},ageMaxUs{0},ageSamples{0},unknown{0},overflow{0},parseErrors{0},
         routeUs{0},routeWaitUs{0},guardUs{0},guardWaitUs{0},ancestryWalks{0},ancestryUs{0},imageUs{0},parentQueries{0},parentErrors{0},
-        sendFailures{0},sendHostUnreachable{0},expiredImpostors{0},lastSendError{0};
+        sendFailures{0},sendHostUnreachable{0},expiredImpostors{0},lastSendError{0},
+        tcpQueueSamples{0},tcpQueueUs{0},tcpQueueMaxUs{0},tcpWouldBlock{0},tcpStallTimeouts{0};
 };
 static PacketMetrics packetMetrics;
 static std::wstring telemetryPath,telemetryDirectory;
@@ -184,6 +185,8 @@ static void saveTelemetry(){
         now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,now.wMilliseconds,GetCurrentProcessId(),m.packets.load(),m.bytes.load(),m.batches.load(),m.impostor.load(),m.loopback.load(),m.icmp.load(),m.ownerQueries.load(),m.ownerUs.load(),m.ownerMaxUs.load(),m.classifyUs.load(),m.classifyMaxUs.load(),m.sendUs.load(),m.sendMaxUs.load(),m.ageUs.load(),m.ageMaxUs.load(),m.ageSamples.load(),m.unknown.load(),m.overflow.load(),m.parseErrors.load());
     fprintf(file,"{\"utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"detail\":true,\"routeUs\":%llu,\"routeWaitUs\":%llu,\"guardUs\":%llu,\"guardWaitUs\":%llu,\"ancestryWalks\":%llu,\"ancestryUs\":%llu,\"imageUs\":%llu,\"parentQueries\":%llu,\"parentErrors\":%llu,\"sendFailures\":%llu,\"sendHostUnreachable\":%llu,\"expiredImpostors\":%llu,\"lastSendError\":%llu}\n",
         now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,now.wMilliseconds,m.routeUs.load(),m.routeWaitUs.load(),m.guardUs.load(),m.guardWaitUs.load(),m.ancestryWalks.load(),m.ancestryUs.load(),m.imageUs.load(),m.parentQueries.load(),m.parentErrors.load(),m.sendFailures.load(),m.sendHostUnreachable.load(),m.expiredImpostors.load(),m.lastSendError.load());
+    fprintf(file,"{\"utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"relay\":true,\"tcpQueueSamples\":%llu,\"tcpQueueUs\":%llu,\"tcpQueueMaxUs\":%llu,\"tcpWouldBlock\":%llu,\"tcpStallTimeouts\":%llu}\n",
+        now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,now.wMilliseconds,m.tcpQueueSamples.load(),m.tcpQueueUs.load(),m.tcpQueueMaxUs.load(),m.tcpWouldBlock.load(),m.tcpStallTimeouts.load());
     fclose(file);
 }
 static void lifecycleEvent(const char* phase){
@@ -582,31 +585,7 @@ static void udpWorker(std::shared_ptr<Flow> f) {
     }
     f->close();
 }
-static uint32_t tcpPump(std::shared_ptr<Flow> f,SOCKET accepted,SOCKET remote,bool managed,uint32_t& error) {
-    f->connected=true;trace(*f,Connected);
-    configure_tcp_socket(accepted,65536,5000);configure_tcp_socket(remote,65536,5000);
-    std::array<char,65536> buf{}; bool clientRead=true,proxyRead=true;
-    while((active||!managed)&&f->alive&&(!managed||stillBound(*f))&&(clientRead||proxyRead)) {
-        fd_set read;FD_ZERO(&read);if(clientRead)FD_SET(accepted,&read);if(proxyRead)FD_SET(remote,&read);timeval timeout{0,200000};
-        int ready=select(0,&read,nullptr,nullptr,&timeout);if(ready<0){error=WSAGetLastError();return SelectFailed;}if(!ready)continue;
-        if(clientRead&&FD_ISSET(accepted,&read)){
-            int n=recv(accepted,buf.data(),(int)buf.size(),0);
-            if(n==0){clientRead=false;f->connected=false;trace(*f,ClientEof);shutdown(remote,SD_SEND);}
-            else if(n<0){error=WSAGetLastError();return ClientReadFailed;}
-            else if(send_all(remote,buf.data(),n)!=n){error=WSAGetLastError();return SendToProxyFailed;}
-            else {f->sent+=n;count(f->rule.pid,n,0,0,f->rule.created);}
-        }
-        if(proxyRead&&FD_ISSET(remote,&read)){
-            int n=recv(remote,buf.data(),(int)buf.size(),0);
-            if(n==0){proxyRead=false;f->connected=false;trace(*f,UpstreamEof);shutdown(accepted,SD_SEND);}
-            else if(n<0){error=WSAGetLastError();return UpstreamReadFailed;}
-            else if(send_all(accepted,buf.data(),n)!=n){error=WSAGetLastError();return SendToClientFailed;}
-            else {f->received+=n;count(f->rule.pid,0,n,0,f->rule.created);}
-        }
-        f->last=GetTickCount64();
-    }
-    return !managed||clientRead==false&&proxyRead==false?Closed:active?PolicyClosed:EngineStopped;
-}
+#include "TcpRelay.h"
 static void tcpWorker(std::shared_ptr<Flow> f,SOCKET accepted) {
     f->client=accepted;bool local=localGatewayFlow(*f);auto cfg=config(f->rule.proxy);uint32_t destination=relayDestination(*f);
     SOCKET remote=local?openLocal(destination,f->key.dp):dial(cfg);f->upstream=remote;
@@ -621,6 +600,11 @@ static void tcpWorker(std::shared_ptr<Flow> f,SOCKET accepted) {
 API uint32_t Core_RelayForTest(SOCKET accepted,SOCKET remote,uint32_t pid,uint64_t birth) {
     auto f=std::make_shared<Flow>();f->rule.pid=pid;f->rule.created=birth;f->key.protocol=6;trace(*f,Captured);
     uint32_t error=0,reason=tcpPump(f,accepted,remote,false,error);f->close(reason,error);return reason;
+}
+API int Core_ReadRelayMetrics(uint64_t* values,uint32_t capacity) {
+    if(!values||capacity<5)return 0;
+    values[0]=packetMetrics.tcpQueueSamples.load();values[1]=packetMetrics.tcpQueueUs.load();values[2]=packetMetrics.tcpQueueMaxUs.load();
+    values[3]=packetMetrics.tcpWouldBlock.load();values[4]=packetMetrics.tcpStallTimeouts.load();return 5;
 }
 static void acceptLoop() {
     while(active) {
