@@ -24,7 +24,20 @@
 
 ## 發布前檢查
 
-完整 dotnet test、最終 package build／內嵌 payload 驗證、0.1.30→0.1.32 synthetic portable 更新、遠端附件 hash 核對：完成後在此追加結果。失敗時不得公開套件。
+**PASS**：原生建置後完整 `dotnet test`：456／456，3 分 18 秒；`full-native-ready.trx`。
+
+**PASS**：`scripts/Build-Package.ps1 -PayloadDirectory artifacts/release-payload-0.1.32 -OutputDirectory artifacts/release/0.1.32`。此正式流程再次執行完整測試，`core-tests.trx` 為 456 PASS、0 FAIL／skip。354 個 payload 檔案版本及 hash 核對通過；ZIP 共 355 entries（含 manifest），禁止項目 0。最終 Setup `--verify-payload` exit 0，未安裝產品。
+
+**PASS**：`scripts/Test-UpdateRelease.ps1 -PayloadDirectory artifacts/release-payload-0.1.32 -OldPayloadDirectory artifacts/update-baseline-0.1.30/payload -OutputDirectory artifacts/update-0.1.30-to-0.1.32`。在非管理員、獨立目錄執行真實 updater worker，synthetic settings 保留，serviceTouched=false；更新後 354 個檔案完整性與版本通過。
+
+產品建置來源：`fed788df20a3ff577ca4026409ccba80086115b8`；Core ProductVersion 為 `0.1.32+fed788df20a3ff577ca4026409ccba80086115b8`。後續驗證紀錄提交僅更新本文件，不改變產品原始碼或套件。
+
+| 交付檔 | Bytes | SHA-256 |
+|---|---:|---|
+| xa-sk5-Setup-0.1.32.exe | 123386368 | 39344A81354B9964D8770A745E945E0CAE5D1754F565681658F6DF029A86DC9C |
+| xa-sk5-0.1.32-win-x64.zip | 73136144 | 1A3B066B0E771A0D5116DDFFE83776ECBC063782ED0E1F65B0B4AC693E9275FD |
+
+發布使用明確的 release commit 作 `gh release create --target`，不使用預設 main 指向舊版本。僅上傳上述兩個附件；公開前核對遠端 digest、大小與 tag 指向，公開後再次核對 latest。完整遠端結果保存在本機 `artifacts/release-publication/`，成功後追加摘要。
 
 ## 實機限制與延後項目
 
