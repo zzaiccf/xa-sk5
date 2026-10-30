@@ -25,11 +25,24 @@
 - **PASS**：修正後 `scripts/Build-Native.ps1`，接著 `dotnet test tests/WindowSocks.Tests -c Release --filter FullyQualifiedName~RelayDiagnosticsTests --logger 'trx;LogFileName=relay-final.trx' --results-directory artifacts/test-results`：**10/10，0 skip**。反向訊息在下行壅塞 6.69 ms、上行壅塞 0.97 ms；只代表該次回送測試，不能換算遊戲速度。另驗證兩條與四條同時各方向約 512 KiB 的二進位資料一致、EOF、上游 RST、認證遮蔽、診斷序列化；持續壅塞 5.02 秒回報正確傳送逾時與計數。
 - **PASS**：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-PacketPathPerformance.ps1 -OutputDirectory artifacts/packet-path-0.1.34`：**157646 assertions**，沒有開 capture handle。保留封包路徑／規則／PID／生命週期回歸，另驗證輪替日誌仍包含 detail 及新增 relay 欄位。證據 `artifacts-packet-path.log`、`artifacts/packet-path-0.1.34/result.txt`。
 - **PASS**：複製已核對官方 WinDivert 快取至本工作樹；DLL SHA-256 `C1E060EE19444A259B2162F8AF0F3FE8C4428A1C6F694DCE20DE194AC8D7D9A2`；SYS `8DA085332782708D8767BCACE5327A6EC7283C17CFB85E40B03CD2323A90DDC2`，Authenticode Valid。只提供建置與 parser 測試，不啟用驅動。
-- **PENDING**：完整 dotnet test、建置安裝包／可攜 ZIP、版本與 SHA-256 核對在產品提交後執行，完成後補寫結果。
+- **PASS**：產品提交後，`scripts/Build-Package.ps1 -PayloadDirectory artifacts/release-payload-0.1.34 -OutputDirectory artifacts/release/0.1.34`，全新輸出目錄，exit 0。內含完整 `dotnet test tests/WindowSocks.Tests/WindowSocks.Tests.csproj -c Release --logger 'trx;LogFileName=core-tests.trx' --results-directory artifacts/test-results`：**477/477，0 FAIL、0 skip，3 分 52 秒**。完整回歸中的反向壅塞訊息為 0.47／0.36 ms，無進展逾時 5.02 秒。
+- **PASS**：建置 Desktop／Service／Tools／Maintenance／Updater／Setup；354 檔版本與 manifest hash 核對，原生 Setup `--verify-payload` exit 0，沒有進行安裝。證據 `artifacts-package-0.1.34.log`。
+- **PASS**：使用 `ZipFile.OpenRead` 逐項核對 ZIP 內 354 檔 SHA-256 與 install-manifest，再核對 manifest 本身；355 entries，重複／禁止路徑 0。`artifacts/zip-verification-0.1.34.json`。
+- **PASS**：交付副本 `C:\SOCKS5 Client\artifacts\local-sandbox-0.1.34\WindowSocks.Tools.exe verify-release <程式目錄> 0.1.34`，354 檔全部通過。包內 Core ProductVersion `0.1.34+529dfc16c9c596a700d5409005d48e5baf447572`，符合產品提交。`artifacts/build-source-0.1.34.json`、`artifacts/delivery-verification-0.1.34.txt`。
+- **PASS**：安裝包、ZIP、latest.json、SHA256SUMS 複製至交付目錄，逐檔核對來源／交付 SHA-256 相同。`artifacts/delivery-hashes-0.1.34.json`。已開啟程式及安裝包目錄，未啟動產品或安裝程式。
 
 ## 交付範圍
 
 版本 0.1.34，本機測試版。僅提交產品原始碼、測試、正式說明、版本及 release notes。排除 reviews/、YongOrigin/、artifacts/、experiments/、第三方二進位快取、舊未確認腳本及個人設定。主要 workspace 及其他 worktree 保持原狀。
+
+產品來源提交：`529dfc16c9c596a700d5409005d48e5baf447572`。白名單 12 檔，差異 0、禁止路徑 0、私密樣式 0，`git diff --cached --check` 通過。LF／CRLF 提示為既有 Git 換行政策，不是內容差異。建置後提交僅更新本驗證文件，不改產品及套件。
+
+程式目錄：`C:\SOCKS5 Client\artifacts\local-sandbox-0.1.34`。安裝包目錄：`C:\SOCKS5 Client\artifacts\release\0.1.34`。
+
+| 交付檔 | Bytes | SHA-256 |
+|---|---:|---|
+| xa-sk5-Setup-0.1.34.exe | 123420672 | B2279AE87BBA023D1D1725D2D5D2566A56E31E38EF4DB32F23639846B734742D |
+| xa-sk5-0.1.34-win-x64.zip | 73162208 | 0B85BDF6D317B88395F5D6EE7EBC413005E9990B40CD5AC31C20AB4518C57405 |
 
 ## 實機確認（NOT RUN）
 
