@@ -37,7 +37,13 @@
 | xa-sk5-Setup-0.1.32.exe | 123386368 | 39344A81354B9964D8770A745E945E0CAE5D1754F565681658F6DF029A86DC9C |
 | xa-sk5-0.1.32-win-x64.zip | 73136144 | 1A3B066B0E771A0D5116DDFFE83776ECBC063782ED0E1F65B0B4AC693E9275FD |
 
-發布使用明確的 release commit 作 `gh release create --target`，不使用預設 main 指向舊版本。僅上傳上述兩個附件；公開前核對遠端 digest、大小與 tag 指向，公開後再次核對 latest。完整遠端結果保存在本機 `artifacts/release-publication/`，成功後追加摘要。
+發布使用明確的 release commit 作 `gh release create --target`，不使用預設 main 指向舊版本。僅上傳上述兩個附件；公開前核對遠端 digest、大小與 target commit，公開後再次核對 tag 與 latest。完整遠端結果保存在本機 `artifacts/release-publication/`。
+
+**發布 PASS（台北 2026-10-31 01:29:16）**：[v0.1.32](https://github.com/zzaiccf/xa-sk5/releases/tag/v0.1.32) 已公開且為 latest。tag 指向 `b472488821d38a7e185c59c7dbf34d07544bb3cf`，相對產品建置 commit 只增加本文件的驗證結果。公開 API 再核對兩個附件的大小／SHA-256 均與上表及本機交付檔一致。沒有覆寫 0.1.30／0.1.31 產物。
+
+實際發布流程：`git push origin HEAD:refs/heads/release/0.1.32` → `gh release create v0.1.32 --repo zzaiccf/xa-sk5 --target b472488821d38a7e185c59c7dbf34d07544bb3cf --title 'xa sk5 0.1.32' --notes-file release/notes-0.1.32.txt --draft <上述兩附件>` → read-only 檢查 release 429308486 的兩個 digest → `gh api --method PATCH repos/zzaiccf/xa-sk5/releases/429308486 -F draft=false -f make_latest=true` → 公開 latest／tag／附件核對 PASS。
+
+草稿尚未建立正式 tag，初次使用 `/releases/tags/v0.1.32` 查詢回 404；改用已認證 release list 與 release ID 唯讀核對，證明草稿及附件正確後才公開。此為查詢端點差異，並非上傳內容失敗。原始回應與查核結果均保留，沒有略過 hash 驗證。
 
 ## 實機限制與延後項目
 
