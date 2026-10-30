@@ -108,8 +108,20 @@ public static class AppReleasePackage
     }
     public static void Extract(string archivePath, string destination, string version, CancellationToken ct = default, IProgress<UpdateProgress>? progress = null)
     {
+        using var input=new FileStream(archivePath,FileMode.Open,FileAccess.Read,FileShare.None);
+        Extract(input,destination,version,ct,progress);
+    }
+    public static void ExtractVerified(string archivePath,ReleaseAsset asset,string destination,string version,CancellationToken ct=default,IProgress<UpdateProgress>? progress=null)
+    {
+        RejectLinks(archivePath);
+        using var input=new FileStream(archivePath,FileMode.Open,FileAccess.Read,FileShare.None);
+        if(input.Length!=asset.Size||!Convert.ToHexString(SHA256.HashData(input)).Equals(asset.Sha256,StringComparison.OrdinalIgnoreCase))throw new InvalidDataException("更新壓縮包已改變，拒絕安裝。");
+        input.Position=0;Extract(input,destination,version,ct,progress);
+    }
+    private static void Extract(Stream archive, string destination,string version,CancellationToken ct,IProgress<UpdateProgress>? progress)
+    {
         if (Directory.Exists(destination)) throw new IOException("解壓目錄必須為新的空目錄。");
-        using var zip = ZipFile.OpenRead(archivePath);
+        using var zip = new ZipArchive(archive,ZipArchiveMode.Read,true);
         if (zip.Entries.Count is < 1 or > 4000) throw new InvalidDataException("更新壓縮包項目數超出限制。");
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase); long total = 0;
         // Validate the entire directory before extracting any bytes.
@@ -123,19 +135,16 @@ public static class AppReleasePackage
         }
         Directory.CreateDirectory(destination); RejectLinks(destination);
         var entries = zip.Entries.Where(e => !e.FullName.EndsWith('/')).Select(e => e.FullName).ToArray();
-        int workers = Math.Min(entries.Length, Math.Clamp(Environment.ProcessorCount / 2, 1, 4));
         long extracted = 0;
-        // Each worker has its own ZIP stream; ZipArchive itself is not safe for concurrent reads.
-        Parallel.For(0, workers, new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = workers }, worker => {
-            using var reader = ZipFile.OpenRead(archivePath); byte[] buffer = new byte[256 * 1024];
-            for (int index = worker; index < entries.Length; index += workers) {
+        // Verification and extraction share one exclusively opened file; no TOCTOU reopen.
+        byte[] buffer = new byte[256 * 1024];
+            for (int index = 0; index < entries.Length; index++) {
                 ct.ThrowIfCancellationRequested(); string target = SafePath(destination, entries[index]);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!); RejectLinks(target);
-                using var input = reader.GetEntry(entries[index])!.Open();
+                using var input = zip.GetEntry(entries[index])!.Open();
                 using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None, buffer.Length);
                 int read; while ((read = input.Read(buffer)) != 0) { ct.ThrowIfCancellationRequested(); output.Write(buffer, 0, read); long count = Interlocked.Add(ref extracted, read); progress?.Report(new("解壓更新…", count, total) { CanCancel = true }); }
             }
-        });
         ct.ThrowIfCancellationRequested(); progress?.Report(new("驗證檔案與元件版本…") { CanCancel = true });
         VerifyPayload(destination, version);
     }

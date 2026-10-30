@@ -18,6 +18,16 @@ namespace WindowSocks.Desktop;
 
 public partial class MainWindow : Window
 {
+    private async void InspectFirewallClick(object sender,RoutedEventArgs e)
+    {
+        try {var state=await backend.InspectSandboxFirewall();MessageBox.Show(this,$"持久封鎖：{state.Blocks} 條\n動態放行：{state.Permits} 條\n{state.Detail}","xa sk5 防火牆封鎖");}
+        catch(Exception ex){StatusText.Text=ex.Message;}
+    }
+    private async void ClearFirewallClick(object sender,RoutedEventArgs e)
+    {
+        if(MessageBox.Show(this,"僅在停止並移除所有沙盒後清除本產品的持久封鎖。清除後原副本可直接連線。是否繼續？","清除 xa sk5 防火牆封鎖",MessageBoxButton.YesNo,MessageBoxImage.Warning,MessageBoxResult.No)!=MessageBoxResult.Yes)return;
+        try {await backend.ClearSandboxFirewall();StatusText.Text="已清除 xa sk5 防火牆封鎖。";}catch(Exception ex){StatusText.Text=ex.Message;}
+    }
     private readonly Backend backend;
     private readonly IDesktopStartupController startup;
     private readonly bool integrateShell;
@@ -207,8 +217,23 @@ public partial class MainWindow : Window
         catch (Exception ex) {
             closingService = false; IsEnabled = true; timer.Start(); durationTimer.Start();
             StatusText.Text = "尚未完成關閉：" + ex.Message;
+            if (integrateShell) ForceStopButton.Visibility = Visibility.Visible;
             Restore();
         }
+    }
+    private async void ForceStopClick(object sender, RoutedEventArgs e)
+    {
+        if (!integrateShell || closingService) return;
+        if (MessageBox.Show(this, "將先結束最後已核驗的沙盒成員，再列出仍可能直連的程式供確認。是否繼續？", "強制停止（會失去保護）", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+        closingService = true; IsEnabled = false;
+        try {
+            var state = lastConnectedSnapshot ?? snapshot;
+            await ForceServiceStop.ExecuteAsync(state, System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value,
+                report => Task.FromResult(MessageBox.Show(this, report.Warning, "確認強制停止（會失去保護）", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes),
+                terminate: (ids, sid) => Task.Run(() => ManagedProcessTerminator.CloseAsync(ids, sid)));
+            quitting = true; Close();
+        } catch (Exception ex) { StatusText.Text = ex.Message; }
+        finally { closingService = false; IsEnabled = true; }
     }
     private void CleanupExit()
     {

@@ -10,6 +10,14 @@ namespace WindowSocks.Tests;
 
 public sealed class AppUpdateTests : IDisposable
 {
+    [Fact] public void P08_VerificationAndExtractionHoldOneExclusiveArchiveHandle()
+    {
+        string payload=Payload("fixture"),zip=Path.Combine(root,"p0.zip");ZipFile.CreateFromDirectory(payload,zip);
+        var asset=new ReleaseAsset("p0.zip",new FileInfo(zip).Length,AppReleasePackage.Hash(zip));int attempts=0;
+        var progress=new InlineProgress(p=>{if(p.Received==0)return;attempts++;Assert.Throws<IOException>(()=>File.WriteAllText(zip,"replacement"));Assert.Throws<IOException>(()=>File.Move(zip,zip+".replaced"));});
+        AppReleasePackage.ExtractVerified(zip,asset,Path.Combine(root,"extracted"),AppReleasePackage.CurrentVersion,progress:progress);Assert.True(attempts>0);
+    }
+    private sealed class InlineProgress(Action<UpdateProgress> action):IProgress<UpdateProgress>{public void Report(UpdateProgress value)=>action(value);}
     private readonly string root = Path.Combine(Path.GetTempPath(), "xa-sk5-update-test-" + Guid.NewGuid().ToString("N"));
     public AppUpdateTests() => Directory.CreateDirectory(root);
     public void Dispose() => Directory.Delete(root, true);

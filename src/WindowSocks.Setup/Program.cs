@@ -163,7 +163,9 @@ internal static partial class Program
         string ownerFile = Path.Combine(DataDirectory, "owner.sid");
         string ownerSid = File.Exists(ownerFile) ? new SecurityIdentifier(File.ReadAllText(ownerFile).Trim()).Value : installOwnerSid;
         using (var user = Registry.Users.OpenSubKey(ownerSid, true)) { if (user is not null) { new StartupRegistry(user).RemoveForDirectory(InstallDirectory); WindowsShortcuts.RemoveDesktopForDirectory(user, InstallDirectory); } }
-        Run("sc.exe", ["stop", "WindowSocks"], false); WaitForServiceStop(); Run("sc.exe", ["delete", "WindowSocks"], false);
+        WindowSocks.Recovery.ForceStopDialog.Stop(); WaitForServiceStop();
+        using(var firewall=new NativeSandboxFirewall())firewall.Clear();
+        Run("sc.exe", ["delete", "WindowSocks"], false);
         Run("netsh.exe", ["advfirewall", "firewall", "delete", "rule", "name=WindowSocks relay"], false);
         Registry.LocalMachine.DeleteSubKeyTree(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\WindowSocks", false);
         foreach (string name in new[] { "xa sk5.lnk", "窗流 WindowSocks.lnk" }) {

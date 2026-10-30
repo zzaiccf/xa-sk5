@@ -1,8 +1,10 @@
-param([string]$OutputDirectory = 'artifacts/packet-path-checks')
+param([string]$OutputDirectory = 'artifacts/packet-path-checks', [string]$Check = '')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$out = [IO.Path]::GetFullPath($OutputDirectory, $root)
+$out = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($OutputDirectory)) { $OutputDirectory } else { Join-Path $root $OutputDirectory }))
 New-Item -ItemType Directory -Path $out -Force | Out-Null
+$version = ([xml](Get-Content (Join-Path $root 'Directory.Build.props') -Raw)).Project.PropertyGroup.Version
+Set-Content -LiteralPath (Join-Path $out 'BuildVersion.h') -Value ('#define XA_VERSION "' + $version + '"') -Encoding ascii
 $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vsWhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (!$vs) { throw 'Visual Studio C++ tools are required.' }
@@ -17,8 +19,10 @@ try {
     $common = @('/nologo','/O2','/MT','/GS','/guard:cf','/utf-8','/W3','/D_CRT_SECURE_NO_WARNINGS','/D_WINSOCK_DEPRECATED_NO_WARNINGS',"/I$root/native/include","/I$root/third_party/ProxyBridge/src")
     & $compiler @common /c "$root/third_party/ProxyBridge/src/pb_util.c" "$root/third_party/ProxyBridge/src/pb_socks5.c"
     if ($LASTEXITCODE) { throw 'Protocol helpers failed to compile.' }
-    & $compiler @common /std:c++20 /EHsc "$root/tests/WindowSocks.Native.PerformanceChecks/PacketPathChecks.cpp" /Fe:PacketPathChecks.exe /link pb_util.obj pb_socks5.obj ws2_32.lib iphlpapi.lib advapi32.lib
+    & $compiler @common /std:c++20 /EHsc "/FI$out/BuildVersion.h" "$root/tests/WindowSocks.Native.PerformanceChecks/PacketPathChecks.cpp" /Fe:PacketPathChecks.exe /link pb_util.obj pb_socks5.obj ws2_32.lib iphlpapi.lib advapi32.lib
     if ($LASTEXITCODE) { throw 'Packet checks failed to compile.' }
-    & ./PacketPathChecks.exe "$root/third_party/WinDivert-2.2.2-A/x64/WinDivert.dll" | Tee-Object -FilePath result.txt
+    $arguments = @("$root/third_party/WinDivert-2.2.2-A/x64/WinDivert.dll")
+    if ($Check) { $arguments += $Check }
+    & ./PacketPathChecks.exe @arguments | Tee-Object -FilePath result.txt
     if ($LASTEXITCODE) { throw 'Packet-path regression failed.' }
 } finally { Pop-Location }

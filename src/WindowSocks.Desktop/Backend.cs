@@ -11,6 +11,8 @@ namespace WindowSocks.Desktop;
 
 public partial class Backend
 {
+    public Task<SandboxFirewallStatus> InspectSandboxFirewall()=>Call<SandboxFirewallStatus>(Command.Create("inspectSandboxFirewall",new{}));
+    public Task<bool> ClearSandboxFirewall()=>Call<bool>(Command.Create("clearSandboxFirewall",new{}));
     private readonly ConfigStore store;
     private readonly SavedConfig config;
     private readonly Func<Command, CancellationToken, Task<Reply>>? serviceTransport;

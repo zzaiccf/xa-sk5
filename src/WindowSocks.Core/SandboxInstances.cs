@@ -2,7 +2,11 @@ using System.Text.RegularExpressions;
 
 namespace WindowSocks.Core;
 
-public sealed record SandboxBrokerRequest(string Action, string Box = "", int Pid = 0, SandboxInstanceProfile? Profile = null, string OwnerSid = "");
+public sealed record SandboxBrokerRequest(string Action, string Box = "", int Pid = 0, SandboxInstanceProfile? Profile = null, string OwnerSid = "")
+{
+    public Guid RequestId { get; init; } = Guid.NewGuid();
+}
+public sealed record SandboxBrokerReply(Guid RequestId, Reply Reply);
 
 public sealed record SandboxInstanceProfile
 {

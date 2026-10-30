@@ -4,9 +4,9 @@ using System.Text;
 using Microsoft.Win32.SafeHandles;
 using WindowSocks.Core;
 
-namespace WindowSocks.Service;
+namespace WindowSocks.Core;
 
-internal static class ManagedProcessTerminator
+public static class ManagedProcessTerminator
 {
     private const uint Query = 0x1000, Terminate = 0x0001, Synchronize = 0x100000;
     private static readonly HashSet<string> infrastructure = new(StringComparer.OrdinalIgnoreCase) {
@@ -62,3 +62,4 @@ internal static class ManagedProcessTerminator
         } finally { foreach (var process in opened) process.Handle.Dispose(); }
     }
 }
+

@@ -35,7 +35,7 @@ public static class UpdatePreparation
             finally { if (ownsClient) client.Dispose(); }
         }
         ct.ThrowIfCancellationRequested();
-        await Task.Run(() => AppReleasePackage.Extract(archive, payload, version, ct, progress), ct);
+        await Task.Run(() => AppReleasePackage.ExtractVerified(archive,download.Release.Portable,payload,version,ct,progress), ct);
         return payload;
     }
 }

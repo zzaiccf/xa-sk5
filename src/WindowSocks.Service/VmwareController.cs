@@ -12,6 +12,13 @@ public sealed partial class Controller
     private bool vmwareDiscoveryHealthy;
     private bool vmwareSetupFailed;
     private string VmwareJournal => Path.Combine(directory, "vmware-network-backup.json");
+    private void ValidateVmwareReservations(VmwareSettings settings)
+    {
+        if(settings.ByStartup)return;
+        var ledger=new ProxyOwnershipLedger(ProxyOwnershipLedger.From(config,vmwareRuntime).Outside("VMware"));
+        foreach(var mapping in settings.Machines.Where(m=>!m.UseLocalNetwork&&m.ProxyId!=Guid.Empty))
+            ledger.Require(mapping.ProxyId,"vmware:"+VmwareVmx.NormalizePath(mapping.VmxPath),"VMware",true);
+    }
     private VmwareDiscovered[] ListVmware()
     {
         var found = new List<VmwareDiscovered>();
@@ -36,6 +43,7 @@ public sealed partial class Controller
     private Task<bool> SetupVmware(VmwareSettings request, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+        ValidateVmwareReservations(request);
         RequireVmwareLocalSupport(request);
         if (VmwarePrepared) {
             var existing = config.Vmware;
@@ -111,6 +119,7 @@ public sealed partial class Controller
     {
         RequireVmwareLocalSupport(settings);
         VmwarePlanner.Validate(settings, config.Proxies, requirePlanned: true);
+        ValidateVmwareReservations(settings);
         if (!VmwareNetwork.CanPrepare(VmwareJournal)) throw new InvalidOperationException("已有專用網路備份，請先關機並回復原網路。");
         if (settings.Machines.Length == 0) throw new InvalidOperationException("請先加入 VMware 虛擬機。");
         if (!NativeEngine.SupportsVmwareGateway) throw new InvalidOperationException("請先套用支援 VMware 的原生核心。");
@@ -135,6 +144,7 @@ public sealed partial class Controller
     {
         RequireVmwareLocalSupport(settings);
         VmwarePlanner.Validate(settings, config.Proxies, requirePlanned: true);
+        ValidateVmwareReservations(settings);
         if (!VmwarePrepared) throw new InvalidOperationException("請先準備專用代理網路。");
         var original = config.Vmware;
         if (original.ByStartup && settings.ByStartup && !settings.OverflowToLocal && vmwareRuntime.Where(r => r.Process.HasValue && r.ProxyId != Guid.Empty).GroupBy(r => r.ProxyId).Any(g => g.Count() > settings.PerProxy))
@@ -184,7 +194,7 @@ public sealed partial class Controller
             foreach (string path in paths.Where(live.ContainsKey)) { if (live[path] is not null) duplicate.Add(path); else live[path] = identity; }
         }
         foreach (string path in duplicate) live[path] = null;
-        var next = VmwarePlanner.Assign(config.Vmware, config.Proxies, live, vmwareRuntime);
+        var next = VmwarePlanner.Assign(config.Vmware, config.Proxies, live, vmwareRuntime,ProxyOwnershipLedger.From(config,vmwareRuntime).Outside("VMware"));
         if (!next.Select(r => (r.VmxPath, r.Process, r.ProxyId, r.UseLocalNetwork)).SequenceEqual(vmwareRuntime.Select(r => (r.VmxPath, r.Process, r.ProxyId, r.UseLocalNetwork)))) { config.VmwareSessions = next; childrenDirty = true; }
         vmwareRuntime = next;
         vmwareDiscoveryHealthy = true;

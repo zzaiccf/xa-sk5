@@ -21,19 +21,21 @@ switch (args[0])
         using (var runtime = new SandboxieRuntime()) {
             while (await Console.In.ReadLineAsync() is { } requestLine) {
                 if (requestLine.Length > PipeTransport.Limit) break;
-                Reply reply;
+                Reply reply;Guid requestId=Guid.Empty;
                 try {
                     var request = JsonSerializer.Deserialize<SandboxBrokerRequest>(requestLine, Json.Options) ?? throw new InvalidDataException();
+                    requestId=request.RequestId;
                     if (request.Action == "list") {
                         if (!System.Text.RegularExpressions.Regex.IsMatch(request.Box, "^Xa_[0-9a-f]{24}$")) throw new InvalidDataException("沙盒名稱無效。");
                         reply = Reply.Success(runtime.Processes(request.Box));
                     } else if (request.Action == "query") reply = Reply.Success(runtime.Query(request.Pid));
+                    else if(request.Action=="validate"&&request.Profile is{} settings){runtime.ValidateSettings(settings);reply=Reply.Success(true);}
                     else if (request.Action == "terminate" && request.Profile is { } owned) {
                         SandboxInstances.Validate(owned); _ = new System.Security.Principal.SecurityIdentifier(request.OwnerSid);
                         runtime.TerminateOwned(owned, request.OwnerSid); reply = Reply.Success(true);
                     } else throw new InvalidDataException("不支援的沙盒查詢。");
                 } catch (Exception ex) when (ex is not OutOfMemoryException) { reply = Reply.Failure(ex.Message); }
-                Console.WriteLine(JsonSerializer.Serialize(reply, Json.Options));
+                Console.WriteLine(JsonSerializer.Serialize(new SandboxBrokerReply(requestId,reply), Json.Options));
             }
         }
         break;

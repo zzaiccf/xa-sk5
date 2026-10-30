@@ -28,6 +28,9 @@ extern "C" {
 LogCallback g_log_callback = nullptr;
 }
 #define API extern "C" __declspec(dllexport)
+#ifndef XA_VERSION
+#define XA_VERSION "unversioned"
+#endif
 
 struct RouteRule { uint32_t pid, proxy; uint64_t created; uint32_t blocked, reserved; };
 struct Traffic { uint64_t sent, received, dropped; };
@@ -53,15 +56,32 @@ static bool gatewayDhcpResponse(const Key& key,uint32_t index);
 // Activity can advance on another thread after the caller samples its clock.
 // Such a timestamp is fresh, not an unsigned wraparound worth years of idle time.
 static uint64_t elapsedSince(uint64_t now,uint64_t timestamp) { return now>=timestamp?now-timestamp:0; }
+static std::atomic<unsigned> liveFlowCount{0};
+static std::shared_mutex quarantineMutex;
+static std::map<Key,uint64_t> retiredTuples;
+static std::map<uint16_t,uint64_t> retiredAliases;
+static std::atomic<size_t> retiredTupleCount{0};
+static void quarantine(const Key& key,uint16_t alias,uint64_t at){
+    if(!key.protocol)return;
+    std::unique_lock lk(quarantineMutex);
+    if(key.protocol==6){auto& expiry=retiredTuples[key];expiry=(std::max)(expiry,at+240000);retiredTupleCount=retiredTuples.size();}
+    if(alias){auto& expiry=retiredAliases[alias];expiry=(std::max)(expiry,at+240000);}
+}
+static bool quarantined(const Key& key){
+    if(!retiredTupleCount.load())return false;
+    std::shared_lock lk(quarantineMutex);auto it=retiredTuples.find(key);return it!=retiredTuples.end()&&GetTickCount64()<=it->second;
+}
+static bool aliasRetired(uint16_t alias){std::shared_lock lk(quarantineMutex);auto it=retiredAliases.find(alias);return it!=retiredAliases.end()&&GetTickCount64()<=it->second;}
 struct Flow {
+    Flow(){++liveFlowCount;}
     uint64_t id=++nextFlow,opened=GetTickCount64();
     Key key{}; RouteRule rule{}; uint16_t alias{}; uint64_t socketCreated{}; WINDIVERT_ADDRESS address{};
     uint32_t gatewayHost=0,gatewayInterface=0;
     std::atomic<SOCKET> client{INVALID_SOCKET}, upstream{INVALID_SOCKET}, datagram{INVALID_SOCKET};
-    std::atomic<bool> alive{true}, connected{false}; std::atomic<uint64_t> last{0};
+    std::atomic<bool> alive{true}, connected{false}; std::atomic<uint64_t> last{0},closedAt{0};
     std::atomic<uint64_t> sent{0},received{0};
     std::mutex queueMutex; std::deque<std::vector<uint8_t>> queue;
-    void close(uint32_t reason=Closed,uint32_t error=0) { if(alive.exchange(false))trace(*this,reason,error); connected=false; for (auto* p : {&client,&upstream,&datagram}) { SOCKET s=p->exchange(INVALID_SOCKET); if(s!=INVALID_SOCKET) { shutdown(s,SD_BOTH); closesocket(s); } } }
+    void close(uint32_t reason=Closed,uint32_t error=0) { if(alive.exchange(false)){closedAt=GetTickCount64();quarantine(key,alias,closedAt);--liveFlowCount;trace(*this,reason,error);} connected=false; for (auto* p : {&client,&upstream,&datagram}) { SOCKET s=p->exchange(INVALID_SOCKET); if(s!=INVALID_SOCKET) { shutdown(s,SD_BOTH); closesocket(s); } } }
     ~Flow() { close(); }
 };
 static void trace(const Flow& f,uint32_t stage,uint32_t error) {
@@ -75,6 +95,9 @@ static void trace(const Flow& f,uint32_t stage,uint32_t error) {
 static std::shared_mutex stateMutex;
 static std::vector<RouteRule> rules;
 static std::vector<std::wstring> guards;
+// Injectable driver identity query for packet-path fixtures; production installs the adapter below.
+static std::function<int(uint32_t,uint64_t,std::wstring&)> sandboxIdentityQuery;
+static std::atomic<int> sandboxIdentityState{0};
 // State: 0 disabled, 1 proxy, 2 quarantine. Replaced atomically with process rules.
 static uint32_t globalProxy=0,globalState=0;
 static bool globalBypassLan=true;
@@ -98,14 +121,16 @@ static std::map<std::pair<uint32_t,uint64_t>,ProcessLifetime> processLifetimes;
 static std::map<std::pair<uint32_t,uint64_t>,HANDLE> processJobs;
 static std::map<uint32_t, PROXY_CONFIG> profiles;
 static std::map<std::pair<uint32_t,uint64_t>, Traffic> traffic;
-static std::mutex flowMutex, sendMutex, lifecycleMutex;
+static std::mutex flowMutex, sendMutex, lifecycleMutex, listenerPortMutex;
 static std::map<Key,std::shared_ptr<Flow>> flows;
 static std::map<uint16_t,std::shared_ptr<Flow>> aliases;
+static std::map<uint16_t,uint64_t> retiredListenerPorts;
 static std::atomic<bool> active{false};
 static std::atomic<unsigned> workers{0};
 static std::thread captureThread, acceptThread, pruneThread, retryThread;
 static SOCKET listener=INVALID_SOCKET;
 static uint16_t listenPort=0, nextAlias=20000;
+static bool relayPort(uint16_t port){if(port==listenPort)return true;std::lock_guard lk(listenerPortMutex);auto it=retiredListenerPorts.find(port);return it!=retiredListenerPorts.end()&&elapsedSince(GetTickCount64(),it->second)<=240000;}
 static HANDLE divert=INVALID_HANDLE_VALUE;
 static HMODULE driverLibrary=nullptr;
 static decltype(&WinDivertOpen) wdOpen;
@@ -118,6 +143,9 @@ static decltype(&WinDivertClose) wdClose;
 static decltype(&WinDivertHelperCalcChecksums) wdChecksums;
 static decltype(&WinDivertShutdown) wdShutdown;
 static std::atomic<uint32_t> lastError{0};
+static std::atomic<bool> captureFailed{false};
+#include "PersistentFirewall.h"
+static void markCaptureFailed(){captureFailed=true;DWORD error=sandboxFirewall::withdraw();if(error)lastError=error;}
 struct PacketMetrics {
     std::atomic<uint64_t> packets{0},bytes{0},impostor{0},loopback{0},icmp{0},batches{0},ownerQueries{0},ownerUs{0},ownerMaxUs{0},
         classifyUs{0},classifyMaxUs{0},sendUs{0},sendMaxUs{0},ageUs{0},ageMaxUs{0},ageSamples{0},unknown{0},overflow{0},parseErrors{0},
@@ -152,7 +180,7 @@ static void saveTelemetry(){
     FILE* file=nullptr;if(_wfopen_s(&file,telemetryPath.c_str(),L"a")||!file)return;
     SYSTEMTIME now;GetSystemTime(&now);
     auto& m=packetMetrics;
-    fprintf(file,"{\"utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"native\":\"0.1.30\",\"pid\":%lu,\"packets\":%llu,\"bytes\":%llu,\"batches\":%llu,\"impostor\":%llu,\"loopback\":%llu,\"icmp\":%llu,\"ownerQueries\":%llu,\"ownerUs\":%llu,\"ownerMaxUs\":%llu,\"classifyUs\":%llu,\"classifyMaxUs\":%llu,\"sendUs\":%llu,\"sendMaxUs\":%llu,\"ageUs\":%llu,\"ageMaxUs\":%llu,\"ageSamples\":%llu,\"unknown\":%llu,\"overflow\":%llu,\"parseErrors\":%llu}\n",
+    fprintf(file,"{\"utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"native\":\"" XA_VERSION "\",\"pid\":%lu,\"packets\":%llu,\"bytes\":%llu,\"batches\":%llu,\"impostor\":%llu,\"loopback\":%llu,\"icmp\":%llu,\"ownerQueries\":%llu,\"ownerUs\":%llu,\"ownerMaxUs\":%llu,\"classifyUs\":%llu,\"classifyMaxUs\":%llu,\"sendUs\":%llu,\"sendMaxUs\":%llu,\"ageUs\":%llu,\"ageMaxUs\":%llu,\"ageSamples\":%llu,\"unknown\":%llu,\"overflow\":%llu,\"parseErrors\":%llu}\n",
         now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,now.wMilliseconds,GetCurrentProcessId(),m.packets.load(),m.bytes.load(),m.batches.load(),m.impostor.load(),m.loopback.load(),m.icmp.load(),m.ownerQueries.load(),m.ownerUs.load(),m.ownerMaxUs.load(),m.classifyUs.load(),m.classifyMaxUs.load(),m.sendUs.load(),m.sendMaxUs.load(),m.ageUs.load(),m.ageMaxUs.load(),m.ageSamples.load(),m.unknown.load(),m.overflow.load(),m.parseErrors.load());
     fprintf(file,"{\"utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"detail\":true,\"routeUs\":%llu,\"routeWaitUs\":%llu,\"guardUs\":%llu,\"guardWaitUs\":%llu,\"ancestryWalks\":%llu,\"ancestryUs\":%llu,\"imageUs\":%llu,\"parentQueries\":%llu,\"parentErrors\":%llu,\"sendFailures\":%llu,\"sendHostUnreachable\":%llu,\"expiredImpostors\":%llu,\"lastSendError\":%llu}\n",
         now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,now.wMilliseconds,m.routeUs.load(),m.routeWaitUs.load(),m.guardUs.load(),m.guardWaitUs.load(),m.ancestryWalks.load(),m.ancestryUs.load(),m.imageUs.load(),m.parentQueries.load(),m.parentErrors.load(),m.sendFailures.load(),m.sendHostUnreachable.load(),m.expiredImpostors.load(),m.lastSendError.load());
@@ -190,13 +218,14 @@ static uint64_t created(uint32_t pid) {
     return ((uint64_t)c.dwHighDateTime<<32)|c.dwLowDateTime;
 }
 static void updateProcessJobs() { // stateMutex is held exclusively.
-    for(const auto& r:rules)if((r.reserved&1)&&processJobs.find({r.pid,r.created})==processJobs.end()) {
+    for(const auto& r:rules)if(r.reserved&4){auto it=processJobs.find({r.pid,r.created});if(it!=processJobs.end()){CloseHandle(it->second);processJobs.erase(it);}}
+    for(const auto& r:rules)if((r.reserved&1)&&!(r.reserved&4)&&processJobs.find({r.pid,r.created})==processJobs.end()) {
         HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SET_QUOTA|PROCESS_TERMINATE,FALSE,r.pid);
         if(!process)continue;
         FILETIME c,e,k,u;bool valid=GetProcessTimes(process,&c,&e,&k,&u)&&!e.dwHighDateTime&&!e.dwLowDateTime&&(((uint64_t)c.dwHighDateTime<<32)|c.dwLowDateTime)==r.created;
         bool covered=false;
         if(valid)for(const auto& [root,job]:processJobs) {
-            bool followed=std::any_of(rules.begin(),rules.end(),[&](const auto& parent){return parent.pid==root.first&&parent.created==root.second&&(parent.reserved&1);});
+            bool followed=std::any_of(rules.begin(),rules.end(),[&](const auto& parent){return parent.pid==root.first&&parent.created==root.second&&(parent.reserved&1)&&!(parent.reserved&4);});
             BOOL member=FALSE;if(followed&&IsProcessInJob(process,job,&member)&&member){covered=true;break;}
         }
         if(valid&&!covered) {
@@ -269,11 +298,11 @@ static uint32_t parentOf(uint32_t pid,uint64_t birth) {
 static int route(uint32_t pid,uint64_t birth,bool ipv6,RouteRule& found) {
     if(pid==GetCurrentProcessId())return 0;
     MetricTimer timer{packetMetrics.routeUs};uint64_t waiting=qpcUs();std::unique_lock lk(stateMutex);packetMetrics.routeWaitUs+=qpcUs()-waiting;
-    auto action=[&](const RouteRule& r){found=r;found.pid=pid;found.created=birth;return r.blocked==2?3:r.blocked||ipv6||profiles.find(r.proxy)==profiles.end()?2:1;};
+    auto action=[&](const RouteRule& r){found=r;found.pid=pid;found.created=birth;if((r.reserved&8)&&sandboxIdentityState<0)return 2;return r.blocked==3?4:r.blocked==2?3:r.blocked||ipv6||profiles.find(r.proxy)==profiles.end()?2:1;};
     for(const auto& r:rules) if(r.pid==pid && r.created==birth && birth) {
         return action(r);
     }
-    if(!birth)return 0;
+    if(!birth)return pid!=4&&std::any_of(rules.begin(),rules.end(),[&](const auto& r){return r.pid==pid&&r.blocked!=2&&r.blocked!=3;})?2:0;
     if(std::none_of(rules.begin(),rules.end(),[](const auto&r){return (r.reserved&1)!=0;}))return 0;
     // A job proves membership of the currently opened process, not of a stale PID+birth supplied by a caller.
     // Validate before consulting either captured descendants or Windows job membership.
@@ -290,7 +319,7 @@ static int route(uint32_t pid,uint64_t birth,bool ipv6,RouteRule& found) {
     if(inherited!=descendants.end())for(const auto& r:rules)if(r.pid==inherited->second.first&&r.created==inherited->second.second&&(r.reserved&1))return action(r);
     HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
     const RouteRule* jobRule=nullptr;bool conflict=false;
-    if(process){for(const auto& r:rules)if(r.reserved&1) {
+    if(process){for(const auto& r:rules)if((r.reserved&1)&&!(r.reserved&4)) {
         auto job=processJobs.find({r.pid,r.created});BOOL member=FALSE;
         if(job!=processJobs.end()&&IsProcessInJob(process,job->second,&member)&&member){
             if(jobRule&&(jobRule->proxy!=r.proxy||jobRule->blocked!=r.blocked))conflict=true;
@@ -352,11 +381,13 @@ static bool remoteRdpListener(uint32_t pid,uint64_t birth,uint16_t localPort) {
     return globalState&&globalBypassRemote&&rdpPid&&rdpPort&&localPort==rdpPort&&
         ((pid==rdpPid&&birth&&birth==rdpCreated)||pid==4);
 }
+#include "SandboxIdentity.h"
 static int policyAction(uint32_t pid,uint64_t birth,bool ipv6,RouteRule& rule,uint16_t localPort=0) {
     if(pid==GetCurrentProcessId())return 0; // Relay, health checks and SOCKS bootstrap must never recurse.
     int action=route(pid,birth,ipv6,rule);
-    if(action)return action;
-    if(guarded(pid))return 2; // Startup guards and paused bindings override the global fallback.
+    if(action&&action!=4)return action;
+    if(pendingSandbox(pid,birth))return 2;
+    if(action!=4&&guarded(pid))return 2; // Exemption skips only the startup guard, never the global fallback.
     if(remoteRdpListener(pid,birth,localPort)||remoteControlProcess(pid,birth)){rule={pid,0,birth,2,0};return 3;}
     std::shared_lock lk(stateMutex);
     if(!globalState)return 0;
@@ -388,8 +419,9 @@ static void closeGoneUdpSockets() {
     DWORD bytes=0;if(GetExtendedUdpTable(nullptr,&bytes,FALSE,AF_INET,UDP_TABLE_OWNER_MODULE,0)!=ERROR_INSUFFICIENT_BUFFER)return;
     std::vector<uint8_t> data(bytes+4096);bytes=(DWORD)data.size();
     if(GetExtendedUdpTable(data.data(),&bytes,FALSE,AF_INET,UDP_TABLE_OWNER_MODULE,0)!=NO_ERROR)return;
-    auto* table=(MIB_UDPTABLE_OWNER_MODULE*)data.data();std::lock_guard lk(flowMutex);
-    for(auto& [key,f]:flows)if(key.protocol==17&&f->alive&&!f->gatewayInterface){
+    auto* table=(MIB_UDPTABLE_OWNER_MODULE*)data.data();std::vector<std::shared_ptr<Flow>> snapshot;
+    {std::lock_guard lk(flowMutex);for(auto& [key,f]:flows)if(key.protocol==17&&f->alive&&!f->gatewayInterface)snapshot.push_back(f);}
+    for(auto& f:snapshot){const auto& key=f->key;
         bool found=false;for(DWORD i=0;i<table->dwNumEntries;i++){auto&r=table->table[i];
             if(r.dwOwningPid==f->rule.pid&&ntohs((u_short)r.dwLocalPort)==key.sp&&(!r.dwLocalAddr||r.dwLocalAddr==key.src)&&
                 (!f->socketCreated||(uint64_t)r.liCreateTimestamp.QuadPart==f->socketCreated)){found=true;break;}
@@ -468,7 +500,10 @@ static bool expiredImpostor(std::span<const uint8_t> p,const WINDIVERT_ADDRESS& 
 static bool fatalSendError(DWORD error) {
     ++packetMetrics.sendFailures;packetMetrics.lastSendError=error;
     if(error==ERROR_HOST_UNREACHABLE){++packetMetrics.sendHostUnreachable;return false;}
-    lastError=error;return true;
+    lastError=error;
+    bool fatal=error==ERROR_INVALID_HANDLE||error==ERROR_OPERATION_ABORTED||error==ERROR_ACCESS_DENIED||error==ERROR_INVALID_FUNCTION;
+    if(fatal)markCaptureFailed();
+    return fatal;
 }
 static bool inject(std::span<uint8_t> p,WINDIVERT_ADDRESS address,bool modified=true) {
     std::lock_guard lk(sendMutex); if(divert==INVALID_HANDLE_VALUE)return false;
@@ -601,7 +636,7 @@ static void acceptLoop() {
     }
 }
 static void prune(uint64_t now=GetTickCount64()) {
-    closeGoneUdpSockets();std::lock_guard lk(flowMutex);
+    closeGoneUdpSockets();
     // A closed application socket can disappear from the owner table before its final FIN is captured.
     // Do not leave a relay and its connection counter alive indefinitely when that happens.
     std::set<Key> tcpSockets;bool tableValid=false;DWORD bytes=0;
@@ -614,14 +649,26 @@ static void prune(uint64_t now=GetTickCount64()) {
             }
         }
     }
-    for(auto it=flows.begin();it!=flows.end();) {
-        auto f=it->second;
+    std::vector<std::shared_ptr<Flow>> snapshot;
+    {std::lock_guard lk(flowMutex);for(auto& [key,f]:flows)snapshot.push_back(f);}
+    for(auto& f:snapshot) {
         if(f->alive&&!f->gatewayInterface&&f->key.protocol==6&&tableValid&&elapsedSince(now,f->opened)>1000&&!tcpSockets.count(f->key))f->close(SocketGone);
         const uint64_t idle=elapsedSince(now,f->last.load());
-        if((!f->alive&&idle>5000)||(f->key.protocol==17&&idle>60000)||(f->key.protocol==6&&idle>1800000)) {
-            f->close(IdleExpired);if(f->alias)aliases.erase(f->alias);it=flows.erase(it);
-        }else ++it;
+        if(f->alive&&((f->key.protocol==17&&idle>60000)||(f->key.protocol==6&&idle>1800000))){f->close(IdleExpired);f->closedAt=now;}
+        if(!f->alive) {
+            std::lock_guard lk(flowMutex);auto it=flows.find(f->key);
+            if(it!=flows.end()&&it->second==f)flows.erase(it);
+        }
     }
+    {std::lock_guard lk(flowMutex);for(auto it=aliases.begin();it!=aliases.end();){
+        if(!it->second->alive)it=aliases.erase(it);else ++it;
+    }}
+    {std::unique_lock lk(quarantineMutex);
+        for(auto it=retiredTuples.begin();it!=retiredTuples.end();)if(now>it->second)it=retiredTuples.erase(it);else ++it;
+        for(auto it=retiredAliases.begin();it!=retiredAliases.end();)if(now>it->second)it=retiredAliases.erase(it);else ++it;
+        retiredTupleCount=retiredTuples.size();
+    }
+    {std::lock_guard lk(listenerPortMutex);for(auto it=retiredListenerPorts.begin();it!=retiredListenerPorts.end();)if(elapsedSince(now,it->second)>240000)it=retiredListenerPorts.erase(it);else ++it;}
 }
 static bool localCommunication(const uint8_t* packet,size_t length) {
     if(!packet||length<20)return false;
@@ -664,11 +711,26 @@ struct PassThroughBatch {
 static bool processPacket(std::span<uint8_t> p,WINDIVERT_ADDRESS addr,OwnerBatch& owners,PassThroughBatch* direct=nullptr) {
     UINT length=(UINT)p.size();if(length<20)return true;
     auto pass=[&](){if(direct)direct->append(p,addr);else inject(p,addr,false);};
+    // Classify established TCP before consulting possibly vanished process/socket identities.
+    // A terminated or unbound relay owns its tuple until TIME_WAIT quarantine expires.
+    if((p[0]>>4)==4&&p[9]==6){
+        const UINT off=(p[0]&15)*4;
+        if(off>=20&&off+20<=length&&!(p[off+13]&2)){
+            Key key{word(p.data()+12),word(p.data()+16),be16(p.data()+off),be16(p.data()+off+2),6};
+            std::shared_ptr<Flow> existing;if(liveFlowCount.load()){std::lock_guard lk(flowMutex);auto it=flows.find(key);if(it!=flows.end())existing=it->second;}
+            if(existing){
+                if(!existing->alive||!stillBound(*existing))return true;
+                existing->last=GetTickCount64();memcpy(p.data()+12,&key.dst,4);memcpy(p.data()+16,&key.src,4);
+                put16(p.data()+off,existing->alias);put16(p.data()+off+2,listenPort);addr.Outbound=0;addr.Loopback=0;inject(p,addr);return true;
+            }
+            if(quarantined(key))return true;
+        }
+    }
     {std::shared_lock lk(stateMutex);
         bool managed=globalState||!guards.empty()||std::any_of(rules.begin(),rules.end(),[](const auto&r){return r.blocked!=2;});
         // Pure inventory/direct rules need no ownership or executable lookup. Keep
         // the listener return path active for the separate VMware gateway.
-        bool listenerPacket=(p[0]>>4)==4&&length>=40&&p[9]==6&&(UINT)(p[0]&15)*4+20<=length&&be16(p.data()+(p[0]&15)*4)==listenPort;
+        bool listenerPacket=(p[0]>>4)==4&&length>=40&&p[9]==6&&(UINT)(p[0]&15)*4+20<=length&&relayPort(be16(p.data()+(p[0]&15)*4));
         if(!managed&&!listenerPacket){lk.unlock();pass();return true;}
     }
     // Emulator control/ADB and application IPC stay on loopback. DNS keeps the managed proxy/block policy.
@@ -691,9 +753,11 @@ static bool processPacket(std::span<uint8_t> p,WINDIVERT_ADDRESS addr,OwnerBatch
     if(be16(p.data()+6)&0x3fff){std::shared_lock lk(stateMutex);if(!globalState&&rules.empty()&&guards.empty()){lk.unlock();pass();}return true;}
     Key key{word(p.data()+12),word(p.data()+16),be16(p.data()+ipLength),be16(p.data()+ipLength+2),protocol};
     if(gatewayDhcpResponse(key,addr.Network.IfIdx)){pass();return true;}
-    if(protocol==6&&key.sp==listenPort) {
+    if(protocol==6&&relayPort(key.sp)) {
+        if(key.sp!=listenPort)return true;
         std::shared_ptr<Flow> f;{std::lock_guard lk(flowMutex);auto it=aliases.find(key.dp);if(it!=aliases.end()){auto candidate=it->second;if(candidate->gatewayInterface?candidate->key.src==key.dst&&candidate->gatewayHost==key.src:candidate->key.dst==key.dst&&candidate->key.src==key.src)f=candidate;}}
         if(f){if(!stillBound(*f)&&(ipLength+20>(int)length||!(p[ipLength+13]&5)))return true;reverseTcp(*f,p,addr);inject(p,addr);return true;}
+        return true; // Never expose a relay's orphan packet through the service's direct exemption.
     }
     bool freshTcp=protocol==6&&ipLength+20<=(int)length&&(p[ipLength+13]&2);
     uint64_t socketBirth=0;uint32_t pid=owner(key,socketBirth,freshTcp,&owners);
@@ -711,14 +775,14 @@ static bool processPacket(std::span<uint8_t> p,WINDIVERT_ADDRESS addr,OwnerBatch
         if(it!=flows.end()){
             f=it->second;
             if(f->rule.pid!=rule.pid||f->rule.created!=rule.created||f->rule.proxy!=rule.proxy||f->socketCreated!=socketBirth||(!f->alive&&elapsedSince(GetTickCount64(),f->last.load())>1000)){
-                f->close();if(f->alias)aliases.erase(f->alias);flows.erase(it);f.reset();
+                f->close();if(f->alias){f->last=GetTickCount64();}flows.erase(it);f.reset();
             }
         }
         if(!f){
-            if(flows.size()>=2048||workers>=256){count(pid,0,0,length);return true;}
+            if(liveFlowCount.load()>=2048||workers>=256){count(pid,0,0,length);return true;}
             if(protocol==6&&(ipLength+20>(int)length||!(p[ipLength+13]&2)))return true; // existing TCP sessions must reconnect
             f=std::make_shared<Flow>();f->key=key;f->rule=rule;f->address=addr;f->socketCreated=socketBirth;
-            if(protocol==6){for(unsigned n=0;n<40000;n++){if(++nextAlias>60000)nextAlias=20000;if(!aliases.count(nextAlias)){f->alias=nextAlias;break;}}if(!f->alias)return true;aliases[f->alias]=f;}
+            if(protocol==6){for(unsigned n=0;n<40000;n++){if(++nextAlias>60000)nextAlias=20000;if(!aliases.count(nextAlias)&&!aliasRetired(nextAlias)){f->alias=nextAlias;break;}}if(!f->alias)return true;aliases[f->alias]=f;}
             flows[key]=f;trace(*f,Captured);fresh=true;
         }
         f->last=GetTickCount64();
@@ -766,13 +830,19 @@ static void captureLoop() {
     while(active) {
         UINT length=0,addrLength=(UINT)sizeof(addresses);
         if(!wdRecvEx(divert,packets.data(),(UINT)packets.size(),&length,0,addresses.data(),&addrLength,nullptr)){
-            if(active)lastError=GetLastError();break;
+            if(active){lastError=GetLastError();markCaptureFailed();}break;
         }
         OwnerBatch owners;void* current=packets.data();UINT remaining=length;
         ++packetMetrics.batches;
         for(UINT i=0;i<addrLength/sizeof(WINDIVERT_ADDRESS)&&remaining;i++) {
             void* next=nullptr;UINT nextLength=0;
-            if(!wdParsePacket(current,remaining,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,&next,&nextLength)||nextLength>=remaining){++packetMetrics.parseErrors;lastError=ERROR_INVALID_DATA;break;}
+            if(!wdParsePacket(current,remaining,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,&next,&nextLength)||nextLength>=remaining){
+                ++packetMetrics.parseErrors;lastError=ERROR_INVALID_DATA;
+                // Only a bounded IP length can locate the next address/packet pair after a parser rejection.
+                const auto* bad=(const uint8_t*)current;UINT skip=remaining>=20&&(bad[0]>>4)==4?be16(bad+2):remaining>=40&&(bad[0]>>4)==6?40+be16(bad+4):0;
+                if(skip<20||skip>remaining)break;
+                current=(uint8_t*)current+skip;remaining-=skip;continue;
+            }
             std::span<uint8_t> p((uint8_t*)current,remaining-nextLength);
             ++packetMetrics.packets;packetMetrics.bytes+=p.size();packetMetrics.impostor+=addresses[i].Impostor;packetMetrics.loopback+=addresses[i].Loopback;
             if((p[0]>>4)==4&&p.size()>=20&&p[9]==1)++packetMetrics.icmp;
@@ -783,7 +853,7 @@ static void captureLoop() {
             uint64_t elapsed=qpcUs()-begin;packetMetrics.classifyUs+=elapsed;peak(packetMetrics.classifyMaxUs,elapsed);
             current=next;remaining=nextLength;
         }
-        if(!direct.flush())break;
+        if(!direct.flush()){markCaptureFailed();break;}
     }
 }
 
@@ -801,7 +871,7 @@ static int replacePolicy(const RouteRule* entries,uint32_t countRules,const wcha
     std::vector<RouteRule> next;
     if(countRules)next.assign(entries,entries+countRules);
     std::sort(next.begin(),next.end(),[](const RouteRule&a,const RouteRule&b){return std::make_pair(a.pid,a.created)<std::make_pair(b.pid,b.created);});
-    for(size_t i=0;i<next.size();i++)if(!next[i].pid||!next[i].created||next[i].blocked>2||(next[i].reserved&~1u)||(i&&next[i-1].pid==next[i].pid&&next[i-1].created==next[i].created))return 0;
+    for(size_t i=0;i<next.size();i++)if(!next[i].pid||!next[i].created||next[i].blocked>3||(next[i].reserved&~13u)||(i&&next[i-1].pid==next[i].pid&&next[i-1].created==next[i].created))return 0;
     std::vector<std::wstring> nextGuards;if(replaceGuards&&paths)for(auto p=paths;*p;p+=wcslen(p)+1)nextGuards.emplace_back(p);
     std::vector<std::wstring> nextImages;if(images)for(auto p=images;*p;p+=wcslen(p)+1){
         size_t length=wcslen(p);if(length<5||length>1024||nextImages.size()>=128||wcspbrk(p,L"*?\r\n")||_wcsicmp(p+length-4,L".exe")!=0)return 0;
@@ -815,7 +885,7 @@ static int replacePolicy(const RouteRule* entries,uint32_t countRules,const wcha
             globalBypassRemote==(bypassRemote!=0)&&remoteImages==nextImages&&rdpPid==nextRdpPid&&rdpCreated==nextRdpCreated&&rdpPort==nextRdpPort)return 1;
         unrelatedProcesses.clear();
         if(replaceGuards&&guards!=nextGuards)guardResults.clear();
-        rules=std::move(next);if(replaceGuards)guards.swap(nextGuards);globalProxy=nextGlobal;globalState=nextState;globalBypassLan=bypassLan!=0;
+        rules=std::move(next);if(replaceGuards){guards.swap(nextGuards);rebuildSandboxBoxes();}globalProxy=nextGlobal;globalState=nextState;globalBypassLan=bypassLan!=0;
         updateProcessJobs();
         for(const auto& r:rules)if(r.reserved&1) {
             auto key=std::make_pair(r.pid,r.created);
@@ -857,9 +927,13 @@ API int Core_SetOwner(const wchar_t* sid){PSID parsed=nullptr;if(!ConvertStringS
 API int Core_RouteForTest(uint32_t pid,uint64_t birth,int ipv6,uint32_t* proxy) {RouteRule r{};int action=policyAction(pid,birth,ipv6!=0,r);if(proxy)*proxy=r.proxy;return action;}
 API int Core_RoutePacketForTest(uint32_t pid,uint64_t birth,int ipv6,uint16_t localPort,uint32_t* proxy) {RouteRule r{};int action=policyAction(pid,birth,ipv6!=0,r,localPort);if(proxy)*proxy=r.proxy;return action;}
 API int Core_SupportsSandboxGuards(){return 1;}
-API void Core_ClearGuards(){std::unique_lock lk(stateMutex);guards.clear();guardResults.clear();}
-API void Core_AddGuard(const wchar_t* path){if(!path)return;std::unique_lock lk(stateMutex);for(const auto& g:guards)if(_wcsicmp(g.c_str(),path)==0)return;guards.emplace_back(path);guardResults.clear();}
-API void Core_SetGuards(const wchar_t* paths){std::vector<std::wstring> next;if(paths){for(auto p=paths;*p;p+=wcslen(p)+1)next.emplace_back(p);}std::unique_lock lk(stateMutex);if(guards!=next){guards.swap(next);guardResults.clear();}}
+API int Core_SupportsP0RoutingSafety(){return 1;}
+API int Core_CheckSandboxIdentity(){return checkSandboxDriver();}
+API void Core_SandboxIdentityDetail(wchar_t* buffer,int capacity){if(!buffer||capacity<1)return;std::lock_guard lk(sandboxHealthMutex);wcsncpy_s(buffer,capacity,sandboxDriverDetail.c_str(),_TRUNCATE);}
+API int Core_SandboxIdentityState(){return sandboxIdentityState;}
+API void Core_ClearGuards(){std::unique_lock lk(stateMutex);guards.clear();rebuildSandboxBoxes();guardResults.clear();}
+API void Core_AddGuard(const wchar_t* path){if(!path)return;std::unique_lock lk(stateMutex);for(const auto& g:guards)if(_wcsicmp(g.c_str(),path)==0)return;guards.emplace_back(path);rebuildSandboxBoxes();guardResults.clear();}
+API void Core_SetGuards(const wchar_t* paths){std::vector<std::wstring> next;if(paths){for(auto p=paths;*p;p+=wcslen(p)+1)next.emplace_back(p);}std::unique_lock lk(stateMutex);if(guards!=next){guards.swap(next);rebuildSandboxBoxes();guardResults.clear();}}
 API void Core_GetTraffic(uint32_t pid,Traffic* output){if(!output)return;*output={};std::shared_lock lk(stateMutex);for(const auto& [key,t]:traffic)if(key.first==pid){output->sent+=t.sent;output->received+=t.received;output->dropped+=t.dropped;}}
 API void Core_GetProcessStats(uint32_t pid,uint64_t birth,Traffic* output,uint32_t* tcp,uint32_t* udp){
     if(output){std::shared_lock lk(stateMutex);auto it=traffic.find({pid,birth});*output=it==traffic.end()?Traffic{}:it->second;}
@@ -871,10 +945,30 @@ API uint32_t Core_GetFlowEvents(FlowEvent* output,uint32_t capacity){
     uint32_t n=(uint32_t)(std::min)((size_t)capacity,events.size());std::copy(events.end()-n,events.end(),output);return n;
 }
 API uint32_t Core_LastError(){return lastError;}
-API int Core_IsRunning(){return active&&lastError==0;}
+API int Core_IsRunning(){return active&&!captureFailed;}
+static INT16 capturePriority=100;
+API int Core_ReplaceCapture(){
+    std::lock_guard lifecycle(lifecycleMutex);
+    if(!active||!wdOpen||!wdClose||!wdShutdown){lastError=ERROR_INVALID_STATE;return 0;}
+    if(!captureFailed)return 1;
+    if(DWORD error=sandboxFirewall::withdraw()){lastError=error;return 0;}
+    // WinDivert higher numeric priorities receive first. Both handles exist
+    // throughout the transition; the replacement queues until the old reader ends.
+    INT16 nextPriority=capturePriority==100?101:100;
+    HANDLE replacement=wdOpen("outbound and (ip or ipv6)",WINDIVERT_LAYER_NETWORK,nextPriority,0);
+    if(replacement==INVALID_HANDLE_VALUE){lastError=GetLastError();return 0;}
+    HANDLE old=divert;
+    wdShutdown(old,WINDIVERT_SHUTDOWN_RECV);
+    if(captureThread.joinable())captureThread.join();
+    {std::lock_guard send(sendMutex);divert=replacement;wdClose(old);capturePriority=nextPriority;}
+    captureFailed=false;
+    try { captureThread=std::thread([](){try{captureLoop();}catch(...){lastError=ERROR_UNHANDLED_EXCEPTION;markCaptureFailed();}}); }
+    catch(...){markCaptureFailed();lastError=ERROR_NOT_ENOUGH_MEMORY;return 0;} // Keep replacement intercepting.
+    lifecycleEvent("capture-replaced");return 1;
+}
 API int Core_Start(const wchar_t* libraryPath) {
-    std::lock_guard lifecycle(lifecycleMutex);if(active)return 1;
-    lastError=0;if(!queryProcessInfo()){lastError=ERROR_PROC_NOT_FOUND;return 0;}
+    std::lock_guard lifecycle(lifecycleMutex);if(active)return Core_IsRunning();
+    lastError=0;captureFailed=false;if(!queryProcessInfo()){lastError=ERROR_PROC_NOT_FOUND;return 0;}
     WSADATA ws{};int startup=WSAStartup(MAKEWORD(2,2),&ws);if(startup){lastError=startup;return 0;}
     auto failed=[&](){if(listener!=INVALID_SOCKET){closesocket(listener);listener=INVALID_SOCKET;}if(driverLibrary){FreeLibrary(driverLibrary);driverLibrary=nullptr;}WSACleanup();return 0;};
     driverLibrary=LoadLibraryExW(libraryPath,nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -889,14 +983,17 @@ API int Core_Start(const wchar_t* libraryPath) {
     u_long nonblocking=1;if(ioctlsocket(listener,FIONBIO,&nonblocking)){lastError=WSAGetLastError();return failed();}
     int len=sizeof(local);getsockname(listener,(sockaddr*)&local,&len);listenPort=ntohs(local.sin_port);
     divert=wdOpen("outbound and (ip or ipv6)",WINDIVERT_LAYER_NETWORK,100,0);
+    capturePriority=100;
     if(divert==INVALID_HANDLE_VALUE){lastError=GetLastError();return failed();}
     {std::lock_guard lk(retryMutex);deferredPackets.clear();}
-    auto safe=[](auto task){return std::thread([task](){try{task();}catch(...){lastError=ERROR_UNHANDLED_EXCEPTION;}});};
-    startTelemetry();active=true;captureThread=safe(captureLoop);acceptThread=safe(acceptLoop);pruneThread=safe(pruneLoop);retryThread=safe(retryLoop);lifecycleEvent("started");return 1;
+    auto safe=[](auto task,bool capture=false){return std::thread([task,capture](){try{task();}catch(...){lastError=ERROR_UNHANDLED_EXCEPTION;if(capture)markCaptureFailed();}});};
+    startTelemetry();active=true;captureThread=safe(captureLoop,true);acceptThread=safe(acceptLoop);pruneThread=safe(pruneLoop);retryThread=safe(retryLoop);lifecycleEvent("started");return 1;
 }
 API void Core_Stop() {
+    if(DWORD error=sandboxFirewall::withdraw()){lastError=error;return;}
     lifecycleEvent("stop-requested");
     std::lock_guard lifecycle(lifecycleMutex);stopGateway();if(!active.exchange(false))return;
+    {std::lock_guard lk(listenerPortMutex);if(listenPort)retiredListenerPorts[listenPort]=GetTickCount64();}
     closesocket(listener);listener=INVALID_SOCKET;
     {std::lock_guard lk(flowMutex);for(auto& [k,f]:flows)f->close(EngineStopped);}
     wdShutdown(divert,WINDIVERT_SHUTDOWN_RECV);
@@ -907,7 +1004,7 @@ API void Core_Stop() {
     {std::lock_guard lk(retryMutex);deferredPackets.clear();}
     while(workers)Sleep(10);
     {std::lock_guard lk(sendMutex);wdClose(divert);divert=INVALID_HANDLE_VALUE;}
-    {std::lock_guard lk(flowMutex);flows.clear();aliases.clear();}
+    // Preserve closed tuple/alias quarantine across an in-process restart.
     if(driverLibrary){FreeLibrary(driverLibrary);driverLibrary=nullptr;}WSACleanup();
     lifecycleEvent("stopped");
 }

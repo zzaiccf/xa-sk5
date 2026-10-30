@@ -1,5 +1,25 @@
 # 架構與生命週期
 
+## 0.1.31 複審修正與驗收邊界
+
+本輪未發布、未安裝；實作與隔離測試見 [RELEASE-VALIDATION-0.1.31](RELEASE-VALIDATION-0.1.31.md)。沒有操作實機服務、遊戲、Sandboxie 設定或代理。
+
+第二輪 N1–N4：PID query 的未知（-1）與裝置／ABI 失敗（-2）分離，封包執行緒只設驅動檢查旗標；單一 PID 500 ms 重試不改全域健康。控制工作每 5 秒查 GET_VERSION，已核驗驅動連續三次或 15 秒失敗才轉 -1，恢復轉 1；控制工作在等待 broker 前撤回 WFP，重建政策後放行，不改持久 Enabled。全新未核驗驅動不享有寬限。WFP Replace 在 BLOCK 交易後建立全部映像的新 dynamic lease，再關閉舊 lease；建置失敗保留舊放行，關閉失敗保留 handle 供重試。映像掃描（Arm、Save、Remove、規則刪除及初始化）在 Gate 外；回鎖核對世代，初始化完成前暫停。owned 列舉使用 provider＋四個 ALE layer 範本及全 action mask，另驗 sublayer；不掃全機 filter。分階段實機工具僅完成編譯，見 [驗收清單](LIVE-ACCEPTANCE-0.1.31.md)。
+
+- 全局與沙盒只在同一節點互斥，不做模式互斥。全局啟用前拒絕已知重複出口，再以候選線路檢測結果核對；執行中重複只封鎖其他綁定，保留既有全局路由。
+- 沙盒原生規則 Reserved=13：父系接續（bit 0）、不建立 Job（bit 2）、沙盒身分失效時封鎖（bit 3）。PID＋建立時間釘選及父系接續保留。`@box:` 只對有效票據／存活成員生效；Game、Box、來源路徑保護保留。
+- 原生身分查詢先核對 Sandboxie Plus 1.18.8／driver 5.73.8／ABI 0x57230。未知 ABI 拒絕 Arm，查詢失敗不封鎖無關主機程序。已知身分與祖先鏈、受保護映像維持封鎖；撤回已知映像的 WFP 動態放行。目錄外、服務代建且尚未核驗的未知程序仍是無法保證的邊界。
+- box 清單在政策更新時建立不可變快照；4096 筆 PID 身分快取逐筆淘汰。PID 4／未受管 PID 的 birth=0 不因沙盒存在而封鎖。受管 PID 身分無法確認時維持封鎖。
+- 250 ms 沙盒觀察僅在有效路由狀態有變化時套用政策。Arm 在 Gate 外讀 INI 專屬區段（1 秒等待上限），不再執行三個 SbieIni 查詢。停止在 Gate 外操作 broker，返回後核對世代；過程中拒絕新啟動。snapshot 回傳已序列化、原子發布的快照，不等 Gate；寫入完成或監測週期更新資料。
+- 暫時 broker 失敗保留仍存活的已核驗成員，持續失敗封鎖。correlation id、部分回覆拒絕及 500 ms～30 秒共同退避保留。
+- 正常停止先逐一結束沙盒，失敗保留封鎖。明確的強制停止先釘選核對並結束已知成員，列出未關閉與未知範圍，第二次確認才 SCM stop；沒有靜默後備。Desktop、Setup、Updater、Maintenance 共用 Core 結束流程。
+- 擷取健康不重啟；故障立即開啟不同 priority 的新 handle，再 shutdown／join 舊讀取執行緒、交換 send handle 並關舊 handle。WinDivert 數值較高的 priority 先攔截；使用 100／101 輪替。失敗保留舊 handle；持續故障且有存活沙盒時才排程結束沙盒。
+- 已關閉 TCP tuple／alias 的 240 秒隔離使用獨立輕量表。完整 Flow 在清理週期移除；活流以原子計數限制 2048，不再用 32768 總筆數阻擋新流。沒有活流時不取得 flowMutex；隔離查詢使用獨立共享鎖。prune 的系統表讀取、UDP比對與連線結束在長鎖外執行。
+- `PersistentFirewall.h` 使用實際 Fwpm API：專屬持久 provider／sublayer，四個 ALE CONNECT／RECV_ACCEPT V4/V6 layer 的 AppId 精確路徑 BLOCK（權重 1、排除 loopback）；健康期間以 dynamic session 添加相同條件 PERMIT（權重 2）。一般 soft permit 不覆蓋其他防火牆的拒絕。服務崩潰由 BFE 回收 session；捕獲故障、重啟與退出前主動撤回。路徑變更在交易內替換 BLOCK；正常退出不刪持久封鎖。
+- WFP 管理僅由正式服務的無參數建構式注入；隔離 Controller 測試不接觸 BFE。移除實例更新其路徑集合；UI 清除須先停止並移除全部沙盒；解除安裝清理專屬 provider。WFP 整合測試使用不同 GUID，預設只編譯，必須明確 opt-in 且具有管理員權限。
+- 限制：精確 AppId 不涵蓋未列出的系統 EXE、共享 DNS、任意新 EXE；一般 PID 綁定不套 WFP。已授權連線的 FIN／RST 不能由 ALE 持久政策宣稱完全防止。持久物件在 BFE 啟動載入，不等於 TCP/IP 啟動至 BFE 之前的 boot-time 保護。SandboxieLogon 的每盒 SID 尚未實測，不自動改動既有設定。
+- 提權更新保留受保護 helper／job、官方來源重取與獨占解壓。已安裝版離線更新／回復、可攜版更新服務及 0.1.30 第一次升級，改用官方安裝程式。UI 提供下載頁按鈕，未新增發布者簽章。
+
 ## 各線路分配數量（0.1.26 本機測試）
 
 自動規則以 `ProxyCapacities` 保存節點 ID 對應的 0–10 個名額；沒有覆寫的節點沿用 `PerProxy`（新規則為 1），讓舊規則及後續匯入節點維持可預期的預設。零只停止新增分配。`AutoProxyPlanner` 計入所有既有綁定並保留獨占限制及總管理上限十個，降低名額不移動或中斷既有窗口，待名額釋放才重新分配。節點刪除／清空同步移除自訂名額。
@@ -79,7 +99,7 @@ GlobalProxy 保存所選代理、啟用狀態、區網直連選項與啟用前�
 
 啟動時服務先保留路由與目錄保護，再交付限時一次性票據。使用者身分的沙盒輔助程序透過受限命名管道登記；服務核對管道 PID、建立時間、沙盒名稱及安裝者 SID。由官方程序 API 辨識全部成員，包含服務代建程序；不繼承共用 SbieSvc 的線路。核驗後，沙盒內使用普通 socket 測量 TCP／UDP 出口，與該線路最近成功結果一致後才建立登入器。直接 DNS 結果另列，不能推論共享 Windows DNS 已分流。
 
-服務透過受保護安裝目錄的長駐 `sandbox-broker` 子程序呼叫官方 SbieDll API；資料僅經繼承的標準輸入／輸出傳遞，沒有對外控制埠。這避免 Sandboxie 重新載入設定時，把載入 SbieDll 的 xa sk5 Windows 服務列為需要重啟的主機服務。查詢有逾時，失敗時清空可信成員並封鎖；封包路徑只使用驗證後的 PID＋建立時間規則。受管 Game／Box 路徑的啟動保護在程序擁有者無法直接查詢時仍生效。
+服務透過受保護安裝目錄的長駐 `sandbox-broker` 子程序呼叫官方 SbieDll API；資料僅經繼承的標準輸入／輸出傳遞，沒有對外控制埠。這避免 Sandboxie 重新載入設定時，把載入 SbieDll 的 xa sk5 Windows 服務列為需要重啟的主機服務。0.1.31 的查詢容錯與首包查詢策略以上方 P0 章節為準，不再於單次失敗清空可信成員。受管目錄的啟動保護在程序擁有者無法直接查詢時仍生效。
 
 `SupportsSandboxInstances` 與原生 `Core_SupportsSandboxGuards` 用於拒絕不相容的舊元件。快照另帶沙盒狀態及沙盒內實測出口；界面不把建立登入器當成客戶端登入成功。正常停止先針對已核對的沙盒名稱及使用者工作階段結束成員，再關閉核心。TCP listener 採可取消的輪詢，避免停止時等待阻塞的 accept；核心階段與錯誤碼記錄於診斷目錄的 `core-lifecycle.log`。
 

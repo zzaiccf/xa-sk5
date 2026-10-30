@@ -45,7 +45,29 @@ public sealed class SandboxieRuntime : IDisposable
         // With a non-null count pointer the API uses it as IN capacity / OUT count, and PID data starts at index zero.
         if (enumerate(box, 1, uint.MaxValue, pids, ref count) != 0) throw new InvalidOperationException("無法確認沙盒程序，保持封鎖。");
         if (count >= pids.Length) throw new InvalidOperationException("沙盒程序過多，無法完整驗證。");
-        return pids.Take((int)count).Select(p => Query((int)p)).OfType<SandboxProcess>().ToArray();
+        return CompleteSnapshot(pids.Take((int)count).Select(p => Query((int)p)));
+    }
+    public static SandboxProcess[] CompleteSnapshot(IEnumerable<SandboxProcess?> members)
+    {
+        var snapshot = members.ToArray();
+        if (snapshot.Any(p => p is null)) throw new IOException("沙盒成員查詢不完整，保留上次核驗身分。");
+        return snapshot.Select(p => p!).ToArray();
+    }
+    public void ValidateSettings(SandboxInstanceProfile profile) => ValidatePersistedSettings(profile);
+    public static void ValidatePersistedSettings(SandboxInstanceProfile profile, string? settingsFile = null)
+    {
+        SandboxInstances.Validate(profile);
+        string ini = settingsFile ?? new[] { Path.Combine(InstallDirectory,"Sandboxie.ini"), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"Sandboxie.ini") }.FirstOrDefault(File.Exists)
+            ?? throw new IOException("找不到沙盒設定，拒絕啟動。");
+        using var stream = new FileStream(ini, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        if(stream.Length>1024*1024)throw new IOException("沙盒設定過大，拒絕啟動。");
+        using var reader=new StreamReader(stream, System.Text.Encoding.UTF8, true);
+        var lines=reader.ReadToEnd().Split(['\r','\n'],StringSplitOptions.RemoveEmptyEntries);
+        if (!lines.Any(l=>l.Trim().Equals("["+profile.BoxName+"]",StringComparison.OrdinalIgnoreCase))) throw new IOException("BoxName 不符，拒絕啟動。");
+        var persisted=SandboxIniSettings.Read(lines,profile.BoxName);var expected=SandboxCompatibility.Settings(profile);
+        foreach(string key in new[]{"Enabled","FileRootPath","OpenPipePath"}) {
+            if (!persisted.GetValueOrDefault(key,[]).SequenceEqual(expected[key],StringComparer.OrdinalIgnoreCase)) throw new IOException(key+" 不符，拒絕啟動。");
+        }
     }
     public void TerminateOwned(SandboxInstanceProfile profile, string ownerSid)
     {
@@ -60,7 +82,7 @@ public sealed class SandboxieRuntime : IDisposable
             else if (terminate(session, profile.BoxName) == 0 && Processes(profile.BoxName).Any(p => p.SessionId == session))
                 throw new IOException("無法停止受管沙盒：" + profile.Name);
         }
-        for (int attempt = 0; attempt < 10 && Processes(profile.BoxName).Length > 0; attempt++) Thread.Sleep(100);
+        for (int attempt = 0; attempt < 300 && Processes(profile.BoxName).Length > 0; attempt++) Thread.Sleep(100);
         if (Processes(profile.BoxName).Length > 0) throw new IOException("沙盒仍有程序未結束，請重試。");
     }
     public void Dispose() => NativeLibrary.Free(library);

@@ -71,7 +71,7 @@ internal static partial class Program
             Report("驅動簽章通過；SHA-256 " + Hash(Path.Combine(driver, "WinDivert64.sys")));
             ct.ThrowIfCancellationRequested();
             Report("正在安裝代理元件；請勿關機或結束安裝程序…");
-            Run("sc.exe", ["stop", "WindowSocks"], false); WaitForServiceStop(); serviceStopped = true;
+            await WindowSocks.Recovery.ForceStopDialog.StopAsync(); WaitForServiceStop(); serviceStopped = true;
             Directory.CreateDirectory(InstallDirectory); Protect(InstallDirectory, true);
             foreach (string entry in Directory.EnumerateFileSystemEntries(InstallDirectory, "*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint })) {
                 // Each destination ancestor is checked again before writing; never follow a user-created junction.

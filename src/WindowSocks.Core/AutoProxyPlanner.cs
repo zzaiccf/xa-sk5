@@ -53,13 +53,14 @@ public static class AutoProxyPlanner
 
     public static AssignmentItem[] Additions(IEnumerable<TargetInstance> candidates, IEnumerable<InstanceBinding> current,
         IEnumerable<ProxyProfile> profiles, int perProxy, IEnumerable<string> excluded, bool launchOrder = false,
-        IReadOnlyDictionary<Guid, int>? capacities = null)
+        IReadOnlyDictionary<Guid, int>? capacities = null, IEnumerable<InstanceBinding>? reservations = null)
     {
         ProxyCapacity.Validate(perProxy, capacities ?? new Dictionary<Guid, int>());
         var bindings = current.ToArray(); var skip = excluded.Concat(bindings.Select(b => b.TargetKey)).ToHashSet(StringComparer.Ordinal);
         var usedProcesses = bindings.SelectMany(b => b.Processes.Concat(b.IncludeChildren ? b.Descendants : [])).ToHashSet();
-        var counts = bindings.GroupBy(b => b.ProxyId).ToDictionary(g => g.Key, g => g.Count());
-        var exclusive = bindings.Where(b => !b.SharedProxy).Select(b => b.ProxyId).ToHashSet();
+        var occupied=new ProxyOwnershipLedger(bindings.Concat((reservations??[]).Select(e=>e with{SharedProxy=false}))).Entries;
+        var counts = occupied.GroupBy(b => b.ProxyId).ToDictionary(g => g.Key, g => g.Count());
+        var exclusive = occupied.Where(b => !b.SharedProxy).Select(b => b.ProxyId).ToHashSet();
         var pool = profiles.Select(p => p.Id).Distinct().Where(id => !exclusive.Contains(id)).ToArray();
         var items = new List<AssignmentItem>();
         var ordered = launchOrder

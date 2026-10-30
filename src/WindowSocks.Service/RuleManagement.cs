@@ -6,7 +6,7 @@ public sealed partial class Controller
 {
     private void DeleteRule(DeleteRuleRequest request)
     {
-        if (request.Key.StartsWith("sandbox:", StringComparison.Ordinal) && Guid.TryParseExact(request.Key[8..], "N", out var sandboxId)) { RemoveSandbox(sandboxId); return; }
+        if(request.Key.StartsWith("sandbox:",StringComparison.Ordinal))throw new InvalidOperationException("沙盒規則必須經背景移除流程處理。");
         var original = config with { }; var previousRuntime = vmwareRuntime;
         var next = ProxyRules.Delete(config, request.Key);
         try {

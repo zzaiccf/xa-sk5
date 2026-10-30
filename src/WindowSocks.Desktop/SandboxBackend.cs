@@ -51,6 +51,7 @@ public partial class Backend
     {
         var state = await Call<Snapshot>(Command.Create("snapshot", new { }), ct).ConfigureAwait(false);
         if (!state.SupportsSandboxInstances) throw new InvalidOperationException("桌面沙盒需要 0.1.27 背景服務及核心，請先到設定安裝／修復。");
+        if (!state.SupportsSandboxSafety) throw new InvalidOperationException("桌面沙盒需要 0.1.31 背景服務與原生核心的封包身分保護，請先更新完整元件。");
         return state;
     }
     public async Task PrepareSandbox(SandboxInstanceProfile profile, IProgress<string>? progress, CancellationToken ct)

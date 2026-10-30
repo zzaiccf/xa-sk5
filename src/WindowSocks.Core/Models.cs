@@ -86,6 +86,7 @@ public sealed record Snapshot(ProxyProfile[] Proxies, InstanceBinding[] Bindings
     public bool SupportsProxyCapacities { get; init; }
     public bool SupportsSandboxInstances { get; init; }
     public bool SupportsSandboxExperience { get; init; }
+    public bool SupportsSandboxSafety { get; init; }
     public SandboxInstanceProfile[] SandboxInstances { get; init; } = [];
     public SandboxInstanceStatus[] SandboxStatuses { get; init; } = [];
     public VmwareState? Vmware { get; init; }

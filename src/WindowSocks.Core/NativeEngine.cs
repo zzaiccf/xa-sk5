@@ -10,6 +10,14 @@ public static class NativeEngine
         try { return NativeLibrary.TryGetExport(library, "Core_SupportsSandboxGuards", out _); } finally { NativeLibrary.Free(library); }
     });
     public static bool SupportsSandboxGuards => Present && sandboxGuardSupport.Value;
+    private static readonly Lazy<bool> p0RoutingSafety = new(() => {
+        if (!NativeLibrary.TryLoad(Path.Combine(AppContext.BaseDirectory, Dll), out var library)) return false;
+        try { return NativeLibrary.TryGetExport(library, "Core_SupportsP0RoutingSafety", out _); } finally { NativeLibrary.Free(library); }
+    });
+    public static bool SupportsP0RoutingSafety => Present && p0RoutingSafety.Value;
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_CheckSandboxIdentity();
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_SandboxIdentityState();
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern void Core_SandboxIdentityDetail(System.Text.StringBuilder buffer, int capacity);
     [StructLayout(LayoutKind.Sequential)] public struct Rule
     { public uint Pid, Proxy; public ulong Created; public uint Blocked, Reserved; }
     [StructLayout(LayoutKind.Sequential)] public struct Traffic
@@ -62,6 +70,7 @@ public static class NativeEngine
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern void Core_SetGuards(string paths);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int Core_Start(string path);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern void Core_Stop();
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_ReplaceCapture();
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern int Core_IsRunning();
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern uint Core_LastError();
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] public static extern void Core_GetTraffic(uint pid, out Traffic traffic);

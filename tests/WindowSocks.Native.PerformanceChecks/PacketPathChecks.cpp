@@ -2,12 +2,14 @@
 // fake receive/send functions. Never opens a WinDivert handle or changes routing.
 #include <cstdio>
 #include <stdexcept>
+#include <future>
 #include "../../native/WindowSocksNative.cpp"
 #include <tlhelp32.h>
 
 static unsigned checks=0,checksumCalls=0,sendCalls=0,batchSends=0,received=0,delivered=0;
 static unsigned totalPackets=0;
 static bool firstUnknown=false;
+static bool malformedFirst=false;
 static DWORD singleSendError=0,batchSendError=0;
 static std::vector<uint8_t> fixture;
 static WINDIVERT_ADDRESS lastAddress{};
@@ -34,6 +36,7 @@ static BOOL fakeRecvEx(HANDLE,void* p,UINT capacity,UINT* n,UINT64,WINDIVERT_ADD
     for(UINT i=0;i<count;i++){
         memcpy((uint8_t*)p+i*fixture.size(),fixture.data(),fixture.size());
         if(firstUnknown&&received+i==0)put16((uint8_t*)p+i*fixture.size()+20,0);
+        if(malformedFirst&&received+i==0)((uint8_t*)p)[i*fixture.size()]=0x40;
         a[i]={};a[i].Outbound=1;a[i].IPChecksum=a[i].TCPChecksum=a[i].UDPChecksum=1;a[i].Timestamp=received+i;
     }
     received+=count;*n=count*(UINT)fixture.size();*addrLength=count*sizeof(WINDIVERT_ADDRESS);return TRUE;
@@ -46,7 +49,7 @@ static std::vector<uint8_t> packet(bool udp=false,bool ipv6=false){
     if(udp)put16(p.data()+off+4,20);else{p[off+12]=0x50;p[off+13]=2;}
     return p;
 }
-static void reset(){Core_ReplacePolicy(nullptr,0,L"\0");received=delivered=batchSends=sendCalls=checksumCalls=0;tcpOwners.clear();firstUnknown=false;singleSendError=batchSendError=0;lastError=0;}
+static void reset(){Core_ReplacePolicy(nullptr,0,L"\0");received=delivered=batchSends=sendCalls=checksumCalls=0;tcpOwners.clear();firstUnknown=false;singleSendError=batchSendError=0;lastError=0;captureFailed=false;sandboxIdentityState=0;sandboxIdentityCache.clear();sandboxIdentityOrder.clear();retiredTuples.clear();retiredAliases.clear();retiredTupleCount=0;}
 static uint32_t parentPid(){
     uint32_t parent=0;HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);PROCESSENTRY32W e{};e.dwSize=sizeof(e);
     if(Process32FirstW(snap,&e))do{if(e.th32ProcessID==GetCurrentProcessId())parent=e.th32ParentProcessID;}while(Process32NextW(snap,&e));CloseHandle(snap);return parent;
@@ -126,7 +129,7 @@ static void concurrentActivityChecks(){
     reset();
     auto add=[](uint8_t protocol,uint16_t port,uint64_t last,bool alive=true,bool gateway=true){
         auto f=std::make_shared<Flow>();f->key={inet_addr("192.0.2.1"),inet_addr("198.51.100.1"),port,443,protocol};
-        f->gatewayInterface=gateway?1:0;f->last=last;f->alive=alive;f->alias=port;
+        f->gatewayInterface=gateway?1:0;f->last=last;f->alias=port;if(!alive){f->close();f->closedAt=last;quarantine(f->key,f->alias,last);}
         flows[f->key]=f;aliases[f->alias]=f;return f;
     };
     // Model an activity update arriving after prune sampled its clock. Future
@@ -138,12 +141,12 @@ static void concurrentActivityChecks(){
     prune(now);
     require(tcp->alive&&flows.count(tcp->key)&&aliases.count(tcp->alias),"concurrent TCP activity must not underflow into idle expiration");
     require(udp->alive&&flows.count(udp->key),"concurrent UDP activity must not underflow into idle expiration");
-    require(flows.count(closed->key),"recently closed flow must retain its grace period despite a newer activity timestamp");
+    require(retiredTuples.count(closed->key),"recently closed flow must retain its grace period despite a newer activity timestamp");
     require(opening->alive,"a flow opened after the cleanup clock sample must retain its socket discovery grace period");
     tcp->last=now;udp->last=now;closed->last=now;opening->gatewayInterface=1;
-    prune(now);require(flows.size()==4,"recent activity and closed-flow grace periods must be retained");
-    tcp->last=now-1800000;udp->last=now-60000;closed->last=now-5000;
-    prune(now);require(flows.size()==4,"cleanup must honor the exact idle and closed-grace boundaries");
+    prune(now);require(flows.size()==3,"recent activity and closed-flow grace periods must be retained");
+    tcp->last=now-1800000;udp->last=now-60000;closed->last=now-240000;
+    prune(now);require(flows.size()==3,"cleanup must honor the exact idle and closed-grace boundaries");
     prune(now+1);
     require(!tcp->alive&&!udp->alive&&flows.size()==1&&flows.count(opening->key),"truly idle TCP/UDP and expired closed flows must still be removed");
     require(aliases.size()==1&&aliases.count(opening->alias),"cleanup must release only expired flow aliases");
@@ -238,21 +241,165 @@ static void telemetryChecks(){
     if(find!=INVALID_HANDLE_VALUE){do{++count;}while(FindNextFileW(find,&entry));FindClose(find);}
     require(count==16,"rotation must retain only sixteen generated segments");require(GetFileAttributesW((directory+L"\\user-document.txt").c_str())!=INVALID_FILE_ATTRIBUTES,"rotation must preserve unrelated documents");
     FILE* file=nullptr;_wfopen_s(&file,telemetryPath.c_str(),L"rb");require(file!=nullptr,"new telemetry segment must contain a record");char line[4096]{};bool written=fgets(line,sizeof(line),file)!=nullptr;fclose(file);
-    require(written&&strstr(line,"\"native\":\"0.1.30\"")&&strstr(line,"\"ageMaxUs\""),"rotated record must include version and queue timing");
+    require(written&&strstr(line,"\"native\":\"" XA_VERSION "\"")&&strstr(line,"\"ageMaxUs\""),"rotated record must include version and queue timing");
     telemetryPath.clear();telemetryDirectory.clear();
     // Delete only files in this exact directory created above; no recursive move/delete.
     find=FindFirstFileW((directory+L"\\*").c_str(),&entry);if(find!=INVALID_HANDLE_VALUE){do{if(!(entry.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY))DeleteFileW((directory+L"\\"+entry.cFileName).c_str());}while(FindNextFileW(find,&entry));FindClose(find);}require(RemoveDirectoryW(directory.c_str())!=0,"isolated telemetry files must be cleaned up");
 }
+static void p05Checks(){
+    reset(); auto p=packet();p[33]=0x11;
+    auto f=std::make_shared<Flow>();f->key={word(p.data()+12),word(p.data()+16),41001,443,6};
+    f->rule={UINT32_MAX-1,910,42,0,0};f->alias=42000;f->close();
+    flows[f->key]=f;aliases[f->alias]=f;
+    RouteRule r=f->rule;Core_ReplacePolicy(&r,1,L"\0");
+    WINDIVERT_ADDRESS a{};a.IPChecksum=a.TCPChecksum=1;PassThroughBatch out;auto owners=tcpOwner(r.pid,p);
+    require(processPacket(p,a,owners,&out),"P0-5 exited TCP tail must be classified");
+    require(out.addresses.empty()&&sendCalls==0,"P0-5 exited managed FIN must never escape directly");
+    p[33]=4;owners=tcpOwner(r.pid,p);require(processPacket(p,a,owners,&out)&&out.addresses.empty(),"P0-5 exited RST must never escape directly");
+    flows.clear();aliases.clear();reset();p=packet();put16(p.data()+20,listenPort);owners=tcpOwner(GetCurrentProcessId(),p);
+    require(processPacket(p,a,owners,&out)&&out.addresses.empty()&&sendCalls==0,"P0-5 orphan relay packet must be dropped");
+    retiredListenerPorts[17000]=GetTickCount64();put16(p.data()+20,17000);owners=tcpOwner(GetCurrentProcessId(),p);
+    require(processPacket(p,a,owners,&out)&&out.addresses.empty()&&sendCalls==0,"P0-5 retired listener port must never regain the service direct exemption");retiredListenerPorts.clear();
+    reset();RouteRule prior{UINT32_MAX-1,910,42,1,0},found{};Core_ReplacePolicy(&prior,1,L"unrelated.exe\0");
+    require(policyAction(prior.pid,0,false,found)==2,"P0-5 unknown birth for a managed PID must fail closed");
+    reset();f->last=1000;f->closedAt=1000;quarantine(f->key,f->alias,1000);flows[f->key]=f;aliases[f->alias]=f;prune(7000);
+    require(retiredAliases.count(f->alias),"P0-5 relay alias must remain quarantined for TCP TIME_WAIT");
+    prune(241001);require(!retiredAliases.count(f->alias),"P0-5 alias quarantine must eventually expire");flows.clear();aliases.clear();reset();
+}
+static void p06Checks(uint32_t pid,uint64_t birth){
+    reset();Core_SetProxy(910,"127.0.0.1",1080,"","");RouteRule exemption{pid,0,birth,3,0},found{};
+    Core_ReplacePolicyEx2(&exemption,1,L"\0",910,0,0,0,L"\0",0,0,0);require(policyAction(pid,birth,false,found)==0,"P0-6 guard exemption is direct when global is off");
+    Core_ReplacePolicyEx2(&exemption,1,L"\0",910,1,0,0,L"\0",0,0,0);require(policyAction(pid,birth,false,found)==1&&found.proxy==910,"P0-6 guard exemption must use the global proxy");
+    require(policyAction(pid,birth,true,found)==2,"P0-6 exempt IPv6 must retain global blocking");
+    Core_ReplacePolicyEx2(&exemption,1,L"\0",910,2,0,0,L"\0",0,0,0);require(policyAction(pid,birth,false,found)==2,"P0-6 unhealthy global must block exempt targets");reset();
+}
+static void p04Checks(){
+    reset();active=true;lastError=ERROR_INVALID_DATA;
+    require(Core_IsRunning()!=0,"P0-4 diagnostic parser error must not mark healthy capture as stopped");
+    lastError=0;singleSendError=ERROR_INVALID_PARAMETER;auto p=packet();WINDIVERT_ADDRESS a{};
+    require(!inject(p,a,false)&&Core_IsRunning()!=0,"P0-4 packet rejection must not tear down all flows");
+    gatewayError=ERROR_ACCESS_DENIED;require(Core_IsRunning()!=0,"P0-4 gateway errors must not mark host capture failed");gatewayError=0;
+    reset();fixture=packet();totalPackets=128;firstUnknown=true;malformedFirst=true;active=true;auto before=packetMetrics.parseErrors.load();captureLoop();
+    require(received==128&&delivered==127&&packetMetrics.parseErrors==before+1&&!captureFailed,"P0-4 malformed packet must not discard later valid packets in its batch");
+    malformedFirst=false;reset();active=false;
+}
+static void p01Checks(uint32_t pid,uint64_t birth){
+    reset();Core_SetGuards(L"@box:Xa_0123456789abcdef01234567\0");
+    sandboxIdentityQuery=[](uint32_t,uint64_t,std::wstring& box){box=L"Xa_0123456789abcdef01234567";return 1;};
+    RouteRule found{};
+    require(policyAction(pid,birth,false,found)==2,"P0-1 service-created sandbox member must block before discovery even outside game directory");
+    require(policyAction(pid,birth,true,found)==2,"P0-1 undiscovered sandbox IPv6 must block");
+    sandboxIdentityQuery=[](uint32_t,uint64_t,std::wstring& box){box.clear();return 0;};
+    require(policyAction(pid,birth+1,false,found)==0,"P0-1 outside same-image process must stay direct");
+    sandboxIdentityQuery={};reset();
+}
+static void r3Checks(uint32_t pid,uint64_t birth){
+    reset();Core_SetGuards(L"@box:Xa_0123456789abcdef01234567\0");
+    sandboxIdentityState=1;sandboxIdentityCache.clear();sandboxIdentityQuery=[](uint32_t,uint64_t,std::wstring&){return -1;};
+    RouteRule found{};
+    require(policyAction(pid,birth,false,found)==0,"R3 missing or incompatible identity driver must not block unrelated host traffic");
+    require(sandboxIdentityState==1,"N1 a single PID error must not change global driver health");
+    auto key=std::make_pair(pid,birth);int attempts=0;
+    sandboxIdentityQuery=[&](uint32_t,uint64_t,std::wstring&){++attempts;return 0;};
+    pendingSandbox(pid,birth);require(attempts==0,"N1 unknown PID retry must back off");
+    sandboxIdentityCache[key].checked=GetTickCount64()-500;
+    pendingSandbox(pid,birth);require(attempts==1,"N1 unknown PID retries after 500ms");
+    sandboxDriverFailures=0;recordSandboxDriverHealth(-1,1000);require(sandboxIdentityState==1,"N1 first driver failure keeps established routes");
+    recordSandboxDriverHealth(-1,6000);require(sandboxIdentityState==1,"N1 second driver failure keeps established routes");
+    recordSandboxDriverHealth(-1,11000);require(sandboxIdentityState==-1,"N1 third driver failure pauses managed routes");
+    recordSandboxDriverHealth(1,16000);require(sandboxIdentityState==1&&sandboxDriverFailures==0,"N1 driver recovery automatically resumes existing identities");
+    recordSandboxDriverHealth(-1,20000);recordSandboxDriverHealth(-1,35000);require(sandboxIdentityState==-1,"N1 15 second outage also reaches threshold");
+    recordSandboxDriverHealth(1,40000);
+    sandboxIdentityCache.clear();sandboxIdentityQuery=[](uint32_t,uint64_t,std::wstring&){return -2;};
+    pendingSandbox(pid,birth);require(sandboxIdentityState==1&&sandboxDriverCheckRequested,"N1 packet path requests control-thread driver check without changing global health");
+    sandboxIdentityState=-1;
+    RouteRule boxed{pid,910,birth,0,8};Core_SetProxy(910,"127.0.0.1",1080,"","");Core_ReplacePolicy(&boxed,1,L"\0");
+    require(policyAction(pid,birth,false,found)==2,"R3 verified sandbox members must block immediately on identity failure");
+    Core_ReplacePolicy(nullptr,0,L"@box:Xa_0123456789abcdef01234567\0");sandboxIdentityCache.clear();sandboxIdentityOrder.clear();
+    sandboxIdentityQuery=[](uint32_t,uint64_t,std::wstring&){return 0;};
+    for(uint32_t i=1;i<=5000;i++)pendingSandbox(i,100);
+    require(sandboxIdentityCache.size()==4096,"R3 cache pressure must evict incrementally, not discard all confirmed host identities");
+    sandboxIdentityQuery={};reset();
+}
+static void r5Checks(){
+    reset();Core_SetGuards(L"unrelated.exe\0");RouteRule found{};
+    require(policyAction(4,0,false,found)==0,"R5 System without a managed identity must not be blocked by unrelated guards");
+    require(policyAction(UINT32_MAX-1,0,false,found)==0,"R5 an unmanaged PPL/unknown-birth process must keep its existing policy");
+    RouteRule known{UINT32_MAX-1,910,123,1,0};Core_ReplacePolicy(&known,1,L"unrelated.exe\0");
+    require(policyAction(known.pid,0,false,found)==2,"R5 a previously managed PID with unknown birth must remain blocked");
+    reset();
+}
+static std::vector<std::string> recoverySteps;
+static bool recoveryOpenFails=false;
+static HANDLE recoveryOpen(const char*,WINDIVERT_LAYER,INT16 priority,UINT64 flags){
+    recoverySteps.push_back("open");require(priority!=capturePriority&&flags==0,"R8 replacement must intercept at a distinct priority");
+    if(recoveryOpenFails){SetLastError(ERROR_ACCESS_DENIED);return INVALID_HANDLE_VALUE;}
+    return (HANDLE)(uintptr_t)0x9876;
+}
+static BOOL recoveryShutdown(HANDLE,WINDIVERT_SHUTDOWN){recoverySteps.push_back("shutdown");return TRUE;}
+static BOOL recoveryClose(HANDLE){recoverySteps.push_back("close");return TRUE;}
+static void r8Checks(){
+    reset();auto savedOpen=wdOpen;auto savedShutdown=wdShutdown;auto savedClose=wdClose;auto savedDivert=divert;
+    wdOpen=recoveryOpen;wdShutdown=recoveryShutdown;wdClose=recoveryClose;
+    active=true;captureFailed=false;recoverySteps.clear();
+    require(Core_ReplaceCapture()==1&&recoverySteps.empty(),"R8 healthy capture must not restart");
+    captureFailed=true;recoveryOpenFails=true;
+    require(Core_ReplaceCapture()==0&&recoverySteps==std::vector<std::string>{"open"},"R8 failed replacement must not close the old handle");
+    recoveryOpenFails=false;recoverySteps.clear();totalPackets=0;
+    require(Core_ReplaceCapture()==1,"R8 capture replacement must start");
+    if(captureThread.joinable())captureThread.join();
+    require(recoverySteps==std::vector<std::string>{"open","shutdown","close"},"R8 new capture must exist before old capture stops");
+    active=false;divert=savedDivert;wdOpen=savedOpen;wdShutdown=savedShutdown;wdClose=savedClose;reset();
+}
+static void r4Checks(){
+    reset();flows.clear();aliases.clear();
+    for(unsigned i=0;i<20000;i++){
+        auto f=std::make_shared<Flow>();f->key={htonl(i+1),inet_addr("198.51.100.88"),40000,443,6};
+        f->close();flows[f->key]=f;
+    }
+    auto p=packet();p[33]=16;WINDIVERT_ADDRESS addr{};addr.IPChecksum=addr.TCPChecksum=1;
+    std::vector<uint64_t> times;OwnerBatch owners;PassThroughBatch out;
+    for(int n=0;n<30000;n++){out.addresses.clear();out.bytes.clear();auto start=qpcUs();processPacket(p,addr,owners,&out);times.push_back(qpcUs()-start);}
+    std::sort(times.begin(),times.end());printf("R4 20000 closed tuples classify p99=%llu us, p50=%llu us\n",times[times.size()*99/100],times[times.size()/2]);
+    prune();require(flows.empty(),"R4 closed tuples must not retain full Flow objects after pruning");
+    std::unique_lock held(flowMutex);
+    auto future=std::async(std::launch::async,[&](){OwnerBatch b;PassThroughBatch direct;return processPacket(p,addr,b,&direct)&&direct.addresses.size()==1;});
+    bool unblocked=future.wait_for(std::chrono::milliseconds(200))==std::future_status::ready;held.unlock();
+    require(future.get()&&unblocked,"R4 unrelated host traffic without live flows must not wait for flowMutex");
+    for(unsigned i=0;i<40000;i++){
+        auto f=std::make_shared<Flow>();f->key={htonl(i+1),inet_addr("198.51.100.89"),40000,443,6};f->close();flows[f->key]=f;
+    }
+    uint32_t pid=parentPid();RouteRule r{pid,910,created(pid),0,0};Core_SetProxy(910,"127.0.0.1",1080,"","");Core_ReplacePolicy(&r,1,L"\0");
+    auto syn=packet();auto ownerTable=tcpOwner(pid,syn);auto before=sendCalls;
+    require(processPacket(syn,addr,ownerTable)&&sendCalls==before+1,"R4 40000 closed tuples cannot consume the live-flow admission limit");
+    flows.clear();aliases.clear();reset();
+    Key closed{inet_addr("192.0.2.55"),inet_addr("198.51.100.55"),44000,443,6};
+    quarantine(closed,44000,2000);quarantine(closed,44000,1000);
+    require(retiredTuples[closed]==242000&&retiredAliases[44000]==242000,"R4 a late old close must not shorten a newer tuple or alias quarantine");reset();
+}
+static void r6Checks(uint32_t pid,uint64_t birth){
+    reset();Core_SetProxy(910,"127.0.0.1",1080,"","");RouteRule sandbox{pid,910,birth,0,13};
+    require(Core_ReplacePolicy(&sandbox,1,L"\0")==1,"R6 sandbox ancestry must support the no-Job flag");
+    require(!processJobs.count({pid,birth}),"R6 sandbox identity must never be assigned to an xa sk5 Job");
+    require(processLifetimes.count({pid,birth})==1,"R6 sandbox ancestry still pins root lifetime");
+    wchar_t system[MAX_PATH];GetSystemDirectoryW(system,MAX_PATH);std::wstring executable=std::wstring(system)+L"\\ping.exe";
+    std::wstring command=L"\""+executable+L"\" -n 60 127.0.0.1";STARTUPINFOW si{};si.cb=sizeof(si);PROCESS_INFORMATION pi{};
+    require(CreateProcessW(executable.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&si,&pi)!=0,"R6 child fixture launches");
+    RouteRule found{};int action=route(pi.dwProcessId,created(pi.dwProcessId),false,found);
+    TerminateProcess(pi.hProcess,0);WaitForSingleObject(pi.hProcess,5000);CloseHandle(pi.hThread);CloseHandle(pi.hProcess);
+    require(action==1&&found.proxy==910,"R6 no-Job sandbox child must retain ancestry routing");reset();
+}
 int main(int argc,char** argv){
     try{
-        if(argc!=2)throw std::runtime_error("Pass the official WinDivert.dll path.");
+        if(argc<2)throw std::runtime_error("Pass the official WinDivert.dll path.");
         HMODULE dll=LoadLibraryA(argv[1]);require(dll!=nullptr,"official parser DLL must load");
         wdParsePacket=(decltype(wdParsePacket))GetProcAddress(dll,"WinDivertHelperParsePacket");officialChecksums=(decltype(wdChecksums))GetProcAddress(dll,"WinDivertHelperCalcChecksums");
         require(wdParsePacket&&officialChecksums,"official helpers must exist");
         wdChecksums=fakeChecksums;wdSend=fakeSend;wdSendEx=fakeSendEx;wdRecvEx=fakeRecvEx;divert=(HANDLE)1;
         WSADATA ws;WSAStartup(MAKEWORD(2,2),&ws);listenPort=18000;
         uint32_t pid=parentPid();uint64_t birth=created(pid);require(pid&&birth,"live parent identity required");
-        batchLoopChecks();sendFailureChecks();policyChecks(pid,birth);concurrentActivityChecks();socketReuseChecks();followedTreeChecks(pid,birth);retryChecks();reportBenchmark();shutdownChecks();reset();telemetryChecks();
+        if(argc>2){if(!strcmp(argv[2],"R6"))r6Checks(parentPid(),created(parentPid()));else if(!strcmp(argv[2],"R4"))r4Checks();else if(!strcmp(argv[2],"R5"))r5Checks();else if(!strcmp(argv[2],"R3"))r3Checks(pid,birth);else if(!strcmp(argv[2],"P0-5"))p05Checks();else if(!strcmp(argv[2],"P0-6"))p06Checks(pid,birth);else if(!strcmp(argv[2],"P0-4"))p04Checks();else if(!strcmp(argv[2],"P0-1"))p01Checks(pid,birth);else throw std::runtime_error("Unknown check");}
+        else {r6Checks(parentPid(),created(parentPid()));r4Checks();r8Checks();r5Checks();r3Checks(pid,birth);p01Checks(pid,birth);p04Checks();p05Checks();p06Checks(pid,birth);batchLoopChecks();sendFailureChecks();policyChecks(pid,birth);concurrentActivityChecks();socketReuseChecks();followedTreeChecks(pid,birth);retryChecks();reportBenchmark();shutdownChecks();reset();telemetryChecks();}
         printf("PASS: %u packet-path assertions; no capture handle opened.\n",checks);WSACleanup();return 0;
     }catch(const std::exception& e){fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
 }

@@ -127,12 +127,15 @@ public static class VmwarePlanner
             if (!settings.ByStartup && !item.UseLocalNetwork && item.ProxyId != Guid.Empty && proxies.All(p => p.Id != item.ProxyId)) throw new InvalidOperationException("指定的代理已移除，請重新分配。");
         }
     }
-    public static VmwareRuntime[] Assign(VmwareSettings settings, IReadOnlyCollection<ProxyProfile> proxies, IReadOnlyDictionary<string, ProcessIdentity?> live, IReadOnlyCollection<VmwareRuntime> previous)
+    public static VmwareRuntime[] Assign(VmwareSettings settings, IReadOnlyCollection<ProxyProfile> proxies, IReadOnlyDictionary<string, ProcessIdentity?> live, IReadOnlyCollection<VmwareRuntime> previous, IEnumerable<InstanceBinding>? reservations = null)
     {
         Validate(settings, proxies);
+        var held=new ProxyOwnershipLedger(reservations??[]).Entries.Select(e=>e.ProxyId).ToHashSet();
+        proxies=proxies.Where(p=>!held.Contains(p.Id)).ToArray();
         var result = new List<VmwareRuntime>(); var used = new Dictionary<Guid, int>();
         foreach (var mapping in settings.Machines.OrderBy(m => live.GetValueOrDefault(m.VmxPath)?.CreatedFileTime ?? long.MaxValue).ThenBy(m => m.VmxPath, StringComparer.OrdinalIgnoreCase)) {
             var process = live.GetValueOrDefault(mapping.VmxPath); Guid selected = settings.ByStartup || mapping.UseLocalNetwork ? Guid.Empty : mapping.ProxyId;
+            if(held.Contains(selected))selected=Guid.Empty;
             if (settings.ByStartup && !mapping.UseLocalNetwork && process.HasValue) {
                 var existing = previous.FirstOrDefault(r => r.VmxPath.Equals(mapping.VmxPath, StringComparison.OrdinalIgnoreCase) && r.Process == process && proxies.Any(p => p.Id == r.ProxyId));
                 if (existing is not null && used.GetValueOrDefault(existing.ProxyId) < settings.PerProxy) selected = existing.ProxyId;

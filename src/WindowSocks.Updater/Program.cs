@@ -15,18 +15,23 @@ internal static class Program
     {
         ApplicationConfiguration.Initialize();
         try {
-            if (args.Length != 2 || args[0] is not ("--update" or "--worker")) throw new ArgumentException("請從 xa sk5 的「檢查更新」啟動更新。");
+            if (args.Length is <2 or >3 || args[0] is not ("--update" or "--worker")) throw new ArgumentException("請從 xa sk5 的「檢查更新」啟動更新。");
             string jobFile = Path.GetFullPath(args[1]); AppReleasePackage.RejectLinks(jobFile);
             if (new FileInfo(jobFile).Length > 128 * 1024) throw new IOException("更新工作資料超出限制。");
-            var job = JsonSerializer.Deserialize<UpdateJob>(File.ReadAllText(jobFile), Json.Options) ?? throw new IOException("缺少更新工作。");
+            UpdateRunnerTicket? ticket=args.Length==3?new(jobFile,args[2]):null;
+            var job = ticket is not null ? ProtectedUpdateRunner.ReadTicket(ticket,Environment.ProcessPath!)
+                : args[0]=="--worker"&&Administrator?throw new IOException("拒絕從使用者暫存目錄執行提權更新。")
+                : JsonSerializer.Deserialize<UpdateJob>(File.ReadAllText(jobFile), Json.Options) ?? throw new IOException("缺少更新工作。");
             ValidateJob(job);
+            if((job.IncludeService||job.PauseService)&&ticket is null)throw new IOException("提權更新必須由受保護協調程式啟動。");
             if (args[0] == "--worker") return Execute(job, jobFile);
-            using var form = new UpdateForm(job, jobFile); Application.Run(form); return form.Result;
+            using var form = new UpdateForm(job, jobFile,ticket); Application.Run(form); return form.Result;
         }
         catch (Exception ex) { MessageBox.Show(ex.Message, "xa sk5 更新未完成", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1; }
     }
     private static void ValidateJob(UpdateJob job)
     {
+        if(job.IncludeService||job.PauseService)ProtectedUpdateRunner.ValidateJob(job);
         _ = AppReleasePackage.ParseVersion(job.Version);
         if (job.Download is { } download) { if (job.Recover) throw new IOException("回復工作不可包含下載。"); UpdatePreparation.Validate(download, job.Version); }
         string target = Path.TrimEndingDirectorySeparator(Path.GetFullPath(job.Target));
@@ -59,6 +64,8 @@ internal static class Program
     }
     internal static int Execute(UpdateJob job, string jobFile, IUpdateServiceControl? serviceControl = null)
     {
+        bool privileged=serviceControl is null&&Administrator;
+        if(privileged){ProtectedUpdateRunner.ValidateJob(job);ProtectedUpdateRunner.RequireProtected(Path.GetDirectoryName(jobFile)!);}
         serviceControl ??= new InstalledServiceControl();
         string work = Path.GetDirectoryName(jobFile)!;
         var backups = new List<string>(); var transactions = new List<FileUpdateTransaction>();
@@ -78,7 +85,7 @@ internal static class Program
         }
         void Report(string value) => ReportProgress(new(value));
         using var cancellation = new CancellationTokenSource();
-        using var cancelWatch = new System.Threading.Timer(_ => { try { if (File.Exists(Path.Combine(work, "cancel"))) cancellation.Cancel(); } catch (ObjectDisposedException) { } }, null, 0, 100);
+        using var cancelWatch = new System.Threading.Timer(_ => { try { string file=Path.Combine(work,"cancel");if (File.Exists(file)&&new FileInfo(file).Length>0) cancellation.Cancel(); } catch (ObjectDisposedException) { } catch(IOException){} }, null, 0, 100);
         using var mutex = new Mutex(false, @"Global\WindowSocks.AppUpdate");
         bool acquired = false;
         try {
@@ -98,6 +105,7 @@ internal static class Program
                 Report("正在中斷代理連線，完成後才下載更新…"); stopped = true; serviceControl.Stop();
             }
             string source = job.Payload;
+            if(privileged)job=job with{Payload="",Download=ProtectedUpdateRunner.ResolveOfficial(job.Version,cancellation.Token).GetAwaiter().GetResult()};
             if (job.Download is { } download) {
                 ReportProgress(new("準備中斷代理並下載更新…") { CanCancel = true });
                 source = UpdatePreparation.PrepareAsync(download, job.Version, work, ct => { ct.ThrowIfCancellationRequested(); if (job.PauseService || job.IncludeService) InterruptProxy(); return Task.CompletedTask; },
@@ -226,8 +234,7 @@ internal static class Program
     }
     private static void StopService()
     {
-        using var service = new ServiceController("WindowSocks");
-        if (service.Status != ServiceControllerStatus.Stopped) { service.Stop(); service.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(40)); }
+        WindowSocks.Recovery.ForceStopDialog.Stop();
         // Dispose every process handle before copying its mapped binaries.
         for (int i = 0; i < 60; i++) {
             bool alive = false;
@@ -254,10 +261,11 @@ internal static class Program
         private bool canCancel;
         private bool cancelRequested;
         public int Result { get; private set; } = 1;
-        public UpdateForm(UpdateJob job, string jobFile)
+        public UpdateForm(UpdateJob job, string jobFile,UpdateRunnerTicket? prepared=null)
         {
+            string cancellationFile=Path.Combine(Path.GetDirectoryName(jobFile)!,"cancel");
             Text = "xa sk5 — 更新進度"; Width = 740; Height = 400; StartPosition = FormStartPosition.CenterScreen; Padding = new(20); Font = new("Microsoft JhengHei UI", 10);
-            void Cancel() { if (!canCancel) return; File.WriteAllText(Path.Combine(Path.GetDirectoryName(jobFile)!, "cancel"), "cancel"); cancelRequested = true; canCancel = false; close.Enabled = false; close.Text = "正在取消…"; }
+            void Cancel() { if (!canCancel) return; File.WriteAllText(cancellationFile, "cancel"); cancelRequested = true; canCancel = false; close.Enabled = false; close.Text = "正在取消…"; }
             Controls.Add(details); Controls.Add(progressBar); Controls.Add(status); Controls.Add(close);
             close.Click += (_, _) => { if (finished) Close(); else Cancel(); };
             FormClosing += (_, e) => { if (!finished) { e.Cancel = true; Cancel(); } };
@@ -272,10 +280,15 @@ internal static class Program
                             if (parent.StartTime.ToUniversalTime().Ticks == job.ParentStartTime) { status.Text = "等候 xa sk5 介面關閉，接著中斷代理並開始更新…"; using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45)); await parent.WaitForExitAsync(timeout.Token); }
                         } catch (ArgumentException) { }
                     }
-                    var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden };
-                    start.ArgumentList.Add("--worker"); start.ArgumentList.Add(jobFile); if (job.IncludeService || job.PauseService) start.Verb = "runas";
+                    UpdateRunnerTicket? ticket=prepared;
+                    if(ticket is not null)_=ProtectedUpdateRunner.ReadTicket(ticket,ticket.Executable);
+                    string workerJob=ticket?.JobFile??jobFile;
+                    var start = new ProcessStartInfo(ticket?.Executable??Environment.ProcessPath!) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory=Path.GetDirectoryName(ticket?.Executable??Environment.ProcessPath!)! };
+                    start.ArgumentList.Add("--worker"); start.ArgumentList.Add(workerJob);if(ticket is not null){start.ArgumentList.Add(ticket.JobHash);start.Verb="runas";}
                     status.Text = job.IncludeService || job.PauseService ? "等候 Windows 管理員授權，接著中斷代理並下載更新。" : "開始下載與更新程式…"; status.Refresh();
                     using var worker = Process.Start(start) ?? throw new IOException("無法啟動更新工作。");
+                    work=Path.GetDirectoryName(workerJob)!;
+                    cancellationFile=Path.Combine(work,"cancel");
                     string previous = ""; var stageClock = Stopwatch.StartNew();
                     while (!worker.HasExited) {
                         string file = Path.Combine(work, "status.json");

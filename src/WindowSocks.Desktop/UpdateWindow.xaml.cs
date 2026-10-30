@@ -29,8 +29,8 @@ public partial class UpdateWindow : Window
     {
         this.client = client; this.handoff = handoff; this.preferencesFile = preferencesFile ?? UpdatePaths.Preferences; InitializeComponent(); CurrentVersionText.Text = AppReleasePackage.CurrentVersion;
         UpdateService.Visibility = UpdatePaths.ServiceInstalled ? Visibility.Visible : Visibility.Collapsed;
-        UpdateService.IsChecked = UpdatePaths.ServiceInstalled;
-        if (Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory).Equals(UpdatePaths.Installed, StringComparison.OrdinalIgnoreCase)) UpdateService.IsEnabled = false;
+        UpdateService.IsChecked = UpdatePaths.ServiceInstalled && Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory).Equals(UpdatePaths.Installed, StringComparison.OrdinalIgnoreCase);
+        UpdateService.IsEnabled = false;
         try {
             string file = File.Exists(this.preferencesFile) ? this.preferencesFile : Path.Combine(AppContext.BaseDirectory, "update-source.json");
             if (File.Exists(file)) SourceText.Text = JsonSerializer.Deserialize<SourcePreference>(File.ReadAllText(file), Json.Options)?.ManifestUrl ?? "";
@@ -46,10 +46,15 @@ public partial class UpdateWindow : Window
         };
         UpdateImpact();
     }
+    private void InstallerDownloadClick(object sender, RoutedEventArgs e)
+    {
+        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://github.com/zzaiccf/xa-sk5/releases/latest") { UseShellExecute = true })?.Dispose(); }
+        catch (Exception ex) { UpdateStatus.Text = "無法開啟下載頁：" + ex.Message; }
+    }
     private void ServiceSelectionChanged(object sender, RoutedEventArgs e) { if (ImpactText is not null) UpdateImpact(); }
     private void UpdateImpact() => ImpactText.Text = UpdateService.IsChecked == true
-        ? "按「升級」立即開始：先中斷代理，再下載、備份與安裝，完成後重新開啟 xa sk5。取消或失敗會恢復原服務狀態。Windows 管理員授權由你確認。"
-        : "按「升級」立即開始，下載前先中斷已安裝的代理服務，完成後恢復；只更新此可攜版。代理帳密、到期日及各項配置保留。";
+        ? "已安裝版本透過受保護更新器取得官方套件，停止受管遊戲後更新。需要 0.1.31 以上服務；可攜版、離線包及回復請使用受信任安裝程式處理服務元件。"
+        : "以一般權限更新此可攜版。程式與背景元件需要分別更新；代理帳密、到期日及配置保留。";
     private void SourceChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
         candidate = null; checkedSource = null; localManifest = null;
@@ -60,7 +65,7 @@ public partial class UpdateWindow : Window
         working = value; CheckButton.IsEnabled = !value; LocalCheck.IsEnabled = !value; SourceText.IsEnabled = !value; RecoverButton.IsEnabled = !value;
         CancelDownload.IsEnabled = true;
         UpgradeButton.IsEnabled = !value && candidate is not null; CancelDownload.Visibility = value ? Visibility.Visible : Visibility.Collapsed;
-        UpdateService.IsEnabled = !value && !Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory).Equals(UpdatePaths.Installed, StringComparison.OrdinalIgnoreCase);
+        UpdateService.IsEnabled = false;
         if (!value) DownloadProgress.Visibility = Visibility.Collapsed;
     }
     private async Task Operation(Func<CancellationToken, Task> action)
@@ -124,17 +129,27 @@ public partial class UpdateWindow : Window
         string helper = Path.Combine(work, "helper");
         // Run the existing trusted updater outside the directory that will be replaced.
         using var parent = Process.GetCurrentProcess();
-        var job = new UpdateJob(payload, Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory), version, Environment.ProcessPath!, parent.Id, parent.StartTime.ToUniversalTime().Ticks, UpdateService.IsChecked == true, recover) { Download = download, PauseService = download is not null && (UpdatePaths.ServiceInstalled || UpdatePaths.ServiceRegistered) };
+        var job = new UpdateJob(payload, Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory), version, Environment.ProcessPath!, parent.Id, parent.StartTime.ToUniversalTime().Ticks, UpdateService.IsChecked == true, recover) { Download = download };
+        if(job.IncludeService)ProtectedUpdateRunner.ValidateJob(job);
         if (handoff is not null) { await handoff(job, work, ct); ReadyToExit = true; return; }
-        await Task.Run(() => UpdateHelperPackage.Stage(AppContext.BaseDirectory, helper, ct), ct);
-        string exe = Path.Combine(helper, "WindowSocks.Updater.exe");
-        string jobFile = Path.Combine(work, "job.json"); await File.WriteAllTextAsync(jobFile, JsonSerializer.Serialize(job, Json.Options), ct);
+        UpdateRunnerTicket? ticket=null;
+        string exe,jobFile;
+        if(job.IncludeService){
+            ticket=await PipeTransport.CallAsync<UpdateRunnerTicket>(Command.Create("prepareUpdateRunner",job),ct);
+            _=ProtectedUpdateRunner.ReadTicket(ticket,ticket.Executable);
+            work=ticket.Directory;exe=ticket.Executable;jobFile=ticket.JobFile;helper=Path.GetDirectoryName(exe)!;
+        }else{
+            await Task.Run(() => UpdateHelperPackage.Stage(AppContext.BaseDirectory, helper, ct), ct);
+            exe = Path.Combine(helper, "WindowSocks.Updater.exe");
+            jobFile = Path.Combine(work, "job.json"); await File.WriteAllTextAsync(jobFile, JsonSerializer.Serialize(job, Json.Options), ct);
+        }
         var start = new ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = helper }; start.ArgumentList.Add("--update"); start.ArgumentList.Add(jobFile);
+        if(ticket is not null)start.ArgumentList.Add(ticket.JobHash);
         using var process = Process.Start(start) ?? throw new IOException("無法開啟獨立更新程式。");
         // Once launched, let the handoff complete. Cancellation must not leave a live orphan coordinator.
         CancelDownload.IsEnabled = false;
         var deadline = DateTime.UtcNow.AddSeconds(25);
-        while (!File.Exists(Path.Combine(work, "ready"))) { if (process.HasExited || DateTime.UtcNow > deadline) throw new IOException("更新程式未就緒；介面維持開啟，請查看更新視窗。"); await Task.Delay(100); }
+        while (!File.Exists(Path.Combine(work, "ready"))||new FileInfo(Path.Combine(work,"ready")).Length==0) { if (process.HasExited || DateTime.UtcNow > deadline) throw new IOException("更新程式未就緒；介面維持開啟，請查看更新視窗。"); await Task.Delay(100); }
         ReadyToExit = true;
     }
     private void CancelClick(object sender, RoutedEventArgs e) => cancellation?.Cancel();

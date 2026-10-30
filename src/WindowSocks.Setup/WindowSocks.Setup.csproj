@@ -3,4 +3,4 @@
  <PropertyGroup><SetupPayloadPath Condition="'$(SetupPayloadPath)' == ''">$(MSBuildThisFileDirectory)../../artifacts/package.zip</SetupPayloadPath></PropertyGroup>
  <ItemGroup Condition="Exists('$(SetupPayloadPath)')"><EmbeddedResource Include="$(SetupPayloadPath)" LogicalName="payload.zip" /></ItemGroup>
  <ItemGroup><ProjectReference Include="../WindowSocks.Core/WindowSocks.Core.csproj"/></ItemGroup>
-</Project>
+<ItemGroup><Compile Include="../Shared/ForceStopDialog.cs" Link="ForceStopDialog.cs"/></ItemGroup></Project>

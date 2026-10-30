@@ -49,3 +49,15 @@ public sealed class MonitorWorker(Controller controller, ILogger<MonitorWorker> 
         }
     }
 }
+public sealed class SandboxMonitorWorker(Controller controller,ILogger<SandboxMonitorWorker> logger):BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        using var timer=new PeriodicTimer(TimeSpan.FromMilliseconds(250));
+        while(await timer.WaitForNextTickAsync(stoppingToken)) {
+            try{await controller.TickSandboxes(stoppingToken);}
+            catch(OperationCanceledException) when(stoppingToken.IsCancellationRequested){break;}
+            catch(Exception ex) when(ex is not OutOfMemoryException){logger.LogWarning(ex,"Sandbox observation failed");}
+        }
+    }
+}

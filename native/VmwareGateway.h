@@ -3,6 +3,7 @@ struct GatewayRule {uint32_t source,pid,proxy,blocked;uint64_t created;};
 static std::vector<GatewayRule> gatewayRules;
 static uint32_t gatewayNetwork=0,gatewayMask=0,gatewayHost=0,gatewayInterface=0;
 static std::atomic<bool> gatewayActive{false};
+static std::atomic<uint32_t> gatewayError{0};
 static HANDLE gatewayForward=INVALID_HANDLE_VALUE,gatewayInbound=INVALID_HANDLE_VALUE;
 static std::thread gatewayForwardThread,gatewayInboundThread;
 static std::mutex gatewayLifecycle;
@@ -27,7 +28,7 @@ static bool gatewayStillBound(const Flow& f){RouteRule r{};int action=gatewayRou
 static void gatewayCapture(HANDLE handle,bool inbound) {
     while(active&&gatewayActive) {
         std::vector<uint8_t> p(65535);UINT length=0;WINDIVERT_ADDRESS addr{};
-        if(!wdRecv(handle,p.data(),(UINT)p.size(),&length,&addr)){if(gatewayActive)lastError=GetLastError();break;}
+        if(!wdRecv(handle,p.data(),(UINT)p.size(),&length,&addr)){if(gatewayActive)gatewayError=GetLastError();break;}
         p.resize(length);if(length<20)continue;
         if((p[0]>>4)!=4)continue;
         int offset=(p[0]&15)*4;if(offset<20||offset+8>(int)length||be16(p.data()+6)&0x3fff)continue;
@@ -46,10 +47,10 @@ static void gatewayCapture(HANDLE handle,bool inbound) {
         {std::lock_guard lk(flowMutex);auto it=flows.find(key);
             if(it!=flows.end()){f=it->second;if(!f->gatewayInterface||!stillBound(*f)||(!f->alive&&GetTickCount64()-f->last>1000)){f->close();if(f->alias)aliases.erase(f->alias);flows.erase(it);f.reset();}}
             if(!f){
-                if(flows.size()>=2048||workers>=256)continue;
+                if(liveFlowCount.load()>=2048||workers>=256)continue;
                 if(protocol==6&&(offset+20>(int)length||!(p[offset+13]&2)))continue;
                 f=std::make_shared<Flow>();f->key=key;f->rule=rule;f->gatewayHost=host;f->gatewayInterface=index;f->address=addr;
-                if(protocol==6){for(unsigned n=0;n<40000;n++){if(++nextAlias>60000)nextAlias=20000;if(!aliases.count(nextAlias)){f->alias=nextAlias;break;}}if(!f->alias)continue;aliases[f->alias]=f;}
+                if(protocol==6){for(unsigned n=0;n<40000;n++){if(++nextAlias>60000)nextAlias=20000;if(!aliases.count(nextAlias)&&!aliasRetired(nextAlias)){f->alias=nextAlias;break;}}if(!f->alias)continue;aliases[f->alias]=f;}
                 flows[key]=f;trace(*f,Captured);fresh=true;
             }f->last=GetTickCount64();
         }
@@ -67,7 +68,7 @@ API int Core_ReplaceGatewayRules(const GatewayRule* entries,uint32_t countRules)
 API int Core_GatewayRouteForTest(uint32_t source,uint32_t* proxy){RouteRule r{};int result=gatewayRoute(source,r);if(proxy)*proxy=r.proxy;return result;}
 API int Core_GatewayLocalSupported(){return 1;}
 API SOCKET Core_GatewayOpenLocalForTest(uint32_t destination,uint16_t port,int udp){return (udp==0||udp==1)&&port?openLocal(destination,port,udp!=0):INVALID_SOCKET;}
-API uint32_t Core_GatewayDestinationForTest(uint32_t host,uint32_t destination,uint16_t port,int local){Flow f;f.alive=false;f.gatewayInterface=1;f.gatewayHost=host;f.rule.proxy=local?0:1;f.key.dst=destination;f.key.dp=port;return relayDestination(f);}
+API uint32_t Core_GatewayDestinationForTest(uint32_t host,uint32_t destination,uint16_t port,int local){Flow f;f.close();f.gatewayInterface=1;f.gatewayHost=host;f.rule.proxy=local?0:1;f.key.dst=destination;f.key.dp=port;return relayDestination(f);}
 API int Core_GatewayTranslationForTest(uint8_t* packet,uint32_t length,uint32_t guest,uint32_t destination,uint32_t host,uint32_t index,int reply,uint32_t* outbound) {
     if(!packet||length<40||(packet[0]>>4)!=4||(packet[0]&15)!=5||packet[9]!=6)return 0;
     Flow f;f.key={guest,destination,41000,443,6};f.gatewayHost=host;f.gatewayInterface=index;f.alias=25000;WINDIVERT_ADDRESS addr{};
@@ -81,11 +82,11 @@ API int Core_StartGateway(uint32_t network,uint32_t mask,uint32_t host,uint32_t 
     if(gatewayActive){std::shared_lock state(stateMutex);return network==gatewayNetwork&&host==gatewayHost&&index==gatewayInterface?1:0;}
     char begin[INET_ADDRSTRLEN],end[INET_ADDRSTRLEN];IN_ADDR a{},b{};a.s_addr=network;b.s_addr=network|~mask;InetNtopA(AF_INET,&a,begin,sizeof(begin));InetNtopA(AF_INET,&b,end,sizeof(end));
     std::string filter="ip and ip.SrcAddr > "+std::string(begin)+" and ip.SrcAddr < "+end;
-    gatewayForward=wdOpen(filter.c_str(),WINDIVERT_LAYER_NETWORK_FORWARD,110,0);if(gatewayForward==INVALID_HANDLE_VALUE){lastError=GetLastError();return 0;}
+    gatewayForward=wdOpen(filter.c_str(),WINDIVERT_LAYER_NETWORK_FORWARD,110,0);if(gatewayForward==INVALID_HANDLE_VALUE){gatewayError=GetLastError();return 0;}
     filter="inbound and ifIdx == "+std::to_string(index)+" and (ip or ipv6)";
-    gatewayInbound=wdOpen(filter.c_str(),WINDIVERT_LAYER_NETWORK,110,0);if(gatewayInbound==INVALID_HANDLE_VALUE){lastError=GetLastError();wdClose(gatewayForward);gatewayForward=INVALID_HANDLE_VALUE;return 0;}
+    gatewayInbound=wdOpen(filter.c_str(),WINDIVERT_LAYER_NETWORK,110,0);if(gatewayInbound==INVALID_HANDLE_VALUE){gatewayError=GetLastError();wdClose(gatewayForward);gatewayForward=INVALID_HANDLE_VALUE;return 0;}
     {std::unique_lock state(stateMutex);gatewayNetwork=network;gatewayMask=mask;gatewayHost=host;gatewayInterface=index;}
-    gatewayActive=true;gatewayForwardThread=std::thread([]{try{gatewayCapture(gatewayForward,false);}catch(...){lastError=ERROR_UNHANDLED_EXCEPTION;}});gatewayInboundThread=std::thread([]{try{gatewayCapture(gatewayInbound,true);}catch(...){lastError=ERROR_UNHANDLED_EXCEPTION;}});return 1;
+    gatewayError=0;gatewayActive=true;gatewayForwardThread=std::thread([]{try{gatewayCapture(gatewayForward,false);}catch(...){gatewayError=ERROR_UNHANDLED_EXCEPTION;}});gatewayInboundThread=std::thread([]{try{gatewayCapture(gatewayInbound,true);}catch(...){gatewayError=ERROR_UNHANDLED_EXCEPTION;}});return 1;
 }
 static void stopGateway(){std::lock_guard lk(gatewayLifecycle);if(!gatewayActive.exchange(false))return;
     wdShutdown(gatewayForward,WINDIVERT_SHUTDOWN_RECV);wdShutdown(gatewayInbound,WINDIVERT_SHUTDOWN_RECV);
@@ -94,4 +95,4 @@ static void stopGateway(){std::lock_guard lk(gatewayLifecycle);if(!gatewayActive
     wdClose(gatewayForward);wdClose(gatewayInbound);gatewayForward=gatewayInbound=INVALID_HANDLE_VALUE;
 }
 API void Core_StopGateway(){stopGateway();}
-API int Core_GatewayRunning(){return gatewayActive&&active&&lastError==0?1:0;}
+API int Core_GatewayRunning(){return gatewayActive&&active&&!captureFailed&&gatewayError==0?1:0;}

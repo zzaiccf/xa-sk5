@@ -26,6 +26,7 @@ public sealed partial class Controller
     {
         AutoProxyPlanner.Validate(rule);
         var next = FixedEmulatorPlanner.Prepare(rule, config.AutoProxy, config.Bindings, config.Proxies, targets.Values);
+        ProxyOwnershipLedger.From(config with{Bindings=next},vmwareRuntime).ValidateBindings(next);
         if (rule.Enabled) {
             foreach (var item in rule.EmulatorAssignments) {
                 EmulatorCatalog.ValidateConsole(item.Kind, item.ConsolePath);
@@ -49,6 +50,7 @@ public sealed partial class Controller
     {
         AutoProxyPlanner.Validate(rule);
         var next = SequentialEmulatorPlanner.Prepare(rule, config.Bindings, LdPlayer.Identity);
+        ProxyOwnershipLedger.From(config with{Bindings=next},vmwareRuntime).ValidateBindings(next);
         if (rule.Enabled) { EmulatorCatalog.ValidateConsole(rule.EmulatorKind, rule.ConsolePath); EnsureEngine(); }
         var previousRule = config.AutoProxy; var previousBindings = config.Bindings;
         var previousExcluded = config.AutoExcludedTargets.ToList();

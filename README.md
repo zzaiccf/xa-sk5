@@ -1,11 +1,13 @@
-# xa sk5 0.1.30
+# xa sk5 0.1.31 本機修正工作樹
+
+本輪依複審處理 R1–R9，並實作 P0-3／P0-4 的 WFP 持久封鎖、動態放行與擷取 handle 交接，尚未發布。**隔離回歸與原生編譯通過不等於實機驗收；WFP、Sandboxie ABI、未知系統路徑與崩潰邊界仍須核驗。** 詳見 [0.1.31 逐項修正與驗證紀錄](docs/RELEASE-VALIDATION-0.1.31.md)。此次沒有變更任何線上發布；本機執行中的程式未被替換。
 
 新增桌面沙盒引導設定、YongOrigin 相容設定、規則右鍵啟動／停止及預設間隔 10 秒的批量啟動。設定視窗立即開啟，慢速探索在背景執行；固定線路、取消與啟動前核驗仍保留。詳見 [沙盒操作說明](docs/SANDBOX-GUIDE.md)。
 
 包含統一「遊戲／程式」規則、捷徑與遊戲本體拖放匯入、各線路分配名額調整，以及活躍連線誤判閒置與封包錯誤 1232 的穩定性修正。需要更新主程式、背景服務及核心。
 繁體中文 Windows x64 SOCKS5 代理工具，提供程序／子程序分流、模擬器配置、全局代理、節點檢測及 Windows 背景服務。
 
-[下載最新版](https://github.com/zzaiccf/xa-sk5/releases/latest) · [操作說明](docs/操作說明.html) · [發布與更新流程](docs/RELEASING.md) · [0.1.24 驗證範圍](docs/RELEASE-VALIDATION-0.1.24.md)
+[下載已發布版](https://github.com/zzaiccf/xa-sk5/releases/latest) · [操作說明](docs/操作說明.html) · [發布與更新流程](docs/RELEASING.md) · [0.1.31 本機驗證範圍](docs/RELEASE-VALIDATION-0.1.31.md)
 
 這是工程預覽版。普通 Windows 程序的真實 TCP／UDP／DNS 轉送及程序接續已驗證；個別遊戲、模擬器與虛擬機仍須分別驗收。
 
@@ -27,7 +29,7 @@
 
 ## 下載與安裝
 
-發布頁只提供兩個附件：
+目前 0.1.30 發布頁提供兩個附件；本輪沒有建立或上傳 0.1.31 套件：
 
 - `xa-sk5-Setup-0.1.30.exe`：安裝精靈、背景服務、捷徑與解除安裝項目；由 Windows 要求管理員授權。
 - `xa-sk5-0.1.30-win-x64.zip`：自帶 .NET 的完整可攜版。解壓全部檔案後執行 `xa sk5.exe`，保留同一資料夾內的 DLL。
@@ -55,11 +57,11 @@
 
 特定遊戲已能進入空白帳密頁，但觀察到未登入約三分鐘後上游 EOF；不同協定狀態的被動直連／SOCKS 對照不足以判定原因。登入後遊玩、各遊戲允許的多開方式、雙雷電／雙 VMware 實機及長時間穩定性仍須驗收。詳見 [版本驗證範圍](docs/RELEASE-VALIDATION-0.1.23.md)。
 
-支援範圍為 Windows IPv4 TCP／UDP。受管 IPv6、無法確認身分或來源歧義採保守處理；Windows 共享 DNS、獨立系統服務啟動的程序及橋接網路有額外限制。沒有持久 WFP kill switch，服務／驅動異常不能當作防洩漏保證，也不保證與所有遊戲保護程式相容。
+支援範圍為 Windows IPv4 TCP／UDP。受管 IPv6、無法確認身分或來源歧義採保守處理；Windows 共享 DNS、獨立系統服務啟動的程序及橋接網路有額外限制。沙盒已知 EXE 使用精確 AppId 的持久 WFP BLOCK＋健康擷取期間的動態 PERMIT。未知系統路徑、既有連線尾端封包、BFE 啟動前與一般 PID 綁定不在完整崩潰保護範圍，也不保證與所有遊戲保護程式相容。
 
 ## 建置與測試
 
-需求：Windows x64、PowerShell 7、.NET 10 SDK、Visual Studio C++ x64 工具及 Windows SDK。
+需求：Windows x64、.NET 10 SDK、Visual Studio C++ x64 工具及 Windows SDK。原生檢查 `Test-PacketPathPerformance.ps1` 與 WFP 測試建置 `Test-SandboxFirewall.ps1` 支援 Windows PowerShell 5.1；其他打包腳本仍以 PowerShell 7 執行。WFP 腳本預設只建置，傳入 `-RunApproved -Endpoint <測試位址> -Port <TCP埠>` 且具管理員權限才會執行實機測試。
 
 ```powershell
 ./scripts/Build.ps1 -PayloadDirectory artifacts/local

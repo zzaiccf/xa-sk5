@@ -48,7 +48,7 @@ internal static partial class Program
             string payload = ExtractEmbedded(stage);
             // Stage and verify everything before stopping an active service.
             report(20, "正在停止背景代理服務…");
-            Run("sc.exe", ["stop", "WindowSocks"], false); WaitForServiceStop(); stopped = true;
+            WindowSocks.Recovery.ForceStopDialog.Stop(); WaitForServiceStop(); stopped = true;
             report(25, "備份原有設定與程式…");
             foreach (string name in new[] { "settings.dpapi", "settings.dpapi.bak", "owner.sid" }) {
                 string original = Path.Combine(DataDirectory, name); if (!File.Exists(original)) continue; AppReleasePackage.RejectLinks(original);
@@ -80,7 +80,7 @@ internal static partial class Program
             report(95, "安裝未完成：" + ex.Message);
             if (stopped) {
                 report(95, "安裝未完成，正在回復原程式與設定…");
-                Run("sc.exe", ["stop", "WindowSocks"], false); WaitForServiceStop();
+                WindowSocks.Recovery.ForceStopDialog.Stop(); WaitForServiceStop();
                 transaction?.Rollback(); foreach (var (original, backup) in settings) File.Copy(backup, original, true);
                 Run("sc.exe", ["start", "WindowSocks"], false);
                 if (transaction is not null) File.WriteAllText(Path.Combine(transaction.BackupDirectory, "service-recovery-complete"), "complete");

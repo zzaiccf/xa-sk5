@@ -18,7 +18,7 @@ internal static partial class Program
         ProxyProfile[] nodes = [new() { Name = "線路 A", Host = "192.0.2.1", Port = 1080 }, new() { Name = "線路 B", Host = "192.0.2.2", Port = 1080 }];
         var a = SandboxInstances.Create("遊戲 A", @"C:\SyntheticGame\Launcher.exe", nodes[0].Id) with { SimulateAdmin = true };
         var b = SandboxInstances.Create("遊戲 B", a.SourceLauncherPath, nodes[1].Id);
-        fixture.State = fixture.State with { SupportsSandboxInstances = true, SupportsSandboxExperience = true, Proxies = nodes, SandboxInstances = [b, a],
+        fixture.State = fixture.State with { SupportsSandboxInstances = true, SupportsSandboxExperience = true, SupportsSandboxSafety = true, Proxies = nodes, SandboxInstances = [b, a],
             SandboxStatuses = [new(a.Id, "未啟動", "", []), new(b.Id, "啟動失敗 · 已封鎖", "合成錯誤", [])] };
         var backend = new FakeBackend(fixture);
         var watch = Stopwatch.StartNew();
@@ -55,6 +55,10 @@ internal static partial class Program
             assign.Show(); await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
             Check(assign.IsVisible && !loading.Task.IsCompleted, "Assignment editor waited for process enumeration.");
             assign.Close(); loading.SetResult([]);
+            fixture.State = fixture.State with { SupportsSandboxSafety = false };
+            bool safetyRejected = false; try { await backend.SandboxSnapshot(); } catch (InvalidOperationException) { safetyRejected = true; }
+            Check(safetyRejected, "P0-1: service without first-packet sandbox identity protection was accepted.");
+            fixture.State = fixture.State with { SupportsSandboxSafety = true };
             fixture.State = fixture.State with { SupportsSandboxInstances = false };
             bool rejected = false; try { await backend.SandboxSnapshot(); } catch (InvalidOperationException ex) { rejected = ex.Message.Contains("0.1.27"); }
             Check(rejected, "Old service was accepted for sandbox launch.");

@@ -2,6 +2,8 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $out = Join-Path $repoRoot 'artifacts/native'
 New-Item -ItemType Directory -Path $out -Force | Out-Null
+$version = ([xml](Get-Content (Join-Path $repoRoot 'Directory.Build.props') -Raw)).Project.PropertyGroup.Version
+Set-Content -LiteralPath (Join-Path $out 'BuildVersion.h') -Value ('#define XA_VERSION "' + $version + '"') -Encoding ascii
 $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vsPath = & $vsWhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (!$vsPath) { throw 'Visual Studio C++ tools are required.' }
@@ -17,7 +19,7 @@ try {
     $common = @('/nologo','/c','/O2','/MT','/GS','/guard:cf','/utf-8','/W3','/D_CRT_SECURE_NO_WARNINGS','/D_WINSOCK_DEPRECATED_NO_WARNINGS',"/I$repoRoot/native/include", "/I$repoRoot/third_party/ProxyBridge/src")
     & $compiler @common "$repoRoot/third_party/ProxyBridge/src/pb_util.c" "$repoRoot/third_party/ProxyBridge/src/pb_socks5.c"
     if ($LASTEXITCODE) { throw 'Native protocol compilation failed.' }
-    & $compiler @common '/std:c++20' '/EHsc' "$repoRoot/native/WindowSocksNative.cpp"
+    & $compiler @common '/std:c++20' '/EHsc' "/FI$out/BuildVersion.h" "$repoRoot/native/WindowSocksNative.cpp"
     if ($LASTEXITCODE) { throw 'Native engine compilation failed.' }
     & $linker /NOLOGO /DLL /OUT:WindowSocksNative.dll /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /guard:cf WindowSocksNative.obj pb_util.obj pb_socks5.obj ws2_32.lib iphlpapi.lib advapi32.lib
     if ($LASTEXITCODE) { throw 'Native linking failed.' }

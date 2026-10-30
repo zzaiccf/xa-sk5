@@ -30,6 +30,9 @@ public static class WindowsProxyService
         } finally { CloseServiceHandle(service); }
     }
     public static bool Running() => State() != 1;
+    public static Task StopGracefullyAsync(CancellationToken ct=default, Func<Exception, Task>? explicitRecovery = null) => ServiceExit.StopAsync(async token => {
+        if(!await PipeTransport.CallAsync<bool>(Command.Create("stopService",new{}),token))throw new IOException("服務尚未同意停止，保留代理保護。");
+    },Running,ct,TimeSpan.FromSeconds(115), explicitRecovery);
     public static async Task StartAsync(CancellationToken ct = default)
     {
         if (!Installed) return;

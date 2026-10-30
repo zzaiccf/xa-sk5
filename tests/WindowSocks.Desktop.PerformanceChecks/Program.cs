@@ -20,7 +20,7 @@ using WindowSocks.Desktop;
 internal static partial class Program
 {
     private static readonly string Root = Directory.GetCurrentDirectory();
-    private static readonly string Output = Path.Combine(Root, "artifacts", "rule-editor-performance");
+    private static readonly string Output = Environment.GetEnvironmentVariable("XA_TEST_OUTPUT") ?? Path.Combine(Root, "artifacts", "rule-editor-performance");
     private static readonly BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
     [STAThread] private static int Main()
     {

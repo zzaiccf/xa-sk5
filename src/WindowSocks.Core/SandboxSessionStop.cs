@@ -26,7 +26,7 @@ internal static class SandboxSessionStop
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "無法在沙盒擁有者工作階段執行停止命令。");
                 using var processHandle = new SafeWaitHandle(process.Process, true);
                 using var threadHandle = new SafeWaitHandle(process.Thread, true);
-                uint wait = WaitForSingleObject(processHandle, 3000);
+                uint wait = WaitForSingleObject(processHandle, 30000);
                 if (wait != 0) {
                     TerminateProcess(processHandle, 1);
                     throw new IOException("Sandboxie 停止命令逾時，維持代理保護。");

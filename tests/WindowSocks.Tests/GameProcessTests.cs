@@ -51,7 +51,7 @@ public sealed class GameProcessTests
             Assert.True((await service.Dispatch(Command.Create("syncTargets", new[] { target }), default)).Ok);
             Assert.Equal(2, NativeEngine.Core_RouteForTest((uint)child.Id, (ulong)identity.CreatedFileTime, 0, out _));
             await service.Tick(default); // No proxies: classify the known target as unassigned, preserving the overflow contract.
-            Assert.Equal(3, NativeEngine.Core_RouteForTest((uint)child.Id, (ulong)identity.CreatedFileTime, 0, out _));
+            Assert.Equal(0, NativeEngine.Core_RouteForTest((uint)child.Id, (ulong)identity.CreatedFileTime, 0, out _)); // Guard exemption now evaluates global fallback (off here).
         } finally { NativeEngine.Core_ReplacePolicy([], 0, "\0\0"); if (!child.HasExited) child.Kill(); child.WaitForExit(); Directory.Delete(directory, true); }
     }
 }
