@@ -163,6 +163,22 @@ public sealed class SecondReviewSandboxTests : IDisposable
         Assert.False(new ConfigStore(root).Load().SandboxInstances.Single(p => p.Id == b.Id).Enabled);
         Assert.Empty((System.Collections.IDictionary)typeof(Controller).GetField("sandboxTickets", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(controller)!);
     }
+    [Fact] public async Task LocalNetwork_SaveReleasesProxyAndPreservesOtherInstance()
+    {
+        Setup(); await WaitInitialization();
+        var local = b with { UseLocalNetwork = true, ProxyId = Guid.Empty };
+        var result = await controller.Dispatch(Command.Create("saveSandbox", local), default);
+        Assert.True(result.Ok, result.Error);
+        var saved = new ConfigStore(root).Load();
+        Assert.True(saved.SandboxInstances.Single(p => p.Id == b.Id).UseLocalNetwork);
+        Assert.Equal(Guid.Empty, saved.Bindings.Single(p => p.TargetKey == b.TargetKey).ProxyId);
+        Assert.Equal(a.ProxyId, saved.SandboxInstances.Single(p => p.Id == a.Id).ProxyId);
+        runtime.Members = [new(LdPlayer.Identity(Environment.ProcessId)!.Value, b.BoxName, WindowsIdentity.GetCurrent().User!.Value, 1)];
+        var running = await controller.Dispatch(Command.Create("saveSandbox", b), default);
+        Assert.False(running.Ok); Assert.Contains("停止", running.Error);
+        runtime.Members = [];
+        Assert.True((await controller.Dispatch(Command.Create("saveSandbox", b), default)).Ok);
+    }
     public void Dispose(){scanning=null;controller?.Dispose();if(Directory.Exists(root))Directory.Delete(root,true);}
     private sealed class Runtime:ISandboxRuntime{
         public bool Available=true;public bool? CheckResult;public int Checks;public SandboxProcess[] Members=[];public Action? OnList;public Action? OnValidate;

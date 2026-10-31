@@ -20,7 +20,28 @@ public partial class Backend
     public virtual Task<SandboxieSetupState> SandboxEnvironment(CancellationToken ct) => Task.Run(SandboxieInstaller.Inspect, ct);
     public virtual Task EnsureSandboxInstalled(IProgress<UpdateProgress>? progress, CancellationToken ct) => Task.Run(() => new SandboxieInstaller().EnsureInstalled(progress, ct), ct);
     public virtual Task<SandboxInstanceProfile[]> ResumeSandboxPreparation(string source, Guid[] proxies, SandboxInstanceProfile[] existing, CancellationToken ct) => Task.Run(() => SandboxPreparation.Resume(source, proxies, existing), ct);
+    public virtual Task<SandboxInstanceProfile[]> ResumeSandboxNetworkPreparation(string source, SandboxNetworkChoice[] choices, SandboxInstanceProfile[] existing, CancellationToken ct) =>
+        Task.Run(() => SandboxPreparation.ResumeNetwork(source, choices, existing), ct);
     public virtual Task<bool> DetectYongOrigin(string path, CancellationToken ct) => Task.Run(() => SandboxCompatibility.IsYongOrigin(path), ct);
+    public virtual async Task SaveSandboxNetworks(SandboxInstanceProfile[] profiles, IProgress<string>? progress, CancellationToken ct)
+    {
+        var state = await SandboxSnapshot(ct).ConfigureAwait(false);
+        SandboxPreparation.ValidateBatch(profiles);
+        foreach (var p in profiles) {
+            RequireSandboxNetworkSupport(state, p);
+            if (!state.SandboxInstances.Any(old => old.Id == p.Id)) throw new InvalidOperationException("新實例請使用準備環境。");
+            if (state.SandboxStatuses.Any(s => s.Id == p.Id && s.Processes.Length > 0)) throw new InvalidOperationException("請先停止 " + p.Name + " 再更改網路模式或線路。");
+        }
+        int saved = 0;
+        try {
+            foreach (var p in profiles) {
+                await Call<bool>(Command.Create("saveSandbox", p), ct).ConfigureAwait(false);
+                saved++; progress?.Report("已保存 " + p.Name + (p.UseLocalNetwork ? " · 本地網路" : " · 代理線路"));
+            }
+        } catch (Exception ex) when (ex is not OutOfMemoryException && saved > 0) {
+            throw new InvalidOperationException($"已保存 {saved} 個實例，其餘未完成；請重新整理確認後重試。{ex.Message}", ex);
+        }
+    }
     public virtual async Task PrepareSandboxes(SandboxInstanceProfile[] profiles, IProgress<string>? progress, CancellationToken ct)
     {
         if (!await sandboxPreparationGate.WaitAsync(0, ct).ConfigureAwait(false)) throw new InvalidOperationException("先前的準備或取消尚未完成，請稍後重試。");
@@ -37,6 +58,8 @@ public partial class Backend
             throw new InvalidOperationException("最多管理十個實例，請先移除不使用的規則。");
         foreach (var profile in pair) {
             SandboxInstances.Validate(profile);
+            RequireSandboxNetworkSupport(state, profile);
+            if (profile.UseLocalNetwork) continue;
             if (state.Bindings.Any(b => b.TargetKey != profile.TargetKey && b.ProxyId == profile.ProxyId) ||
                 state.SandboxInstances.Any(p => p.Id != profile.Id && p.ProxyId == profile.ProxyId) ||
                 state.GlobalProxy.Enabled && state.GlobalProxy.ProxyId == profile.ProxyId)
@@ -58,11 +81,18 @@ public partial class Backend
         if (!state.SupportsSandboxSafety) throw new InvalidOperationException("桌面沙盒需要 0.1.31 背景服務與原生核心的封包身分保護，請先更新完整元件。");
         return state;
     }
+    private static void RequireSandboxNetworkSupport(Snapshot state, SandboxInstanceProfile profile)
+    {
+        if (profile.UseLocalNetwork && !state.SupportsSandboxLocalNetwork)
+            throw new InvalidOperationException("本地網路沙盒需要 0.1.36 背景服務；請更新完整程式與服務後再保存或啟動。");
+    }
     public async Task PrepareSandbox(SandboxInstanceProfile profile, IProgress<string>? progress, CancellationToken ct)
     {
         var state = await SandboxSnapshot(ct).ConfigureAwait(false);
+        RequireSandboxNetworkSupport(state, profile);
+        SandboxInstances.Validate(profile);
         if (!SandboxieRuntime.Installed) throw new InvalidOperationException("請先安裝官方 Sandboxie Plus 1.18.8 x64。");
-        if (!state.Proxies.Any(p => p.Id == profile.ProxyId)) throw new InvalidOperationException("找不到指定線路。");
+        if (!profile.UseLocalNetwork && !state.Proxies.Any(p => p.Id == profile.ProxyId)) throw new InvalidOperationException("找不到指定線路。");
         await Task.Run(() => { using var runtime = new SandboxieRuntime(); if (runtime.Processes(profile.BoxName).Length > 0) throw new InvalidOperationException("此沙盒仍在執行，請先停止。"); }, ct).ConfigureAwait(false);
         await Task.Run(() => SandboxPreparation.Prepare(profile.SourceLauncherPath, profile, progress, ct), ct);
         await Call<bool>(Command.Create("saveSandbox", profile), ct);
@@ -77,14 +107,17 @@ public partial class Backend
     {
         var state = await SandboxSnapshot(ct).ConfigureAwait(false);
         var profile = state.SandboxInstances.Single(p => p.Id == id);
+        RequireSandboxNetworkSupport(state, profile);
         if (profile.RemovalPending) throw new InvalidOperationException("此實例正在清理，請到儲存空間頁完成移除。");
         var current = state.SandboxStatuses.FirstOrDefault(s => s.Id == id);
         if (current is { Processes.Length: > 0 }) {
             if (SandboxLauncherState.IsStarted(current, profile, ProcessCatalog.ImagePath, LdPlayer.Identity)) return SandboxStartResult.AlreadyRunning;
             throw new InvalidOperationException(profile.Name + " 已有程序執行，但尚未就緒：" + current.State + "。請先停止後重試。");
         }
-        var probe = await Call<ProbeResult>(Command.Create("probe", new ProxyRequest(profile.ProxyId)), ct);
-        if (!probe.Ready) throw new InvalidOperationException("線路未通過 TCP／UDP 檢測：" + probe.Message);
+        if (!profile.UseLocalNetwork) {
+            var probe = await Call<ProbeResult>(Command.Create("probe", new ProxyRequest(profile.ProxyId)), ct);
+            if (!probe.Ready) throw new InvalidOperationException("線路未通過 TCP／UDP 檢測：" + probe.Message);
+        }
         var ticket = await Call<SandboxLaunchTicket>(Command.Create("armSandbox", new SandboxRequest(id)), ct);
         bool handedOff = false;
         try {

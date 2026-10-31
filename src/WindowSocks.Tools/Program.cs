@@ -48,8 +48,11 @@ switch (args[0])
         var launchId = Guid.Parse(args[1]);
         var launchState = await PipeTransport.CallAsync<Snapshot>(Command.Create("snapshot", new { }));
         var launchProfile = launchState.SandboxInstances.Single(p => p.Id == launchId);
-        var launchProbe = await PipeTransport.CallAsync<ProbeResult>(Command.Create("probe", new ProxyRequest(launchProfile.ProxyId)));
-        if (!launchProbe.Ready) throw new IOException(launchProbe.Message);
+        if (launchProfile.UseLocalNetwork && !launchState.SupportsSandboxLocalNetwork) throw new IOException("本地網路需要 0.1.36 背景服務。");
+        if (!launchProfile.UseLocalNetwork) {
+            var launchProbe = await PipeTransport.CallAsync<ProbeResult>(Command.Create("probe", new ProxyRequest(launchProfile.ProxyId)));
+            if (!launchProbe.Ready) throw new IOException(launchProbe.Message);
+        }
         var launchTicket = await PipeTransport.CallAsync<SandboxLaunchTicket>(Command.Create("armSandbox", new SandboxRequest(launchId)));
         var launchInfo = new System.Diagnostics.ProcessStartInfo(Path.Combine(SandboxieRuntime.InstallDirectory, "Start.exe")) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = launchProfile.WorkingDirectory };
         foreach (string arg in new[] { "/box:" + launchProfile.BoxName, "/hide_window", Environment.ProcessPath!, "sandbox-bootstrap", launchId.ToString(), launchTicket.Token }) launchInfo.ArgumentList.Add(arg);

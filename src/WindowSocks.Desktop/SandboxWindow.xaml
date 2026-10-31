@@ -1,6 +1,6 @@
 <Window x:Class="WindowSocks.Desktop.SandboxWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Style="{StaticResource {x:Type Window}}" Title="桌面沙盒多開" Width="960" Height="740" MinWidth="800" MinHeight="630" WindowStartupLocation="CenterOwner" AllowDrop="True" PreviewDragOver="DragOverFile" PreviewDrop="DropFile">
  <Grid Margin="26"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-  <StackPanel Margin="0,0,0,18"><TextBlock Text="新增遊戲與沙盒多開" FontSize="24" FontWeight="SemiBold"/><TextBlock Text="選遊戲 → 新增需要的實例 → 各選一條線路 → 準備並啟動。支援 1–10 個，包含三開及更多。" Foreground="{StaticResource Muted}" Margin="0,8,0,0" TextWrapping="Wrap"/></StackPanel>
+  <StackPanel Margin="0,0,0,18"><TextBlock Text="新增遊戲與沙盒多開" FontSize="24" FontWeight="SemiBold"/><TextBlock Text="選遊戲 → 新增實例 → 各選代理或本地網路 → 準備並啟動。支援 1–10 個實例。" Foreground="{StaticResource Muted}" Margin="0,8,0,0" TextWrapping="Wrap"/></StackPanel>
   <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto"><StackPanel>
    <Border Style="{StaticResource Card}" Padding="18"><StackPanel>
     <DockPanel Margin="0,0,0,6"><Button DockPanel.Dock="Right" Content="官方安裝頁" Click="OpenSandboxDownload"/><Button DockPanel.Dock="Right" Content="重新檢查" Click="CheckEnvironment"/><Button x:Name="InstallSandboxButton" DockPanel.Dock="Right" Content="一鍵安裝 Sandboxie" Click="InstallEnvironment" IsEnabled="False"/><TextBlock x:Name="EnvironmentText" Text="正在背景檢查 Sandboxie…" TextWrapping="Wrap" VerticalAlignment="Center"/></DockPanel>
@@ -9,29 +9,32 @@
     <DockPanel><Button DockPanel.Dock="Right" Content="選擇檔案" Click="Browse" Margin="10,0,0,0"/><TextBox x:Name="SourcePath" TextChanged="SourceChanged"/></DockPanel>
     <CheckBox x:Name="YongCompatibility" Content="套用 YongOrigin 相容設定" Margin="0,12,0,0" Checked="CompatibilityChanged" Unchecked="CompatibilityChanged"/>
     <TextBlock x:Name="CompatibilityHint" Text="辨識到 YongOrigin 時自動建議相容設定；每個環境使用固定且不同的裝置識別。" FontSize="11" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,5,0,0"/>
-    <TextBlock Text="2. 每個實例選擇不同的固定線路" Style="{StaticResource FieldLabel}" Margin="0,15,0,5"/>
+    <TextBlock Text="2. 每個實例選擇代理線路或本地網路" Style="{StaticResource FieldLabel}" Margin="0,15,0,5"/>
     <ScrollViewer MaxHeight="210" VerticalScrollBarVisibility="Auto"><ItemsControl x:Name="LineAssignments"><ItemsControl.ItemTemplate><DataTemplate>
-     <Grid Margin="0,3"><Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition/></Grid.ColumnDefinitions>
+     <Grid Margin="0,3"><Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="205"/><ColumnDefinition/></Grid.ColumnDefinitions>
       <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}" VerticalAlignment="Center" Margin="0,0,12,0"/>
-      <ComboBox Grid.Column="1" ItemsSource="{Binding Options}" DisplayMemberPath="Label" SelectedValuePath="Id" SelectedValue="{Binding ProxyId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+      <CheckBox Grid.Column="1" Content="本地網路（不使用代理）" IsChecked="{Binding UseLocalNetwork, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" ToolTip="使用本機原有網路，略過 xa sk5 全局代理；可與其他實例共用出口。"/>
+      <ComboBox Grid.Column="2" ItemsSource="{Binding Options}" IsEnabled="{Binding CanSelectProxy}" DisplayMemberPath="Label" SelectedValuePath="Id" SelectedValue="{Binding ProxyId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
      </Grid>
     </DataTemplate></ItemsControl.ItemTemplate></ItemsControl></ScrollViewer>
     <WrapPanel Margin="0,8,0,5"><Button x:Name="AddInstanceButton" Content="＋ 新增實例" Click="AddInstance"/><Button x:Name="RemoveDraftButton" Content="移除最後新增" Click="RemoveDraft"/><TextBlock x:Name="InstanceCountText" VerticalAlignment="Center" Margin="8,0,0,0"/></WrapPanel>
-    <TextBlock Text="已保存實例會保留身分與線路；要刪除已保存實例，請用「移除實例／儲存空間」。全程式最多管理 10 個實例。" FontSize="11" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,0,0,12"/>
+    <TextBlock Text="本地網路不占代理節點、會略過 xa sk5 全局代理，共用本機出口；仍需保持背景服務執行。已保存實例只改網路時，先停止要變更的實例，再按「保存網路選擇」。其他執行中實例不受影響。" FontSize="11" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,0,0,12"/>
     <CheckBox x:Name="SimulateAdmin" Content="模擬管理員相容模式（適用需要管理員權限的登入器）" Margin="0,0,0,12"/>
-    <WrapPanel><Button x:Name="PrepareButton" Content="3. 準備環境／保存" Style="{StaticResource PrimaryButton}" Click="Prepare"/><Button x:Name="CancelWork" Content="取消目前工作" Click="CancelPreparation" IsEnabled="False"/></WrapPanel>
-    <TextBlock Text="每個實例各有一份遊戲副本，完成後不必重建。可取消並接續；原始遊戲不變。保存前請先停止此遊戲的所有實例。" TextWrapping="Wrap" FontSize="11" Foreground="{StaticResource Muted}" Margin="0,10,0,0"/>
+    <TextBlock Text="每個實例各有一份遊戲副本，完成後不必重建。可取消並接續；原始遊戲不變。重新準備環境前，請先停止此遊戲的所有實例。" TextWrapping="Wrap" FontSize="11" Foreground="{StaticResource Muted}" Margin="0,10,0,0"/>
    </StackPanel></Border>
    <WrapPanel Margin="0,16,0,8"><TextBlock Text="批量間隔" VerticalAlignment="Center"/><TextBox x:Name="LaunchInterval" Text="10" Width="55" Margin="8,0"/><TextBlock Text="秒（上一個完成後再等候）" VerticalAlignment="Center"/></WrapPanel>
    <WrapPanel Margin="0,0,0,12"><Button x:Name="StartSelectedButton" Content="啟動選取實例" Click="StartSelected"/><Button x:Name="StartAllButton" Content="批量啟動此遊戲" Click="StartAll"/><Button x:Name="StopButton" Content="停止選取實例" Click="StopSelected"/><Button Content="移除實例／儲存空間" Click="ManageStorage"/><Button Content="重新整理" Click="RefreshClick"/></WrapPanel>
    <TextBlock Text="準備完成後，也可回到「規則管理」右鍵實例 → 啟動。已在執行的實例會略過；遊戲帳密仍在遊戲視窗輸入。" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,0,0,10"/>
    <DataGrid x:Name="Instances" Height="190" SelectionMode="Single" IsReadOnly="True"><DataGrid.RowStyle><Style TargetType="DataGridRow"><Setter Property="ToolTip" Value="{Binding Detail}"/></Style></DataGrid.RowStyle><DataGrid.Columns>
     <DataGridTextColumn Header="實例" Binding="{Binding Profile.Name}" Width="140" ElementStyle="{StaticResource CellText}"/>
-    <DataGridTextColumn Header="固定線路／實測出口" Binding="{Binding Line}" Width="2*" ElementStyle="{StaticResource CellText}"/>
+    <DataGridTextColumn Header="網路模式／線路／出口" Binding="{Binding Line}" Width="2*" ElementStyle="{StaticResource CellText}"/>
     <DataGridTextColumn Header="狀態" Binding="{Binding State}" Width="1.3*" ElementStyle="{StaticResource CellText}"/>
     <DataGridTextColumn Header="成員" Binding="{Binding Members}" Width="55" ElementStyle="{StaticResource CellText}"/>
    </DataGrid.Columns></DataGrid>
   </StackPanel></ScrollViewer>
-  <DockPanel Grid.Row="2" Margin="0,16,0,0"><Button DockPanel.Dock="Right" Content="關閉" Click="CloseWindow" Margin="12,0,0,0" VerticalAlignment="Bottom"/><ScrollViewer MaxHeight="110" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="ProgressText" TextWrapping="Wrap" VerticalAlignment="Center"/></ScrollViewer></DockPanel>
+  <StackPanel Grid.Row="2" Margin="0,16,0,0">
+   <WrapPanel><Button x:Name="PrepareButton" Content="3. 準備環境／保存" Style="{StaticResource PrimaryButton}" Click="Prepare"/><Button x:Name="SaveNetworkButton" Content="保存網路選擇" Click="SaveNetwork"/><Button x:Name="CancelWork" Content="取消目前工作" Click="CancelPreparation" IsEnabled="False"/><Button Content="關閉" Click="CloseWindow"/></WrapPanel>
+   <ScrollViewer MaxHeight="110" VerticalScrollBarVisibility="Auto" Margin="0,8,0,0"><TextBlock x:Name="ProgressText" TextWrapping="Wrap"/></ScrollViewer>
+  </StackPanel>
  </Grid>
 </Window>

@@ -722,9 +722,11 @@ public sealed partial class Controller : IDisposable
         {
             var b = bindings[0]; bool shared = bindings.Select(x => x.TargetKey).Distinct().Count() > 1;
             if (shared) foreach (var binding in bindings) conflicts.Add(binding.TargetKey);
-            bool ready = b.Enabled && !shared && Healthy(b.ProxyId) && !DuplicateExit(b.ProxyId);
-            ReportHealth(b.TargetKey, ready, b.ProxyId);
-            rows.Add(new() { Pid = (uint)process.Pid, Created = (ulong)process.CreatedFileTime, Proxy = nativeIds[b.ProxyId], Blocked = ready ? 0u : 1u, Reserved = b.Kind == "Sandbox" ? 13u : b.IncludeChildren ? 1u : 0u });
+            bool ready = b.Enabled && !shared && BindingNetworkReady(b);
+            if (b.ProxyId != Guid.Empty) ReportHealth(b.TargetKey, ready, b.ProxyId);
+            var sandbox = b.Kind == "Sandbox" ? config.SandboxInstances.FirstOrDefault(p => p.TargetKey == b.TargetKey) : null;
+            rows.Add(sandbox is not null ? SandboxNetworkRules.Build(sandbox, process, nativeIds.GetValueOrDefault(b.ProxyId), b.Enabled, shared, BindingNetworkReady(b)) :
+                new() { Pid = (uint)process.Pid, Created = (ulong)process.CreatedFileTime, Proxy = nativeIds[b.ProxyId], Blocked = ready ? 0u : 1u, Reserved = b.Kind == "Sandbox" ? 13u : b.IncludeChildren ? 1u : 0u });
         }
         // Known unbound instances bypass the startup guard. Unknown new instances stay quarantined until identified.
         foreach (var target in targets.Values.Where(t => EmulatorCatalog.IsEmulator(t.Kind) && config.Bindings.All(b => b.TargetKey != t.Key)))
@@ -790,7 +792,7 @@ public sealed partial class Controller : IDisposable
             ReconcileAutomaticBindings();
             if ((config.GlobalProxy.Enabled || config.Bindings.Count > 0 || config.AutoProxy.Enabled || config.Vmware.Machines.Length > 0 && VmwarePrepared) && NativeEngine.DriverPresent && (!started || NativeEngine.Core_IsRunning() == 0)) { try { EnsureEngine(); } catch (Exception ex) { engineError = ex.Message; } }
             ApplyRules();
-            due = config.Bindings.Where(b => b.Enabled).Select(b => b.ProxyId).Concat(config.GlobalProxy.Enabled ? [config.GlobalProxy.ProxyId] : []).Concat(config.Vmware.Enabled ? vmwareRuntime.Select(r => r.ProxyId).Where(id => id != Guid.Empty) : []).Distinct().FirstOrDefault(id => !tcpProbes.ContainsKey(id) && !supplementalChecks.ContainsKey(id) && (!retries.TryGetValue(id, out var r) || r.At <= DateTimeOffset.UtcNow));
+            due = config.Bindings.Where(b => b.Enabled && b.ProxyId != Guid.Empty).Select(b => b.ProxyId).Concat(config.GlobalProxy.Enabled ? [config.GlobalProxy.ProxyId] : []).Concat(config.Vmware.Enabled ? vmwareRuntime.Select(r => r.ProxyId).Where(id => id != Guid.Empty) : []).Distinct().FirstOrDefault(id => !tcpProbes.ContainsKey(id) && !supplementalChecks.ContainsKey(id) && (!retries.TryGetValue(id, out var r) || r.At <= DateTimeOffset.UtcNow));
             if (childrenDirty) { store.Save(config); childrenDirty = false; }
         }
         catch (Exception ex) when (ex is not OperationCanceledException) { autoStatus = "自動分配／監測失敗：" + ex.Message; Log("監測失敗：" + ex.Message); }
@@ -870,7 +872,7 @@ public sealed partial class Controller : IDisposable
             var members = b.Kind == "GameGroup" ? config.GameGroups.FirstOrDefault(g => g.Key == b.TargetKey)?.Members.Select(m => m.Identity).ToArray() ?? pids : pids;
             long sent = 0, received = 0; uint tcp = 0, udp = 0;
             foreach (var p in members) if (NativeEngine.Present) { NativeEngine.Core_GetProcessStats((uint)p.Pid, (ulong)p.CreatedFileTime, out var t, out uint pt, out uint pu); sent += (long)t.Sent; received += (long)t.Received; tcp += pt; udp += pu; }
-            string state = !running ? "核心未啟用" : conflicts.Contains(b.TargetKey) ? "共用程序，不支援分流" : !b.Enabled ? "已封鎖" : pids.Length == 0 ? b.Kind == "Process" && b.IncludeChildren ? "接續遊戲中 · 保留 IP" : "等待實例" : DuplicateExit(b.ProxyId) ? "出口重複，已封鎖" : !Healthy(b.ProxyId) ? "代理異常，已封鎖" : "代理執行中";
+            string state = !running ? "核心未啟用" : conflicts.Contains(b.TargetKey) ? "共用程序，不支援分流" : !b.Enabled ? "已封鎖" : pids.Length == 0 ? b.Kind == "Process" && b.IncludeChildren ? "接續遊戲中 · 保留 IP" : "等待實例" : b.Kind == "Sandbox" && config.SandboxInstances.Any(p => p.TargetKey == b.TargetKey && p.UseLocalNetwork && p.ProxyId == Guid.Empty) ? "本地網路執行中" : DuplicateExit(b.ProxyId) ? "出口重複，已封鎖" : !Healthy(b.ProxyId) ? "代理異常，已封鎖" : "代理執行中";
             return new RuntimeStatus(b.TargetKey, state, running ? "TCP／UDP 規則已下達；實際 IP 仍須從目標內驗證。連入時長為本次代理啟用時長；連線數為核心已建立的 TCP／UDP 關聯。" : engineError, sent, received) { TcpConnections = tcp, UdpAssociations = udp, ConnectedAt = sessions.ConnectedAt(b.TargetKey) };
         }).ToArray();
         var visibleTargets = targets.Values.Concat(config.Bindings.Select(b => new TargetInstance(b.TargetKey, b.Name, b.Kind, b.Path, b.Index,
@@ -878,7 +880,7 @@ public sealed partial class Controller : IDisposable
         var visibleProbes = probes.Values.Where(p => !probeViews.ContainsKey(p.ProxyId)).Concat(probeViews.Values).ToArray();
         return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), visibleTargets, visibleProbes, statuses,
             new(true, NativeEngine.DriverPresent, NativeEngine.Present, running, AppReleasePackage.CurrentVersion + " 預覽版", NativeEngine.DriverPresent ? engineError : "缺少 WinDivert 驅動，未啟用攔截。", logs.ToArray()))
-            { SupportsSandboxInstances = NativeEngine.SupportsSandboxGuards, SupportsSandboxSafety = NativeEngine.SupportsP0RoutingSafety, SupportsSandboxExperience = true, SupportsSandboxRemoval = true, SandboxInstances = config.SandboxInstances.ToArray(), SandboxStatuses = SandboxStatuses(), SupportsBulkActions = true, SupportsProxyCapacities = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyConnectedAt = globalSession.ConnectedAt, GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
+            { SupportsSandboxInstances = NativeEngine.SupportsSandboxGuards, SupportsSandboxSafety = NativeEngine.SupportsP0RoutingSafety, SupportsSandboxExperience = true, SupportsSandboxRemoval = true, SupportsSandboxLocalNetwork = NativeEngine.SupportsP0RoutingSafety, SandboxInstances = config.SandboxInstances.ToArray(), SandboxStatuses = SandboxStatuses(), SupportsBulkActions = true, SupportsProxyCapacities = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyConnectedAt = globalSession.ConnectedAt, GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
     }
     private uint GlobalPolicyState() => !config.GlobalProxy.Enabled ? 0u : Healthy(config.GlobalProxy.ProxyId) ? 1u : 2u;
     private string GlobalStatus()

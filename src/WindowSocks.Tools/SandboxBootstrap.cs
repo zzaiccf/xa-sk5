@@ -9,10 +9,12 @@ internal static class SandboxBootstrap
         var grace = DateTimeOffset.UtcNow;
         await SandboxBootstrapSession.Run(async () => {
         var identity = LdPlayer.Identity(Environment.ProcessId) ?? throw new InvalidOperationException("無法確認啟動程序。");
-        permission = await PipeTransport.CallAsync<SandboxLaunchPermission>(Command.Create("registerSandbox", new SandboxRegistration(id, token, identity)), pipeName: PipeTransport.SandboxName);
+        permission = await PipeTransport.CallAsync<SandboxLaunchPermission>(Command.Create("registerSandbox", new SandboxRegistration(id, token, identity) { SupportsLocalNetwork = true }), pipeName: PipeTransport.SandboxName);
+        if (!permission.UseLocalNetwork) {
         var network = await TransparentTrafficProbe.RunAsync();
         await File.WriteAllTextAsync(Path.Combine(permission.WorkingDirectory, "xa-sandbox-network.json"), System.Text.Json.JsonSerializer.Serialize(network, Json.Options));
         await PipeTransport.CallAsync<bool>(Command.Create("reportSandboxNetwork", new SandboxNetworkReport(id, network.TcpExit, network.UdpExit, network.Dns)), pipeName: PipeTransport.SandboxName);
+        }
         using var game = Process.Start(new ProcessStartInfo(permission.LauncherPath) { WorkingDirectory = permission.WorkingDirectory, UseShellExecute = false })
             ?? throw new IOException("無法啟動遊戲。");
         await PipeTransport.CallAsync<bool>(Command.Create("reportSandboxLaunch", new SandboxLaunchReport(id, true, "")), pipeName: PipeTransport.SandboxName);

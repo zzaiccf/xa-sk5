@@ -392,6 +392,39 @@ static void r6Checks(uint32_t pid,uint64_t birth){
     TerminateProcess(pi.hProcess,0);WaitForSingleObject(pi.hProcess,5000);CloseHandle(pi.hThread);CloseHandle(pi.hProcess);
     require(action==1&&found.proxy==910,"R6 no-Job sandbox child must retain ancestry routing");reset();
 }
+static void localSandboxChecks(uint32_t pid,uint64_t birth){
+    reset();sandboxIdentityState=1;Core_SetProxy(910,"127.0.0.1",1080,"","");
+    RouteRule entries[]={{pid,0,birth,2,13},{4242424242u,910,42,0,13}};RouteRule found{};
+    const wchar_t* guards=L"@box:Xa_0123456789abcdef01234567\0";
+    require(Core_ReplacePolicyEx(entries,2,guards,910,1,0)==1,"local and proxy sandbox rules coexist with global proxy");
+    sandboxIdentityQuery=[](uint32_t,uint64_t,std::wstring& box){box=L"Xa_0123456789abcdef01234567";return 1;};
+    require(policyAction(pid,birth,false,found)==3&&found.proxy==0,"explicit local sandbox bypasses global proxy for IPv4");
+    require(policyAction(pid,birth,true,found)==3,"explicit local sandbox permits local IPv6");
+    require(policyAction(4242424242u,42,false,found)==1&&found.proxy==910,"other sandbox retains fixed SOCKS route");
+    require(policyAction(4242424242u,42,true,found)==2,"proxied sandbox IPv6 remains fail closed");
+    auto p=packet();auto original=p;WINDIVERT_ADDRESS address{};address.Outbound=1;address.IPChecksum=address.TCPChecksum=address.UDPChecksum=1;
+    auto owners=tcpOwner(pid,p);PassThroughBatch output;auto sends=sendCalls;
+    require(processPacket(p,address,owners,&output)&&output.addresses.size()==1&&p==original&&sendCalls==sends,"local TCP bypass is byte-for-byte direct, without SOCKS relay");
+    auto udp=packet(true);OwnerBatch udpOwners;auto& table=udpOwners.tables[1];table.attempted=true;table.at=GetTickCount64();table.data.resize(sizeof(MIB_UDPTABLE_OWNER_MODULE));
+    auto* t=(MIB_UDPTABLE_OWNER_MODULE*)table.data.data();t->dwNumEntries=1;t->table[0]={};t->table[0].dwLocalAddr=word(udp.data()+12);t->table[0].dwLocalPort=htons(be16(udp.data()+20));t->table[0].dwOwningPid=pid;t->table[0].liCreateTimestamp.QuadPart=birth;
+    original=udp;output.addresses.clear();output.bytes.clear();
+    require(processPacket(udp,address,udpOwners,&output)&&output.addresses.size()==1&&udp==original&&sendCalls==sends,"local UDP bypass is byte-for-byte direct, without SOCKS association");
+    require(policyAction(pid,birth+1,false,found)==2,"PID reuse cannot inherit explicit local permission");
+    entries[0].blocked=1;Core_ReplacePolicyEx(entries,2,guards,910,1,0);
+    require(policyAction(pid,birth,false,found)==2,"paused local sandbox remains blocked, not global fallback");
+    entries[0].blocked=2;entries[1].blocked=1;Core_ReplacePolicyEx(entries,2,guards,910,1,0);
+    require(policyAction(4242424242u,42,false,found)==2,"proxy failure cannot turn a proxied sandbox into local mode");
+    require(policyAction(pid,birth,false,found)==3,"another sandbox proxy failure does not change local selection");
+    sandboxIdentityState=-1;
+    require(policyAction(pid,birth,false,found)==2,"driver identity failure blocks explicit local sandbox too");
+    sandboxIdentityState=1;
+    require(policyAction(pid,birth,false,found)==3,"identity recovery restores original local mode");
+    Core_ReplacePolicyEx(entries,2,guards,0,0,0);
+    require(policyAction(pid,birth,false,found)==3,"local sandbox also works when global proxy is off");
+    Core_ReplacePolicyEx(nullptr,0,guards,910,1,0);
+    require(policyAction(pid,birth,false,found)==2,"removed direct permission keeps unknown sandbox quarantined");
+    sandboxIdentityQuery={};reset();
+}
 int main(int argc,char** argv){
     try{
         if(argc<2)throw std::runtime_error("Pass the official WinDivert.dll path.");
@@ -402,7 +435,7 @@ int main(int argc,char** argv){
         WSADATA ws;WSAStartup(MAKEWORD(2,2),&ws);listenPort=18000;
         uint32_t pid=parentPid();uint64_t birth=created(pid);require(pid&&birth,"live parent identity required");
         if(argc>2){if(!strcmp(argv[2],"R6"))r6Checks(parentPid(),created(parentPid()));else if(!strcmp(argv[2],"R4"))r4Checks();else if(!strcmp(argv[2],"R5"))r5Checks();else if(!strcmp(argv[2],"R3"))r3Checks(pid,birth);else if(!strcmp(argv[2],"P0-5"))p05Checks();else if(!strcmp(argv[2],"P0-6"))p06Checks(pid,birth);else if(!strcmp(argv[2],"P0-4"))p04Checks();else if(!strcmp(argv[2],"P0-1"))p01Checks(pid,birth);else throw std::runtime_error("Unknown check");}
-        else {r6Checks(parentPid(),created(parentPid()));r4Checks();r8Checks();r5Checks();r3Checks(pid,birth);p01Checks(pid,birth);p04Checks();p05Checks();p06Checks(pid,birth);batchLoopChecks();sendFailureChecks();policyChecks(pid,birth);concurrentActivityChecks();socketReuseChecks();followedTreeChecks(pid,birth);retryChecks();reportBenchmark();shutdownChecks();reset();telemetryChecks();}
+        else {localSandboxChecks(pid,birth);r6Checks(parentPid(),created(parentPid()));r4Checks();r8Checks();r5Checks();r3Checks(pid,birth);p01Checks(pid,birth);p04Checks();p05Checks();p06Checks(pid,birth);batchLoopChecks();sendFailureChecks();policyChecks(pid,birth);concurrentActivityChecks();socketReuseChecks();followedTreeChecks(pid,birth);retryChecks();reportBenchmark();shutdownChecks();reset();telemetryChecks();}
         printf("PASS: %u packet-path assertions; no capture handle opened.\n",checks);WSACleanup();return 0;
     }catch(const std::exception& e){fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
 }

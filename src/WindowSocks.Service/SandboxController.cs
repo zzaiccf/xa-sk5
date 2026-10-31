@@ -106,6 +106,11 @@ public sealed partial class Controller
         } finally{sandboxPoll.Release();}
     }
     private ISandboxRuntime SandboxRuntime => sandboxRuntime;
+    private bool SandboxNetworkReady(SandboxInstanceProfile profile) => profile.UseLocalNetwork
+        ? profile.ProxyId == Guid.Empty : Healthy(profile.ProxyId) && !DuplicateExit(profile.ProxyId);
+    private bool BindingNetworkReady(InstanceBinding binding) => binding.Kind == "Sandbox"
+        ? config.SandboxInstances.FirstOrDefault(p => p.TargetKey == binding.TargetKey) is { } profile && SandboxNetworkReady(profile)
+        : Healthy(binding.ProxyId) && !DuplicateExit(binding.ProxyId);
     private async Task<SandboxInstanceProfile> BeginSandboxRemoval(Guid id,CancellationToken ct)
     {
         SandboxInstanceProfile profile;long revision;
@@ -154,13 +159,13 @@ public sealed partial class Controller
     {
         SandboxInstances.Validate(profile);
         ProxyOwnershipLedger.From(config,vmwareRuntime).Require(profile.ProxyId,profile.TargetKey,"Sandbox");
-        if (!config.Proxies.Any(p => p.Id == profile.ProxyId)) throw new InvalidOperationException("線路已移除，請重新選取。");
+        if (!profile.UseLocalNetwork && !config.Proxies.Any(p => p.Id == profile.ProxyId)) throw new InvalidOperationException("線路已移除，請重新選取。");
         var old = config.SandboxInstances.SingleOrDefault(p => p.Id == profile.Id);
         if (old is null && config.SandboxInstances.Count >= 10) throw new InvalidOperationException("最多建立十個沙盒實例。");
         if (old is not null && (old.BoxName != profile.BoxName || old.LauncherPath != profile.LauncherPath || old.WorkingDirectory != profile.WorkingDirectory || old.FileRoot != profile.FileRoot))
             throw new InvalidOperationException("已保存實例不可更換沙盒身分或遊戲位置，請另建實例。");
         if (sandboxTickets.ContainsKey(profile.Id)) throw new InvalidOperationException("請先停止此沙盒再修改設定。");
-        if (config.SandboxInstances.Any(p => p.Id != profile.Id && (p.ProxyId == profile.ProxyId || p.BoxName == profile.BoxName || p.WorkingDirectory.Equals(profile.WorkingDirectory, StringComparison.OrdinalIgnoreCase))))
+        if (config.SandboxInstances.Any(p => p.Id != profile.Id && (!profile.UseLocalNetwork && p.ProxyId == profile.ProxyId || p.BoxName == profile.BoxName || p.WorkingDirectory.Equals(profile.WorkingDirectory, StringComparison.OrdinalIgnoreCase))))
             throw new InvalidOperationException("每個沙盒需要獨立的線路與遊戲副本。");
         profile = profile with { Enabled = false };
         var profiles = config.SandboxInstances.Where(p => p.Id != profile.Id).Append(profile).ToList();
@@ -191,8 +196,8 @@ public sealed partial class Controller
             throw new InvalidOperationException("此實例已執行或正在啟動，不會重複開啟。");
         try { _ = File.GetAttributes(profile.LauncherPath); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { throw new InvalidOperationException($"服務無法讀取遊戲副本（{ex.GetType().Name} / {ex.HResult:X8}）：{ex.Message}"); }
-        if (!Healthy(profile.ProxyId) || DuplicateExit(profile.ProxyId)) throw new InvalidOperationException("線路未通過檢測或出口重複，未啟動遊戲。");
-        if (config.Bindings.Any(b => b.TargetKey != profile.TargetKey && b.ProxyId == profile.ProxyId)) throw new InvalidOperationException("此線路仍被其他窗口使用。");
+        if (!SandboxNetworkReady(profile)) throw new InvalidOperationException("線路未通過檢測或出口重複，未啟動遊戲。");
+        if (!profile.UseLocalNetwork && config.Bindings.Any(b => b.TargetKey != profile.TargetKey && b.ProxyId == profile.ProxyId)) throw new InvalidOperationException("此線路仍被其他窗口使用。");
         if (config.Bindings.Count(b => b.TargetKey != profile.TargetKey) >= 10) throw new InvalidOperationException("管理數量已達十個。");
         EnsureEngine(); profile = profile with { Enabled = true };
         sandboxMembershipRevision++;
@@ -204,12 +209,13 @@ public sealed partial class Controller
         sandboxTickets[id] = (token, DateTimeOffset.UtcNow.AddSeconds(60)); sandboxErrors.Remove(id);
         sandboxLaunchErrors.Remove(id); sandboxStages.Remove(id); sandboxBootstraps.Remove(id); sandboxNetworkChecks.Remove(id);
         sandboxLaunchSucceeded.Remove(id);
-        ApplyRules(); store.Save(config); Log($"沙盒「{profile.Name}」已保留線路，等待啟動核驗。");
+        ApplyRules(); store.Save(config); Log($"沙盒「{profile.Name}」已設定{(profile.UseLocalNetwork ? "本地網路（略過全局代理）" : "固定代理線路")}，等待啟動核驗。");
         return new(profile, token);
     }
     private SandboxLaunchPermission RegisterSandbox(SandboxRegistration request, int? callerPid)
     {
         var profile = SandboxProfile(request.Id);
+        if (profile.UseLocalNetwork && !request.SupportsLocalNetwork) throw new InvalidOperationException("本地網路需要 0.1.36 啟動輔助程式，請更新完整程式目錄。");
         ProxyOwnershipLedger.From(config,vmwareRuntime).Require(profile.ProxyId,profile.TargetKey,"Sandbox");
         if (callerPid != request.Process.Pid || LdPlayer.Identity(request.Process.Pid) != request.Process)
             throw new InvalidOperationException("啟動程序 PID 或建立時間不符。");
@@ -219,14 +225,14 @@ public sealed partial class Controller
         var observed = SandboxRuntime.Query(request.Process.Pid);
         if (observed is null || observed.BoxName != profile.BoxName || observed.OwnerSid != OwnerSid)
             throw new InvalidOperationException("程序不在指定沙盒中，未啟動遊戲。");
-        if (!profile.Enabled || !Healthy(profile.ProxyId) || DuplicateExit(profile.ProxyId)) throw new InvalidOperationException("線路尚未就緒，未啟動遊戲。");
+        if (!profile.Enabled || !SandboxNetworkReady(profile)) throw new InvalidOperationException("線路尚未就緒，未啟動遊戲。");
         sandboxTickets.Remove(request.Id); ReconcileSandboxes(); ApplyRules();
         var binding = config.Bindings.Single(b => b.TargetKey == profile.TargetKey);
         if (!binding.Processes.Contains(request.Process)) throw new InvalidOperationException("沙盒程序尚未完成路由。");
-        Log($"沙盒「{profile.Name}」身分與代理核驗完成。");
-        if (NativeEngine.Core_IsRunning() == 0 || conflicts.Contains(profile.TargetKey)) throw new InvalidOperationException("代理核心尚未就緒，未啟動遊戲。");
+        Log($"沙盒「{profile.Name}」身分與{(profile.UseLocalNetwork ? "本地網路規則" : "代理")}核驗完成。");
+        if (!started || !engineLifecycle.Healthy || conflicts.Contains(profile.TargetKey)) throw new InvalidOperationException("網路核心尚未就緒，未啟動遊戲。");
         sandboxBootstraps[request.Id] = request.Process;
-        return new(profile.LauncherPath, profile.WorkingDirectory, profile.FileRoot);
+        return new(profile.LauncherPath, profile.WorkingDirectory, profile.FileRoot) { UseLocalNetwork = profile.UseLocalNetwork };
     }
     private void ReportSandboxLaunch(SandboxLaunchReport report, int? callerPid)
     {
@@ -235,7 +241,11 @@ public sealed partial class Controller
             SandboxRuntime.Query(helper.Pid) is not { } member || member.BoxName != profile.BoxName || member.OwnerSid != OwnerSid)
             throw new InvalidOperationException("沙盒啟動回報身分不符。");
         if (report.Started) {
-            if (!sandboxNetworkChecks.ContainsKey(report.Id)) throw new InvalidOperationException("尚未通過沙盒出口驗證。");
+            if (!profile.UseLocalNetwork && !sandboxNetworkChecks.ContainsKey(report.Id)) throw new InvalidOperationException("尚未通過沙盒出口驗證。");
+            if (profile.UseLocalNetwork && (!profile.Enabled || !SandboxNetworkReady(profile) || !SandboxRuntime.IdentityAvailable ||
+                !started || !engineLifecycle.Healthy || conflicts.Contains(profile.TargetKey) ||
+                !config.Bindings.Any(b => b.TargetKey == profile.TargetKey && b.Enabled && b.Processes.Contains(helper))))
+                throw new InvalidOperationException("本地網路實例的身分或規則尚未就緒，未確認啟動。");
             sandboxLaunchSucceeded[report.Id] = helper;
             sandboxStages[report.Id] = SandboxLaunchErrors.LauncherOpened;
         }
@@ -256,6 +266,7 @@ public sealed partial class Controller
     private void ReportSandboxNetwork(SandboxNetworkReport report, int? callerPid)
     {
         var profile = SandboxProfile(report.Id);
+        if (profile.UseLocalNetwork) throw new InvalidOperationException("本地網路不執行代理出口檢測，請更新啟動輔助程式。");
         if (!sandboxBootstraps.TryGetValue(report.Id, out var helper) || callerPid != helper.Pid || LdPlayer.Identity(helper.Pid) != helper ||
             SandboxRuntime.Query(helper.Pid) is not { } member || member.BoxName != profile.BoxName || member.OwnerSid != OwnerSid)
             throw new InvalidOperationException("出口驗證程序身分不符。");
@@ -300,7 +311,7 @@ public sealed partial class Controller
                 sandboxQueryFailures.Remove(profile.Id);
                 if (binding is not null) { binding.Processes = members; binding.Enabled = sandboxFirewallReady && profile.Enabled && !sandboxLaunchErrors.ContainsKey(profile.Id); }
                 targets[profile.TargetKey] = new(profile.TargetKey, profile.Name, "Sandbox", profile.LauncherPath, -1, members.Length > 0, members,
-                    "沙盒：" + profile.BoxName + " · 固定線路");
+                    "沙盒：" + profile.BoxName + (profile.UseLocalNetwork ? " · 本地網路（略過全局代理）" : " · 固定線路"));
                 sandboxErrors.Remove(profile.Id);
                 sandboxIdentityUnavailable.Remove(profile.Id);
                 if (!SandboxRuntime.IdentityAvailable) {
@@ -404,8 +415,8 @@ public sealed partial class Controller
     }
     private SandboxInstanceStatus[] SandboxStatuses() => config.SandboxInstances.Select(p => {
         var binding = config.Bindings.FirstOrDefault(b => b.TargetKey == p.TargetKey); var members = binding?.Processes ?? [];
-        return new SandboxInstanceStatus(p.Id, p.RemovalPending ? "清理未完成 · 請重試移除" : !sandboxFirewallReady ? "正在建立 WFP 防護 · 沙盒暫停" : sandboxIdentityUnavailable.Contains(p.Id) ? "身分查詢不可用 · 已封鎖 · 自動重試" : members.Length > 0 && NativeEngine.Core_IsRunning() == 0 ? "代理核心未執行 · 請停止沙盒" : sandboxLaunchErrors.ContainsKey(p.Id) ? "啟動失敗 · 已封鎖" : sandboxErrors.ContainsKey(p.Id) ? binding?.Enabled==true ? "身分查詢重試 · 保留既有線路" : "沙盒身分查詢失敗 · 已封鎖" : sandboxTickets.ContainsKey(p.Id) ? "正在啟動" :
-            members.Length == 0 ? "未啟動" : !p.Enabled ? "已暫停 · 已封鎖" : !Healthy(p.ProxyId) || DuplicateExit(p.ProxyId) ? "線路異常 · 已封鎖" : !sandboxNetworkChecks.ContainsKey(p.Id) ? "正在驗證出口" : "代理執行中",
+        return new SandboxInstanceStatus(p.Id, p.RemovalPending ? "清理未完成 · 請重試移除" : !sandboxFirewallReady ? "正在建立 WFP 防護 · 沙盒暫停" : sandboxIdentityUnavailable.Contains(p.Id) ? "身分查詢不可用 · 已封鎖 · 自動重試" : members.Length > 0 && (!started || !engineLifecycle.Healthy) ? "網路核心未執行 · 請停止沙盒" : sandboxLaunchErrors.ContainsKey(p.Id) ? "啟動失敗 · 已封鎖" : sandboxErrors.ContainsKey(p.Id) ? binding?.Enabled==true ? "身分查詢重試 · 保留既有線路" : "沙盒身分查詢失敗 · 已封鎖" : sandboxTickets.ContainsKey(p.Id) ? "正在啟動" :
+            members.Length == 0 ? "未啟動" : !p.Enabled ? "已暫停 · 已封鎖" : !SandboxNetworkReady(p) ? "線路異常 · 已封鎖" : p.UseLocalNetwork ? "本地網路執行中" : !sandboxNetworkChecks.ContainsKey(p.Id) ? "正在驗證出口" : "代理執行中",
             sandboxLaunchErrors.GetValueOrDefault(p.Id, sandboxErrors.GetValueOrDefault(p.Id, sandboxStages.GetValueOrDefault(p.Id, p.BoxName))), members) { Network = sandboxNetworkChecks.GetValueOrDefault(p.Id), LauncherStarted = sandboxBootstraps.TryGetValue(p.Id, out var helper) && sandboxLaunchSucceeded.GetValueOrDefault(p.Id) == helper };
     }).ToArray();
 }

@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
@@ -24,11 +25,17 @@ public partial class SandboxWindow : Window
     private CancellationTokenSource? operation;
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(3) };
     public sealed record LineOption(Guid Id, string Label);
-    public sealed class LineAssignment(string name, Guid proxyId, LineOption[] options)
+    public sealed class LineAssignment(string name, Guid proxyId, LineOption[] options, bool useLocalNetwork = false, Guid? instanceId = null) : INotifyPropertyChanged
     {
         public string Name { get; } = name;
+        public Guid? InstanceId { get; } = instanceId;
         public Guid ProxyId { get; set; } = proxyId;
         public LineOption[] Options { get; } = options;
+        private bool local = useLocalNetwork;
+        public bool UseLocalNetwork { get => local; set { if (local == value) return; local = value; PropertyChanged?.Invoke(this, new(nameof(UseLocalNetwork))); PropertyChanged?.Invoke(this, new(nameof(CanSelectProxy))); } }
+        public bool CanSelectProxy => !UseLocalNetwork;
+        public SandboxNetworkChoice Choice => new(UseLocalNetwork ? Guid.Empty : ProxyId, UseLocalNetwork);
+        public event PropertyChangedEventHandler? PropertyChanged;
     }
     private readonly ObservableCollection<LineAssignment> assignments = new();
     private string assignmentSource = "";
@@ -69,7 +76,7 @@ public partial class SandboxWindow : Window
     {
         assignmentSource = ProgramRuleInput.Normalize(SourcePath.Text);
         assignments.Clear(); var lines = Lines();
-        foreach (var profile in CurrentProfiles()) assignments.Add(new(profile.Name, profile.ProxyId, lines));
+        foreach (var profile in CurrentProfiles()) assignments.Add(new(profile.Name, profile.ProxyId, lines, profile.UseLocalNetwork, profile.Id));
         if (assignments.Count == 0) { AppendAssignment(); if (SlotCount() < SandboxPreparation.MaximumInstances) AppendAssignment(); }
         UpdateAssignmentButtons();
     }
@@ -87,7 +94,7 @@ public partial class SandboxWindow : Window
         var rows = CurrentProfiles().Select(p => {
             var status = state.SandboxStatuses.FirstOrDefault(s => s.Id == p.Id); var line = state.Proxies.FirstOrDefault(n => n.Id == p.ProxyId);
             string exit = status?.Network?.TcpExit ?? "待沙盒內驗證";
-            return new InstanceRow(p, $"{line?.Name} · {line?.Port} · {exit}", status?.State ?? "未啟動", status?.Processes.Length ?? 0,
+            return new InstanceRow(p, p.UseLocalNetwork ? "本地網路 · 共用本機出口 · 略過全局代理" : $"{line?.Name} · {line?.Port} · {exit}", status?.State ?? "未啟動", status?.Processes.Length ?? 0,
                 status?.Detail + (status?.Network is { } network ? $"\n沙盒 TCP：{network.TcpExit} · UDP：{network.UdpExit} · 直接 DNS：{(network.DirectDns ? "通過" : "未通過")}" : ""));
         }).ToArray();
         Instances.ItemsSource = rows; Instances.SelectedItem = rows.FirstOrDefault(r => r.Profile.Id == selected) ?? rows.FirstOrDefault();
@@ -102,7 +109,7 @@ public partial class SandboxWindow : Window
             state = fresh;
             var lines = Lines();
             if (assignments.Any(row => !row.Options.SequenceEqual(lines))) {
-                var choices = assignments.Select(row => new LineAssignment(row.Name, row.ProxyId, lines)).ToArray();
+                var choices = assignments.Select(row => new LineAssignment(row.Name, row.ProxyId, lines, row.UseLocalNetwork, row.InstanceId)).ToArray();
                 assignments.Clear(); foreach (var row in choices) assignments.Add(row);
             }
             if (SourcePath.Text.Length == 0 && state.SandboxInstances.FirstOrDefault() is { } first) SourcePath.Text = first.SourceLauncherPath;
@@ -115,7 +122,7 @@ public partial class SandboxWindow : Window
     {
         if (busy) return; busy = true; operation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         completionText = "操作完成。"; sourceInspection?.Cancel();
-        PrepareButton.IsEnabled = StartSelectedButton.IsEnabled = StartAllButton.IsEnabled = StopButton.IsEnabled = false;
+        PrepareButton.IsEnabled = SaveNetworkButton.IsEnabled = StartSelectedButton.IsEnabled = StartAllButton.IsEnabled = StopButton.IsEnabled = false;
         InstallSandboxButton.IsEnabled = false;
         SourcePath.IsEnabled = LineAssignments.IsEnabled = SimulateAdmin.IsEnabled = YongCompatibility.IsEnabled = LaunchInterval.IsEnabled = false;
         UpdateAssignmentButtons();
@@ -124,7 +131,7 @@ public partial class SandboxWindow : Window
         catch (OperationCanceledException) { if (!lifetime.IsCancellationRequested) ProgressText.Text = "已取消未完成的工作；已完成的副本與先前啟動的實例保留。"; }
         catch (Exception ex) { if (!lifetime.IsCancellationRequested) ProgressText.Text = ex.Message; }
         finally { operation.Dispose(); operation = null; busy = false; if (!lifetime.IsCancellationRequested) {
-            PrepareButton.IsEnabled = StartSelectedButton.IsEnabled = StartAllButton.IsEnabled = StopButton.IsEnabled = true; CancelWork.IsEnabled = false;
+            PrepareButton.IsEnabled = SaveNetworkButton.IsEnabled = StartSelectedButton.IsEnabled = StartAllButton.IsEnabled = StopButton.IsEnabled = true; CancelWork.IsEnabled = false;
             SourcePath.IsEnabled = LineAssignments.IsEnabled = SimulateAdmin.IsEnabled = YongCompatibility.IsEnabled = LaunchInterval.IsEnabled = true;
             await RefreshState();
             await CheckEnvironmentState();
@@ -136,8 +143,8 @@ public partial class SandboxWindow : Window
         // A shortcut/client path can resolve to another game; never carry the previous game's rows across.
         if (!source.Equals(assignmentSource, StringComparison.OrdinalIgnoreCase)) LoadAssignments();
         var existing = CurrentProfiles();
-        var selectedLines = assignments.Select(row => row.ProxyId).ToArray();
-        var pair = await backend.ResumeSandboxPreparation(source, selectedLines, existing, ct);
+        var selectedLines = assignments.Select(row => row.Choice).ToArray();
+        var pair = await backend.ResumeSandboxNetworkPreparation(source, selectedLines, existing, ct);
         if (!compatibilityChoiceMade && existing.All(p => p.IsolateDeviceIdentity is null) && await backend.DetectYongOrigin(source, ct)) {
             applyingSource = true; YongCompatibility.IsChecked = true; applyingSource = false;
         }
@@ -148,6 +155,18 @@ public partial class SandboxWindow : Window
         await backend.PrepareSandboxes(pair.Select(p => p with { SimulateAdmin = admin, IsolateDeviceIdentity = compatibility }).ToArray(), progress, ct);
         await RefreshState(); LoadAssignments();
         completionText = $"{pair.Length} 個環境已準備好。可選取實例啟動、批量啟動此遊戲，或回到規則管理右鍵啟動。";
+    });
+    private async void SaveNetwork(object sender, RoutedEventArgs e) => await Work(async ct => {
+        var saved = CurrentProfiles();
+        var changes = assignments.Where(row => row.InstanceId.HasValue).Select(row => {
+                var p = saved.Single(old => old.Id == row.InstanceId);
+                return p with { UseLocalNetwork = row.UseLocalNetwork, ProxyId = row.Choice.ProxyId };
+            })
+            .Where(p => saved.Any(old => old.Id == p.Id && (old.UseLocalNetwork != p.UseLocalNetwork || old.ProxyId != p.ProxyId))).ToArray();
+        if (changes.Length == 0) { completionText = "既有實例的網路選擇沒有變更；新實例請使用準備環境。"; return; }
+        await backend.SaveSandboxNetworks(changes, new Progress<string>(s => ProgressText.Text = s), ct);
+        await RefreshState(); LoadAssignments();
+        completionText = $"已保存 {changes.Length} 個實例的網路選擇，重新啟動後使用新設定。";
     });
     private async Task LaunchProfiles(SandboxInstanceProfile[] profiles, CancellationToken ct) {
         if (!int.TryParse(LaunchInterval.Text, out int seconds)) throw new InvalidOperationException("啟動間隔請輸入 1–300 秒。");

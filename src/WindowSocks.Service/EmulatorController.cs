@@ -103,6 +103,6 @@ public sealed partial class Controller
             ? config.GlobalProxy.ProxyId : null, DateTimeOffset.UtcNow);
         sessions.Synchronize(config.Bindings.Select(b => new ProxySessionState(b.TargetKey, b.ProxyId,
             b.Kind == "Process" && b.IncludeChildren ? b.Processes : b.Processes.Where(p => LdPlayer.Identity(p.Pid) == p && IsOwned(p.Pid)).ToArray(),
-            running && b.Enabled && !conflicts.Contains(b.TargetKey) && Healthy(b.ProxyId) && !DuplicateExit(b.ProxyId))), DateTimeOffset.UtcNow);
+            running && b.Enabled && !conflicts.Contains(b.TargetKey) && BindingNetworkReady(b))), DateTimeOffset.UtcNow);
     }
 }

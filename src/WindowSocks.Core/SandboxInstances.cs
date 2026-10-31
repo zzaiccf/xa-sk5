@@ -18,6 +18,7 @@ public sealed record SandboxInstanceProfile
     public string WorkingDirectory { get; init; } = "";
     public string FileRoot { get; init; } = "";
     public Guid ProxyId { get; init; }
+    public bool UseLocalNetwork { get; init; }
     public bool Enabled { get; init; }
     public bool RemovalPending { get; init; }
     public bool SimulateAdmin { get; init; }
@@ -32,7 +33,10 @@ public sealed record SandboxInstanceStatus(Guid Id, string State, string Detail,
 public sealed record SandboxRequest(Guid Id);
 public sealed record SandboxRemovalRequest(Guid Id, bool DeleteFiles);
 public sealed record SandboxLaunchTicket(SandboxInstanceProfile Instance, string Token);
-public sealed record SandboxRegistration(Guid Id, string Token, ProcessIdentity Process);
+public sealed record SandboxRegistration(Guid Id, string Token, ProcessIdentity Process)
+{
+    public bool SupportsLocalNetwork { get; init; }
+}
 public sealed record SandboxLaunchReport(Guid Id, bool Started, string Detail)
 {
     // Optional additions: both older senders and older receivers retain the
@@ -41,7 +45,11 @@ public sealed record SandboxLaunchReport(Guid Id, bool Started, string Detail)
     public string? ErrorFile { get; init; }
 }
 public sealed record SandboxNetworkReport(Guid Id, string? TcpExit, string? UdpExit, bool DirectDns);
-public sealed record SandboxLaunchPermission(string LauncherPath, string WorkingDirectory, string FileRoot);
+public sealed record SandboxLaunchPermission(string LauncherPath, string WorkingDirectory, string FileRoot)
+{
+    public bool UseLocalNetwork { get; init; }
+}
+public sealed record SandboxNetworkChoice(Guid ProxyId, bool UseLocalNetwork = false);
 public sealed record SandboxProcess(ProcessIdentity Identity, string BoxName, string OwnerSid, uint SessionId);
 
 public static class SandboxInstances
@@ -57,7 +65,7 @@ public static class SandboxInstances
     public static bool Within(string file, string root) => Path.GetFullPath(file).StartsWith(Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     public static void Validate(SandboxInstanceProfile profile)
     {
-        if (profile.Id == Guid.Empty || profile.ProxyId == Guid.Empty || string.IsNullOrWhiteSpace(profile.Name) || profile.Name.Length > 80 || profile.Name.Any(char.IsControl))
+        if (profile.Id == Guid.Empty || (profile.UseLocalNetwork ? profile.ProxyId != Guid.Empty : profile.ProxyId == Guid.Empty) || string.IsNullOrWhiteSpace(profile.Name) || profile.Name.Length > 80 || profile.Name.Any(char.IsControl))
             throw new InvalidOperationException("沙盒名稱或線路無效。");
         if (!Regex.IsMatch(profile.BoxName, "^Xa_[0-9a-f]{24}$") || profile.BoxName != "Xa_" + profile.Id.ToString("N")[..24])
             throw new InvalidOperationException("沙盒身分不正確。");

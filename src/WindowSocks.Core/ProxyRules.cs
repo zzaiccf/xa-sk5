@@ -19,7 +19,7 @@ public static class ProxyRules
             var settings = vm.Settings;
             rows.Add(new("vmware", "VMware 虛擬機代理", "虛擬機", settings.ByStartup ? "依啟動順序" : "固定虛擬機", settings.ByStartup ? $"每 IP {settings.PerProxy} 個窗口" + (settings.OverflowToLocal ? " · 超額本地" : "") : "依固定對應", $"{settings.Machines.Length} 台虛擬機", !state.Diagnostics.ServiceOnline ? "待服務連線" : settings.PendingPreparation ? settings.PreparationError.Length > 0 ? "已儲存 · 準備未完成" : "已儲存 · 等待準備" : !settings.Enabled ? "已暫停" : !vm.Prepared ? "尚未準備" : "已啟用", string.Join("、", settings.Machines.Select(m => m.Name.Length > 0 ? m.Name : System.IO.Path.GetFileNameWithoutExtension(m.VmxPath))) + "；" + vm.Detail));
         }
-        rows.AddRange(state.SandboxInstances.Select(p => new ProxyRuleItem(p.TargetKey, p.Name, "桌面沙盒", "固定線路", "專用 IP", "1 個隔離實例", state.SandboxStatuses.FirstOrDefault(s => s.Id == p.Id)?.State ?? "未啟動", p.LauncherPath)));
+        rows.AddRange(state.SandboxInstances.Select(p => new ProxyRuleItem(p.TargetKey, p.Name, "桌面沙盒", p.UseLocalNetwork ? "本地網路（略過全局代理）" : "固定線路", p.UseLocalNetwork ? "共用本機出口" : "專用 IP", "1 個隔離實例", state.SandboxStatuses.FirstOrDefault(s => s.Id == p.Id)?.State ?? "未啟動", p.LauncherPath)));
         rows.AddRange(state.Bindings.Where(b => !b.AutoManaged && b.Kind != "Sandbox").Select(b => new ProxyRuleItem("binding:" + b.TargetKey, b.Name, EmulatorCatalog.IsEmulator(b.Kind) ? "模擬器" : "一般程序", "指定代理", b.SharedProxy ? "共用 IP" : "專用 IP", "1 個窗口", b.Enabled ? "已啟用" : "已暫停", b.Path)));
         return rows.ToArray();
     }

@@ -5,8 +5,9 @@ public static class SandboxLauncherState
     public static bool IsStarted(SandboxInstanceStatus status, SandboxInstanceProfile profile,
         Func<int, string> imagePath, Func<int, ProcessIdentity?> identity)
     {
-        if (status.State != "代理執行中") return false;
+        if (status.State != (profile.UseLocalNetwork ? "本地網路執行中" : "代理執行中")) return false;
         if (status.LauncherStarted.HasValue) return status.LauncherStarted.Value;
+        if (profile.UseLocalNetwork) return false; // Old services cannot acknowledge explicit local mode.
         // Legacy service has no acknowledgement field. Its verified members plus
         // an actual launcher/game executable form the fallback, never UI prose.
         return status.Network is not null && status.Processes.Any(p => {

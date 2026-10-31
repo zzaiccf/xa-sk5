@@ -31,9 +31,10 @@ public static class WindowInventory
             }
             var sandbox = snapshot.SandboxInstances.FirstOrDefault(p => p.TargetKey == target.Key);
             var sandboxStatus = sandbox is null ? null : snapshot.SandboxStatuses.FirstOrDefault(s => s.Id == sandbox.Id);
-            result.Add(new(visible, sandbox?.ProxyId ?? binding?.ProxyId ?? Guid.Empty, false, sandbox is not null ? "沙盒固定線路" : binding is null ? "未設定個別規則" : binding.AutoManaged ? "自動代理" : "手動分配",
+            bool localSandbox = sandbox?.UseLocalNetwork == true;
+            result.Add(new(visible, sandbox?.ProxyId ?? binding?.ProxyId ?? Guid.Empty, localSandbox, sandbox is not null ? localSandbox ? "沙盒本地網路" : "沙盒固定線路" : binding is null ? "未設定個別規則" : binding.AutoManaged ? "自動代理" : "手動分配",
                 sandboxStatus?.State ?? status?.State ?? (target.Kind is "GameGroup" or "GameOrphan" ? "未分配 · 已封鎖" : snapshot.GlobalProxy.Enabled ? "依全局代理規則" : target.Running ? "執行中 · 未代理" : "未啟動"), sandboxStatus?.Detail ?? visible.Detail,
-                status?.ConnectedAt, status?.Sent, status?.Received, status?.TcpConnections, status?.UdpAssociations));
+                status?.ConnectedAt, localSandbox ? null : status?.Sent, localSandbox ? null : status?.Received, localSandbox ? null : status?.TcpConnections, localSandbox ? null : status?.UdpAssociations));
         }
         var observed = (discovered ?? []).GroupBy(v => v.Machine.Path, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
         var vmware = snapshot.Vmware;

@@ -192,6 +192,13 @@ internal static partial class Program
         public override Task<SandboxieSetupState> SandboxEnvironment(CancellationToken ct) => Task.FromResult(EnvironmentStatus);
         public override Task EnsureSandboxInstalled(IProgress<UpdateProgress>? progress, CancellationToken ct) { Installs++; EnvironmentStatus = new(true, false, "合成：安裝完成"); return Task.CompletedTask; }
         public override Task<SandboxInstanceProfile[]> ResumeSandboxPreparation(string source, Guid[] proxies, SandboxInstanceProfile[] existing, CancellationToken ct) => Task.FromResult(SandboxPreparation.Resume(source, proxies, existing, Path.Combine(Output, "drafts")));
+        public override Task<SandboxInstanceProfile[]> ResumeSandboxNetworkPreparation(string source, SandboxNetworkChoice[] choices, SandboxInstanceProfile[] existing, CancellationToken ct) => Task.FromResult(SandboxPreparation.ResumeNetwork(source, choices, existing, Path.Combine(Output, "drafts")));
+        public SandboxInstanceProfile[]? SavedNetworks;
+        public override Task SaveSandboxNetworks(SandboxInstanceProfile[] profiles, IProgress<string>? progress, CancellationToken ct) {
+            SandboxPreparation.ValidateBatch(profiles); SavedNetworks = profiles;
+            fixture.State = fixture.State with { SandboxInstances = fixture.State.SandboxInstances.Select(p => profiles.FirstOrDefault(n => n.Id == p.Id) ?? p).ToArray() };
+            return Task.CompletedTask;
+        }
         public override Task<bool> SandboxInstalled(CancellationToken ct) => Task.FromResult(true);
         public override Task<bool> DetectYongOrigin(string path, CancellationToken ct) => Task.FromResult(path.Contains("SyntheticGame"));
         public override Task<SandboxStartResult> StartSandbox(Guid id, CancellationToken ct = default) { SandboxStarts.Enqueue(id); return Task.FromResult(SandboxAlreadyRunning.Contains(id) ? SandboxStartResult.AlreadyRunning : SandboxStartResult.Started); }

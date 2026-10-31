@@ -22,7 +22,7 @@ internal static partial class Program
         var a = SandboxInstances.Create("遊戲 A", @"C:\SyntheticGame\Launcher.exe", nodes[0].Id) with { SimulateAdmin = true };
         var b = SandboxInstances.Create("遊戲 B", a.SourceLauncherPath, nodes[1].Id);
         var c = SandboxInstances.Create("遊戲 C", a.SourceLauncherPath, nodes[2].Id);
-        fixture.State = fixture.State with { SupportsSandboxInstances = true, SupportsSandboxExperience = true, SupportsSandboxSafety = true, Proxies = nodes, SandboxInstances = [c, b, a],
+        fixture.State = fixture.State with { SupportsSandboxInstances = true, SupportsSandboxExperience = true, SupportsSandboxSafety = true, SupportsSandboxLocalNetwork = true, Proxies = nodes, SandboxInstances = [c, b, a],
             SandboxStatuses = [new(a.Id, "未啟動", "", []), new(b.Id, "啟動失敗 · 已封鎖", "合成錯誤", [])] };
         var backend = new FakeBackend(fixture);
         var watch = Stopwatch.StartNew();
@@ -34,6 +34,13 @@ internal static partial class Program
             var rows = (ItemsControl)window.FindName("LineAssignments");
             SandboxWindow.LineAssignment[] Choices() => rows.Items.Cast<SandboxWindow.LineAssignment>().ToArray();
             Check(Choices().Select(r => r.ProxyId).SequenceEqual(new[] { a.ProxyId, b.ProxyId, c.ProxyId }), "Reverse profile order changed fixed lines.");
+            Check(Choices().All(r => !r.UseLocalNetwork), "Existing proxied instances silently became local.");
+            Choices()[0].UseLocalNetwork = true;
+            fixture.State = fixture.State with { Proxies = nodes.Select(p => p with { Name = p.Name + " updated" }).ToArray() };
+            await (Task)typeof(SandboxWindow).GetMethod("RefreshState", Private)!.Invoke(window, [])!;
+            Check(Choices()[0].UseLocalNetwork && !Choices()[0].CanSelectProxy && Choices()[0].Choice.ProxyId == Guid.Empty && Choices()[0].InstanceId == a.Id, "Refresh lost explicit local choice or instance identity.");
+            Choices()[0].UseLocalNetwork = false;
+            Check(Choices()[0].CanSelectProxy && Choices()[0].ProxyId == a.ProxyId, "Switching back to proxy did not restore the draft line.");
             Check(((CheckBox)window.FindName("SimulateAdmin")).IsChecked == true, "Compatibility setting was not restored.");
             Check(((DataGrid)window.FindName("Instances")).Items.Count == 3, "Instances missing from sandbox list.");
             Check(!((Button)window.FindName("RemoveDraftButton")).IsEnabled, "Saved instances could be silently removed.");
@@ -113,6 +120,14 @@ internal static partial class Program
             await Until(() => backend.PreparedProfiles is { Length: 3 } && ((Button)window.FindName("PrepareButton")).IsEnabled);
             Check(backend.Installs == 2 && backend.PreparedProfiles!.Select(p => p.ProxyId).SequenceEqual(requestedLines), "Prepare did not automatically install and retain every selected line.");
             Check(((DataGrid)window.FindName("Instances")).Items.Count == 3, "Prepared third instance did not appear in the launch list.");
+            Guid savedA = Choices()[0].InstanceId!.Value;
+            Choices()[0].UseLocalNetwork = true;
+            ((Button)window.FindName("SaveNetworkButton")).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            await Until(() => backend.SavedNetworks is { Length: 1 } && ((Button)window.FindName("SaveNetworkButton")).IsEnabled);
+            Check(backend.SavedNetworks![0].Id == savedA && backend.SavedNetworks[0].UseLocalNetwork && backend.SavedNetworks[0].ProxyId == Guid.Empty, "Network-only save did not target just changed A.");
+            var localRow = ((DataGrid)window.FindName("Instances")).Items.Cast<SandboxWindow.InstanceRow>().Single(r => r.Profile.Id == savedA);
+            Check(localRow.Line.Contains("本地網路") && localRow.Line.Contains("略過全局代理"), "Sandbox list does not distinguish local mode.");
+            SaveImage(window, "sandbox-local-network.png");
             Console.WriteLine($"Sandbox UI checks passed; open {watch.ElapsedMilliseconds} ms; dispatcher {response.ElapsedMilliseconds} ms.");
         } finally { window.Close(); }
         fixture.State = fixture.State with { SupportsSandboxInstances = true };
