@@ -56,4 +56,28 @@
 
 ## 本機交付
 
-測試包與來源 commit／SHA-256 待建置後填入。本輪不修改或覆蓋 0.1.32、0.1.33、0.1.34、0.1.35 交付；對照基準保存在 `prior-deliveries.json`。
+產物來源 commit：`b58af693650c9176fecd456a94c16540d7da7fa6`。本機分支 `codex/sandbox-local-network-0.1.36`。交付位於主要專案目錄的 `artifacts/release/0.1.36/`；建置 payload 為本工作樹 `artifacts/local-network-0.1.36/payload/`，沒有安裝或啟動正式介面。
+
+執行 `pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Build-Package.ps1 -Version 0.1.36 -PayloadDirectory artifacts/local-network-0.1.36/payload -OutputDirectory <主要專案>/artifacts/release/0.1.36`，使用全新目錄。建置流程再次執行完整測試 **520/520 PASS**（`artifacts/test-results/core-tests.trx`）。
+
+| 核對 | 結果與證據 |
+| --- | --- |
+| 本機提交 | PASS：26 個白名單檔案；禁止路徑 0、私密資料命中 0、`git diff --cached --check` 通過。固定合成測試盒識別另人工核對，不含真實盒名。`commit-whitelist.txt`、`staging-check.json`。 |
+| 來源一致 | PASS：建置前來源乾淨；6 個主要 DLL 的 ProductVersion 都為 `0.1.36+b58af693650c9176fecd456a94c16540d7da7fa6`。`source-provenance.json`、`component-provenance.json`。 |
+| 建置 payload | PASS：354 個清單檔及元件版本相符。`package.log`。 |
+| Setup | PASS：Package.ps1 的 `--verify-payload` 退出碼 0；只有暫存解壓驗證，沒有執行安裝。`build-result.json`、`package.log`。 |
+| 實際 ZIP | PASS：解壓至全新 `zip-verify/`，執行其中 Tools 的 `verify-release <zip-verify> 0.1.36`，354 檔通過；manifest 與 payload 相同。`verify-release.txt`、`verification-result.json`。 |
+| Setup 輸入 | PASS：內嵌來源 `artifacts/package.zip` SHA-256 等於交付 ZIP。`verification-result.json`。 |
+| SHA256SUMS | PASS：3 筆均符合實際檔案；sums 自身雜湊另記錄。`delivery-files.json`。 |
+| 既有交付 | PASS：0.1.32–0.1.35 共 18 檔的大小與 SHA-256 前後一致，未覆蓋。`prior-deliveries.json`、`prior-deliveries-after.json`。 |
+
+`Verify-Delivery.ps1` 與 `verification.log` 保存此次解壓／元件來源／舊包核對命令及結果，僅位於本機證據目錄，沒有提交。
+
+| 檔名 | 位元組 | SHA-256 |
+| --- | ---: | --- |
+| xa-sk5-Setup-0.1.36.exe | 123463680 | `1EEB42812F668C8B1FE922C0DDA6A445CB4046F2F052951B9E36985C85B52834` |
+| xa-sk5-0.1.36-win-x64.zip | 73189794 | `F348E5E568F3BB9061ADF4E7CE2BE3DBA3C4298961A6184F039C0ABC1E7C640C` |
+| SHA256SUMS.txt | 263 | `06F9638A66464ADF6156C04D5504483EC5BA6E5F5586F6BB3F5CADA08EE99180` |
+| latest.json（本機離線更新資訊） | 1306 | `06C40A2707B38CC673053657E75BE3329DE5A1E3AC3C28C1C73F26A37AC11AB1` |
+
+完成本機測試交付後停止。本次沒有發布、push、tag、草稿或實機操作；上述 NOT RUN 項目仍待另行核准。
