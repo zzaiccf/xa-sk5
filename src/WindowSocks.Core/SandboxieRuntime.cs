@@ -134,8 +134,8 @@ public sealed class SandboxieRuntime : IDisposable
         Func<string> resolve, Func<string, IEnumerable<string>, CancellationToken, Task<string>> command)
     {
         SandboxInstances.Validate(profile);
+        string path = SandboxConfiguration.ResolvePath(resolve); // A missing helper is not a missing ini.
         async Task<string[]> Read(CancellationToken token) => await SandboxConfiguration.Retry(async () => {
-            string path = resolve(); // A missing helper is not a missing ini.
             try { return await SandboxIniFile.ReadAsync(path, token); }
             catch (FileNotFoundException) { return []; } // Not permission or missing parent directory.
         }, token);

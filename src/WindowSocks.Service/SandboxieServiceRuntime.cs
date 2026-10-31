@@ -30,7 +30,8 @@ internal sealed class SandboxieServiceRuntime : ISandboxRuntime
             string line;
             if(exchange is not null)line=exchange(request);
             else{
-            if (broker is null || broker.HasExited) {
+            bool coldStart = broker is null || broker.HasExited;
+            if (coldStart) {
                 broker?.Dispose();
                 var start = new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "WindowSocks.Tools.exe")) {
                     UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true
@@ -42,8 +43,8 @@ internal sealed class SandboxieServiceRuntime : ISandboxRuntime
                 broker.OutputDataReceived += (_, e) => { if (e.Data is not null) queue.Add(e.Data); };
                 broker.BeginOutputReadLine();
             }
-            broker.StandardInput.WriteLine(JsonSerializer.Serialize(request, Json.Options)); broker.StandardInput.Flush();
-            if (!responses!.TryTake(out line!, TimeSpan.FromSeconds(request.Action=="terminate"?65:5))) throw new IOException($"沙盒 {request.Action} 逾時（request {request.RequestId}），維持封鎖。");
+            broker!.StandardInput.WriteLine(JsonSerializer.Serialize(request, Json.Options)); broker.StandardInput.Flush();
+            if (!responses!.TryTake(out line!, ResponseTimeout(request.Action, coldStart))) throw new IOException($"沙盒 {request.Action} 逾時（request {request.RequestId}），維持封鎖。");
             }
             if (line.Length > PipeTransport.Limit) throw new IOException("沙盒身分回覆過大。");
             var envelope = JsonSerializer.Deserialize<SandboxBrokerReply>(line, Json.Options) ?? throw new IOException("沙盒身分回覆無效。");
@@ -58,7 +59,12 @@ internal sealed class SandboxieServiceRuntime : ISandboxRuntime
     public SandboxProcess[] Processes(string box) => Call<SandboxProcess[]>(new("list", box));
     public SandboxProcess? Query(int pid) => Call<SandboxProcess?>(new("query", Pid: pid));
     public void TerminateOwned(SandboxInstanceProfile profile, string ownerSid) => Call<bool>(new("terminate", Profile: profile, OwnerSid: ownerSid));
-    public void ValidateSettings(SandboxInstanceProfile profile) => SandboxieRuntime.ValidatePersistedSettings(profile);
+    internal static TimeSpan ResponseTimeout(string action, bool coldStart) => TimeSpan.FromSeconds(
+        action == "terminate" ? 65 : coldStart ? 20 : action == "validate" ? 10 : 5);
+    public void ValidateSettings(SandboxInstanceProfile profile)
+    {
+        if (!Call<bool>(new("validate", Profile: profile))) throw new IOException("沙盒設定未通過核驗，維持封鎖。");
+    }
     public void VerifyCompatibility()
     {
         if (!NativeEngine.Present) throw new IOException("缺少沙盒身分核心。");

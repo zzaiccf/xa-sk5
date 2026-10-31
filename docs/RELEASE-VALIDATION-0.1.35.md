@@ -72,3 +72,49 @@ git diff --check
 **NOT RUN**：可還原 VMware 快照上的乾淨機安裝→準備→啟動；真實遊戲多開；0.1.33 移除實機；0.1.31 C1／C2／C4／C6；C5 外側 FIN／RST 擷取。SBIE1402 的實際持有者、另一台 A 首次 InvalidOperationException 觸發原因及雙窗卡頓改善，均尚未由實機證明。收到該機日誌後再分析，必要追加修正在 C 前處理。
 
 請帶回：錯誤後的匯出診斷、service-session.log（及 previous）、該盒 sandbox-bootstrap-error.txt／sandbox-monitor-error.txt、準備 commands-*.jsonl、安裝 setup.log 及錯誤時間。實際完整路徑查詢與去識別化方式見 [A 文件](SANDBOX-FIXES-0.1.35-A.md)；未知遠端使用者目錄／實例 ID 時不虛構完整路徑，也不索取帳密。
+
+## C 段：打包前修正與測試交付
+
+本節接續已接受的 B 段；上方「C 未執行」及「不建置」是 B 結束時的歷史狀態。本次授權只到本機測試打包，不發布、不 push、不 tag、不建草稿，不操作已安裝服務、Sandboxie、遊戲、線路或防火牆。
+
+### C0 根因、修正與紅 → 綠
+
+| 項目 | 根因及最終行為 | 失敗重現與綠燈證據 |
+|---|---|---|
+| C0-1 arm | ServiceRuntime 曾直接呼叫靜態 ValidatePersistedSettings，繞過常駐 broker，啟動路徑 helper；Controller 外層只有 1 秒。現改傳 broker `validate`，由已載入 SbieDll 的 broker 解析路徑／讀設定。第一個 broker 回覆預算 20 秒、後續 validate 10 秒，arm 外層 30 秒；仍在 Gate 外等待，失敗不發 ticket。其他請求正常 5 秒，terminate 保留 65 秒。 | `c0-red.trx` 的 C01_Arm…：假核驗延遲 1.3 秒，舊程式 Timeout，未到後續身分檢查。`c0-final-green.trx` 通過並確認後續身分拒絕仍封鎖、沒有 ticket。另有 broker 假回覆 1.3 秒、重複 validate 不關閉 broker、明確拒絕／false 不放行。未啟動實際 broker 或讀本機 Sandboxie。 |
+| C0-2 安裝就緒 | 退出碼 0 後立即 Inspect，誤把 START_PENDING 當失敗。現每秒重新檢查，最多 30 秒，檢查本身也受剩餘預算約束；需要 SbieSvc 執行且 IniLocation 可查。設定待初始化仍 CanPrepare。3010 重開機、非零退出碼及使用者取消維持原行為。 | `c0-red.trx` 的 C02 theory 兩例失敗：pending→ready 原本立即拋錯；持續 pending 原本未等待。假單調時鐘綠燈：3 秒／4 次檢查後成功（含缺 ini 可準備）；30 秒／30 次未就緒才逾時。紅版測試原預期邊界第 31 次，實作改為到 30 秒即停止，不再發新檢查，綠版斷言為 30 次。 |
+| C0-3 helper 上限 | 啟動成功後每秒重試沒有退出條件。現連續錯誤五分鐘安靜返回；成功監看會重設預算，取消延遲也安靜返回。正在等待的重試受剩餘預算約束，不能把期限往後拖；不發 Started=false，不 pause，服務的出口／身分／線路判斷未放寬。 | `c0-red.trx` 三例：舊迴圈跑到假測試防掛的第 601／901 次，及取消延遲向外拋錯。綠燈在五分鐘邊界退出、成功回覆後重新計時、failure 回呼 0 次。`monitor-deadline-red.trx` 另重現未完成請求拖過期限，修正後同在 `c0-final-green.trx` 通過。 |
+| C0-4 每次操作一次路徑解析 | 多次磁碟讀回都啟動 path helper。現串行設定 operation 保存一次有效路徑，準備及巢狀 Disable／Remove／環境檢查共用；操作結束即丟棄，下一次重新查。只快取路徑，不快取檔案內容；每次讀仍用共享 reader 及穩定性／resident 核對。 | `c0-red.trx`：準備 34 次解析（期望 1），合成巢狀移除 7 次（期望 1）。綠燈均為 1，另驗下一個 operation 重新解析。B 的「途中改回報另一 ini 路徑」替身依本次使用者指定改為固定有效位置，缺檔仍由官方命令邊界建立並核對，未自行手寫真實 ini。 |
+
+紅燈前只加入未使用的 TimeProvider／delay 接縫，以及不快取的 resolver overload，原行為未修；證據 `artifacts/c-stage-0.1.35/red-tracked.patch`、`red-SandboxCloseoutTests.cs`。第一輪 **8 FAIL／0 PASS**，監看未完成請求另 **1 FAIL**；針對性相鄰回歸 **61／61**，最終 C0 **12／12**。其中 broker 保護三例是額外回歸，不宣稱舊版紅燈。
+
+假命令量測同一個缺設定單實例：解析成本固定 200 ms、每個命令 10 ms；改前 **34 次解析＋31 命令＝7,110 ms**，改後 **1 次解析＋31 命令＝510 ms**，節省 6,600 ms（92.8%）。命令數未減少、核對未省略；不計檔案穩定等待、複製及實際載入，**不是實機準備耗時**。數值在紅／綠 TRX StdOut。
+
+修改產品檔：Core `SandboxBootstrapSession.cs`、`SandboxConfiguration.cs`、`SandboxieInstaller.cs`、`SandboxieRuntime.cs`；Service `SandboxController.cs`、`SandboxieServiceRuntime.cs`。修改／新增測試：`SandboxCloseoutTests.cs`、`SandboxConfigurationFixTests.cs`、`SandboxieInstallerTests.cs`、`SecondReviewSandboxTests.cs`、`P0SandboxBrokerTests.cs`。文件為本節、操作說明、測試清單及 release notes；原生與 TCP 產品來源未修改。
+
+### C 完整驗證與產物
+
+實際命令輸出集中在 `artifacts/c-stage-0.1.35/`；套件雜湊於建置後補記。
+
+| 驗證 | 結果 | 證據（相對本工作樹） |
+|---|---|---|
+| 完整 dotnet test | PASS，511／511、0 fail、0 skip，3 分 40 秒 | `artifacts/c-stage-0.1.35/core-complete.trx`、`core-complete.log` |
+| PacketPathChecks | PASS，157,646 assertions，沒有開 capture handle | `artifacts/c-stage-0.1.35/packet-path/result.txt`、`native.log` |
+| --sandbox-ui | PASS，59 checks，exit 0 | `artifacts/c-stage-0.1.35/sandbox-ui/checks.json`、`ui.log` |
+| --sandbox-storage | PASS，15 checks，exit 0 | `artifacts/c-stage-0.1.35/sandbox-storage/checks.json`、`storage.log` |
+| 既有交付基準 | PASS，0.1.32／0.1.33／0.1.34 的 9 個交付檔符合既有 SHA256SUMS，另保存 3 份 SHA256SUMS 自身雜湊 | `artifacts/c-stage-0.1.35/preserved-before.json` |
+
+本次完整測試比 B 增加 11 例（500 → 511）；另修改缺設定準備的既有測試，驗證一次解析。白名單 15 檔，禁止路徑 0、已知私人資料樣式 0，`git diff --check` 通過；原生／第三方產品來源差異 0。證據 `commit-whitelist.txt`、`precommit-scope.json`。
+
+```powershell
+dotnet test tests/WindowSocks.Tests -c Release --logger 'trx;LogFileName=core-complete.trx' --results-directory artifacts/c-stage-0.1.35
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-PacketPathPerformance.ps1 -OutputDirectory artifacts/c-stage-0.1.35/packet-path
+$env:XA_TEST_OUTPUT = Join-Path (Get-Location) 'artifacts/c-stage-0.1.35/sandbox-ui'
+dotnet run --project tests/WindowSocks.Desktop.PerformanceChecks -c Release -- --sandbox-ui
+$env:XA_TEST_OUTPUT = Join-Path (Get-Location) 'artifacts/c-stage-0.1.35/sandbox-storage'
+dotnet run --project tests/WindowSocks.Desktop.PerformanceChecks -c Release --no-build -- --sandbox-storage
+```
+
+另一台電腦可直接使用 [繁中白話測試清單](TEST-CHECKLIST-0.1.35.md)：0.1.32 升級、單／多／混選選單、先 A 後 A+B 的略過及啟動、SBIE1402 時間與 commands-*.jsonl，任何失敗先匯出診斷。
+
+**NOT RUN 維持**：未裝過 Sandboxie 的乾淨電腦／VMware 快照全流程；真實遊戲多開；0.1.33 移除實機；0.1.31 C1／C2／C4／C6；C5 外側 FIN／RST。另一台的實際 A 失敗觸發原因及 SBIE1402 持有者仍待日誌，不用替身測試推稱實機已解決。

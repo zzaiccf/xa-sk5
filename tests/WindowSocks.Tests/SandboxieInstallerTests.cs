@@ -53,7 +53,8 @@ public sealed class SandboxieInstallerTests : IDisposable
     public async Task RebootCancellationFailureOrMissingPostInstallFilesCannotReportReady(int code)
     {
         using var handler = Download();
-        var setup = new SandboxieInstaller(() => new(false, true, "missing"), _ => code == 1223 ? throw new Win32Exception(1223) : Task.FromResult(code), _ => { }, FixturePackage, handler);
+        var clock = new SandboxTestClock();
+        var setup = new SandboxieInstaller(() => new(false, true, "missing"), _ => code == 1223 ? throw new Win32Exception(1223) : Task.FromResult(code), _ => { }, FixturePackage, handler, clock, clock.Delay);
         var error = await Assert.ThrowsAsync<IOException>(() => setup.EnsureInstalled(root, null, default));
         Assert.Contains(code switch { 3010 => "重新啟動", 1223 => "取消管理員", 0 => "尚未通過", _ => "退出碼 1" }, error.Message);
     }
@@ -91,6 +92,26 @@ public sealed class SandboxieInstallerTests : IDisposable
         Assert.Contains("/PORTABLE=0", start.ArgumentList); Assert.Contains("/TASKS=", start.ArgumentList);
         Assert.Contains("/DIR=" + SandboxieRuntime.InstallDirectory, start.ArgumentList);
         Assert.DoesNotContain("/SUPPRESSMSGBOXES", start.ArgumentList);
+    }
+    [Theory] [InlineData(true)] [InlineData(false)]
+    public async Task C02_InstallerWaitsForServiceAndDriverOrReportsBoundedTimeout(bool becomesReady)
+    {
+        using var handler = Download(); var clock = new SandboxTestClock(); bool exited = false; int checks = 0;
+        var setup = new SandboxieInstaller(() => {
+            if (!exited) return new(false, true, "missing");
+            checks++;
+            // Service becomes RUNNING first; driver IniLocation is available later.
+            if (becomesReady && clock.GetTimestamp() >= 3000) return new(false, false, "pending initialization") { NeedsInitialization = true };
+            return new(false, false, clock.GetTimestamp() < 2000 ? "SbieSvc START_PENDING" : "driver IniLocation unavailable");
+        }, _ => { exited = true; return Task.FromResult(0); }, _ => { }, FixturePackage, handler, clock, clock.Delay);
+        if (becomesReady) {
+            await setup.EnsureInstalled(root, null, default);
+            Assert.Equal(3000, clock.GetTimestamp()); Assert.Equal(4, checks);
+        } else {
+            var error = await Assert.ThrowsAsync<IOException>(() => setup.EnsureInstalled(root, null, default));
+            Assert.Contains("尚未通過環境檢查", error.Message); Assert.Contains("IniLocation", error.Message);
+            Assert.Equal(30000, clock.GetTimestamp()); Assert.Equal(30, checks);
+        }
     }
     public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }
 }

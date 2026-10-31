@@ -151,11 +151,23 @@ public sealed class SecondReviewSandboxTests : IDisposable
         Assert.NotNull(diagnostic.RelayPerformance); // Keep the 0.1.34 diagnostic extension.
         runtime.Members = [];
     }
+    [Fact] public async Task C01_ArmWaitsForSlowValidationWithoutHoldingGateAndKeepsIdentityFailureClosed()
+    {
+        Setup(); await WaitInitialization(); runtime.CheckResult = false;
+        runtime.OnValidate = () => {
+            bool acquired = controller.Gate.Wait(0); if (acquired) controller.Gate.Release();
+            Assert.True(acquired); Thread.Sleep(1300);
+        };
+        var reply = await controller.Dispatch(Command.Create("armSandbox", new SandboxRequest(b.Id)), default);
+        Assert.False(reply.Ok); Assert.Contains("driver temporarily unavailable", reply.Error);
+        Assert.False(new ConfigStore(root).Load().SandboxInstances.Single(p => p.Id == b.Id).Enabled);
+        Assert.Empty((System.Collections.IDictionary)typeof(Controller).GetField("sandboxTickets", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(controller)!);
+    }
     public void Dispose(){scanning=null;controller?.Dispose();if(Directory.Exists(root))Directory.Delete(root,true);}
     private sealed class Runtime:ISandboxRuntime{
-        public bool Available=true;public bool? CheckResult;public int Checks;public SandboxProcess[] Members=[];public Action? OnList;
+        public bool Available=true;public bool? CheckResult;public int Checks;public SandboxProcess[] Members=[];public Action? OnList;public Action? OnValidate;
         public bool IdentityAvailable=>Available;public void VerifyCompatibility(){Checks++;if(CheckResult==false)throw new IOException("driver temporarily unavailable");if(CheckResult==true)Available=true;}
-        public SandboxProcess[] Processes(string box){OnList?.Invoke();return Members.Where(m=>m.BoxName==box).ToArray();}public SandboxProcess? Query(int pid)=>Members.FirstOrDefault(m=>m.Identity.Pid==pid);public void ValidateSettings(SandboxInstanceProfile profile){}public void TerminateOwned(SandboxInstanceProfile profile,string sid){}public void Dispose(){}
+        public SandboxProcess[] Processes(string box){OnList?.Invoke();return Members.Where(m=>m.BoxName==box).ToArray();}public SandboxProcess? Query(int pid)=>Members.FirstOrDefault(m=>m.Identity.Pid==pid);public void ValidateSettings(SandboxInstanceProfile profile)=>OnValidate?.Invoke();public void TerminateOwned(SandboxInstanceProfile profile,string sid){}public void Dispose(){}
     }
     private sealed class Engine:IEngineLifecycle{
         public bool Present=>true;public bool DriverPresent=>false;public bool Compatible=>true;public bool Healthy=>true;public uint Error=>0;public bool Start(string path)=>true;public bool ReplaceCapture(string path)=>true;public void Stop(){}

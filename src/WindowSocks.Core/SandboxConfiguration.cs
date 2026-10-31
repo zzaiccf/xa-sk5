@@ -8,13 +8,14 @@ namespace WindowSocks.Core;
 public static class SandboxConfiguration
 {
     private static readonly SemaphoreSlim gate = new(1, 1);
-    private static readonly AsyncLocal<bool> owner = new();
+    private sealed class Operation { internal string? Path; }
+    private static readonly AsyncLocal<Operation?> owner = new();
     public static async Task Run(Func<Task> action, CancellationToken ct)
     {
-        if (owner.Value) { await action().ConfigureAwait(false); return; }
+        if (owner.Value is not null) { await action().ConfigureAwait(false); return; }
         await gate.WaitAsync(ct).ConfigureAwait(false);
-        try { owner.Value = true; await action().ConfigureAwait(false); }
-        finally { owner.Value = false; gate.Release(); }
+        try { owner.Value = new Operation(); await action().ConfigureAwait(false); }
+        finally { owner.Value = null; gate.Release(); }
     }
     public static async Task<T> Run<T>(Func<Task<T>> action, CancellationToken ct)
     {
@@ -45,6 +46,16 @@ public static class SandboxConfiguration
     // and fallback. Query in the existing isolated helper, never load SbieDll in
     // the routing service. No configuration or service changes are performed.
     public static string ResolvePath()
+        => ResolvePath(QueryPath);
+    internal static string ResolvePath(Func<string> query)
+    {
+        // Cache only the effective path within this serialized prepare/removal.
+        // Never cache ini contents or reuse a path across independent operations.
+        var operation = owner.Value;
+        if (operation is null) return query();
+        lock (operation) return operation.Path ??= query();
+    }
+    private static string QueryPath()
     {
         var start = new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "WindowSocks.Tools.exe")) {
             UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true

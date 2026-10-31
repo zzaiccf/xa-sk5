@@ -3,7 +3,7 @@ using Xunit;
 
 namespace WindowSocks.Tests;
 
-public sealed class SandboxConfigurationFixTests : IDisposable
+public sealed class SandboxConfigurationFixTests(Xunit.Abstractions.ITestOutputHelper output) : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), "WindowSocksTests", Guid.NewGuid().ToString("N"));
     private SandboxInstanceProfile Profile()
@@ -14,10 +14,11 @@ public sealed class SandboxConfigurationFixTests : IDisposable
     }
     [Fact] public async Task MissingIniIsCreatedByOfficialCommandBoundaryAndVerified()
     {
-        var p = Profile(); string ini = Path.Combine(root, "custom.ini"), initial = Path.Combine(root, "missing-initial.ini"); int writes = 0, resolutions = 0;
+        var p = Profile(); string ini = Path.Combine(root, "custom.ini"); int writes = 0, resolutions = 0, commands = 0;
         var values = new Dictionary<string, string[]>();
         Task<string> Command(string exe, IEnumerable<string> input, CancellationToken ct) {
             string[] args = input.ToArray();
+            commands++;
             if (exe == "Start.exe") return Task.FromResult("");
             string key = args[2];
             if (args[0] == "query") return Task.FromResult(string.Join("\n", values.GetValueOrDefault(key, [])));
@@ -25,8 +26,11 @@ public sealed class SandboxConfigurationFixTests : IDisposable
             File.WriteAllLines(ini, new[] { "[" + p.BoxName + "]" }.Concat(values.SelectMany(k => k.Value.Select(v => k.Key + "=" + v))));
             return Task.FromResult("");
         }
-        await SandboxieRuntime.Configure(p, default, null, () => { resolutions++; return writes == 0 ? initial : ini; }, Command);
-        Assert.True(resolutions > 1); Assert.False(File.Exists(initial));
+        await SandboxieRuntime.Configure(p, default, null, () => { resolutions++; return ini; }, Command);
+        // Deterministic cost model: path helper 200 ms, each official command 10 ms.
+        // Excludes filesystem/read-stability waits; not a real-PC timing claim.
+        output.WriteLine($"Preparation synthetic cost: resolutions={resolutions}; commands={commands}; milliseconds={resolutions * 200 + commands * 10}");
+        Assert.Equal(1, resolutions);
         Assert.True(writes > 0); SandboxieRuntime.ValidatePersistedSettings(p, ini);
         Assert.Contains("無既有設定可備份", string.Join("\n", Directory.GetFiles(Path.Combine(Path.GetDirectoryName(p.WorkingDirectory)!, "ConfigBackups")).Select(File.ReadAllText)));
         int before = writes; await SandboxieRuntime.Configure(p, default, null, () => ini, Command); Assert.Equal(before, writes);

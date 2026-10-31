@@ -25,10 +25,13 @@ public sealed class SandboxieInstaller
     private readonly Action<string> verifySignature;
     private readonly HttpMessageHandler? testHandler;
     private readonly ReleaseAsset package;
+    private readonly TimeProvider clock;
+    private readonly Func<TimeSpan, CancellationToken, Task> delay;
     public SandboxieInstaller() : this(Inspect, Execute, DriverTrust.VerifySignature, Package, null) { }
     internal SandboxieInstaller(Func<SandboxieSetupState> inspect, Func<string, Task<int>> execute, Action<string> verifySignature,
-        ReleaseAsset package, HttpMessageHandler? handler)
-    { this.inspect = inspect; this.execute = execute; this.verifySignature = verifySignature; this.package = package; testHandler = handler; }
+        ReleaseAsset package, HttpMessageHandler? handler, TimeProvider? clock = null, Func<TimeSpan, CancellationToken, Task>? delay = null)
+    { this.inspect = inspect; this.execute = execute; this.verifySignature = verifySignature; this.package = package; testHandler = handler;
+        this.clock = clock ?? TimeProvider.System; this.delay = delay ?? ((time, ct) => Task.Delay(time, ct)); }
 
     public static SandboxieSetupState Inspect()
     {
@@ -86,11 +89,34 @@ public sealed class SandboxieInstaller
             catch (Win32Exception ex) when (ex.NativeErrorCode == 1223) { throw new IOException("你已取消管理員授權，尚未安裝 Sandboxie；可再按一鍵安裝。", ex); }
             if (code == 3010) throw new IOException("Sandboxie 已安裝但需要重新啟動 Windows；請自行重開後再按重新檢查，尚未準備或啟動遊戲。");
             if (code != 0) throw new IOException($"Sandboxie 安裝未完成（退出碼 {code}）。請查看 {directory}\\setup.log，處理後重新檢查。");
-            var result = inspect();
-            if (!result.CanPrepare) throw new IOException("安裝程式已結束，但尚未通過環境檢查。" + result.Detail);
+            progress?.Report(new("安裝程式已結束，正在等待 Sandboxie 服務與設定位置就緒（最多 30 秒）…") { CanCancel = true });
+            await WaitUntilReady(ct).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested(); // Closing the window never kills an in-progress driver installer.
             progress?.Report(new("Sandboxie 安裝完成並已重新檢查，可繼續準備遊戲。") { CanCancel = true });
         } finally { installGate.Release(); }
+    }
+    private async Task WaitUntilReady(CancellationToken ct)
+    {
+        long started = clock.GetTimestamp();
+        var budget = TimeSpan.FromSeconds(30);
+        string detail = "Sandboxie 服務或設定位置尚未就緒。";
+        while (true) {
+            ct.ThrowIfCancellationRequested();
+            TimeSpan remaining = budget - clock.GetElapsedTime(started);
+            if (remaining <= TimeSpan.Zero) break;
+            SandboxieSetupState result;
+            try {
+                // Bound the inspection too: loading the path helper may itself be slow.
+                // A late read-only inspection cannot start preparation or change state.
+                result = await Task.Run(inspect, ct).WaitAsync(remaining, ct).ConfigureAwait(false);
+            } catch (TimeoutException) { break; }
+            if (result.CanPrepare) return;
+            detail = result.Detail;
+            remaining = budget - clock.GetElapsedTime(started);
+            if (remaining <= TimeSpan.Zero) break;
+            await delay(remaining < TimeSpan.FromSeconds(1) ? remaining : TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+        }
+        throw new IOException("安裝程式已結束，但尚未通過環境檢查（等待 30 秒逾時）。" + detail);
     }
     private async Task Download(string file, IProgress<UpdateProgress>? progress, CancellationToken ct)
     {

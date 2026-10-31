@@ -133,7 +133,9 @@ public sealed partial class Controller
         await Gate.WaitAsync(ct);
         try { if(stopping||sandboxStopping)throw new InvalidOperationException("服務正在停止沙盒。");profile=SandboxProfile(id);if(profile.RemovalPending)throw new InvalidOperationException("此實例正在清理，請先完成移除。");if(!sandboxFirewallReady)throw new InvalidOperationException("正在背景建立 WFP 防護，完成後即可啟動。");profiles=config.SandboxInstances.ToArray();revision=sandboxMembershipRevision; }
         finally { Gate.Release(); }
-        await Task.Run(()=>SandboxRuntime.ValidateSettings(profile),ct).WaitAsync(TimeSpan.FromSeconds(1),ct);
+        // Validation uses the resident broker. Allow its first cold start and
+        // configuration read, without holding Gate or issuing a launch ticket early.
+        await Task.Run(()=>SandboxRuntime.ValidateSettings(profile),ct).WaitAsync(TimeSpan.FromSeconds(30),ct);
         await Task.Run(()=>SandboxRuntime.VerifyCompatibility(),ct).WaitAsync(TimeSpan.FromSeconds(1),ct);
         bool running=await Task.Run(()=>SandboxRuntime.Processes(profile.BoxName).Length>0,ct);
         var images=sandboxFirewall is null?[]:await Task.Run(()=>discoverSandboxImages(profiles),ct);
