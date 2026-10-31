@@ -94,7 +94,7 @@ git diff --check
 
 ### C 完整驗證與產物
 
-實際命令輸出集中在 `artifacts/c-stage-0.1.35/`；套件雜湊於建置後補記。
+實際命令輸出集中在 `artifacts/c-stage-0.1.35/`；C 段已完成，安裝／實機驗收仍未執行。
 
 | 驗證 | 結果 | 證據（相對本工作樹） |
 |---|---|---|
@@ -118,3 +118,48 @@ dotnet run --project tests/WindowSocks.Desktop.PerformanceChecks -c Release --no
 另一台電腦可直接使用 [繁中白話測試清單](TEST-CHECKLIST-0.1.35.md)：0.1.32 升級、單／多／混選選單、先 A 後 A+B 的略過及啟動、SBIE1402 時間與 commands-*.jsonl，任何失敗先匯出診斷。
 
 **NOT RUN 維持**：未裝過 Sandboxie 的乾淨電腦／VMware 快照全流程；真實遊戲多開；0.1.33 移除實機；0.1.31 C1／C2／C4／C6；C5 外側 FIN／RST。另一台的實際 A 失敗觸發原因及 SBIE1402 持有者仍待日誌，不用替身測試推稱實機已解決。
+
+### C 打包結果與對應 commit
+
+分支 `codex/sandbox-fixes-0.1.35`。**產物來源 commit：`6541b0de267fd78d8a2802388aec52821c6462d1`**，包含已接受的 B commit `b6d310ac087034f7b56f538b7828a9b2f0463eeb`。已核對 `c8f05202` 移除基底及 `d8334828` TCP 基底皆為祖先。打包前及打包後工作樹乾淨；六個主要 DLL 的 ProductVersion 全為 `0.1.35+6541b0de267fd78d8a2802388aec52821c6462d1`。本段交付數據及回復清單補充另作文件提交，不重建或改寫已驗證產物。
+
+在全新 `artifacts/c-stage-0.1.35/payload` 建置，自帶 .NET；交付於**主工作區 `artifacts/release/0.1.35/`**。實際建置命令中的 OutputDirectory 是該主工作區的完整路徑，保存於不提交的 `build-input.json`：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Build-Package.ps1 -Version 0.1.35 -PayloadDirectory artifacts/c-stage-0.1.35/payload -OutputDirectory <主工作區的完整交付路徑>
+# Package.ps1 已執行 payload verify-release 與 Setup --verify-payload。
+# 再將交付 ZIP 解到全新 artifacts/c-stage-0.1.35/zip-verify，執行：
+& artifacts/c-stage-0.1.35/zip-verify/WindowSocks.Tools.exe verify-release artifacts/c-stage-0.1.35/zip-verify 0.1.35
+```
+
+| 檢查 | 實際結果 | 證據（位於本工作樹 artifacts/c-stage-0.1.35） |
+|---|---|---|
+| 官方打包流程 | PASS，退出碼 0；內含第二次完整測試 511／511、0 fail、0 skip，3 分 33 秒 | `package.log`、`build-input.json`、`build-result.json`、`pipeline-core-complete.trx` |
+| 建置 payload | PASS，354 個清單檔，所有組件版本一致 | `package.log` |
+| Setup 內嵌套件 | PASS，Package.ps1 的 `--verify-payload` 退出碼 0，才抵達 Release ready；僅暫存解壓核驗 | `package.log`、`build-result.json` |
+| 實際交付 ZIP | PASS，354 個清單檔；manifest 與建置 payload 相同、版本一致 | `verify-release.txt`、`verification-result.json` |
+| 安裝包輸入一致性 | PASS，內嵌資源來源 `artifacts/package.zip` 的 SHA-256 等於交付 ZIP | `verification-result.json` |
+| 二進位來源 | PASS，六個 DLL 均含產物 commit；未修改 TCP／原生來源 | `component-provenance.json`、`source-provenance.json` |
+| SHA256SUMS | PASS，3 項記錄皆符合實際檔案；另記錄 sums 自身雜湊 | `delivery-files.json` |
+
+| 檔名 | 位元組 | SHA-256 |
+|---|---:|---|
+| xa-sk5-Setup-0.1.35.exe | 123456000 | `9776097C9B2F65258162987937A64A1732BEBDE91A82346F00F59D23CFF290BB` |
+| xa-sk5-0.1.35-win-x64.zip | 73183144 | `5D812846C370335A0C847FA3F418EE09DB58D9D70CB9947639DC04A683D5836B` |
+| SHA256SUMS.txt | 263 | `C8EFF9813CAE5B5A1DE4FA96013EF1617C3ACC989CB050FA55C237F19061BCC8` |
+| latest.json（本機離線更新資訊） | 1533 | `F9197E202F796119DE65A85874001F07E92CF2DDBF2FB116B2F3A38C6B02C037` |
+
+### 舊交付保留核對
+
+PASS：三個舊版本的 Setup、ZIP、latest.json 及 SHA256SUMS 共 **12 檔**，建置前／後大小與 SHA-256 完全相同。`preserved-before.json`／`preserved-after.json` 保存全部記錄；下表列安裝包及 ZIP 的共同雜湊（前後一致），未覆蓋任何舊版交付。
+
+| 版本／檔案 | 前後相同 SHA-256 |
+|---|---|
+| 0.1.32 Setup | `39344A81354B9964D8770A745E945E0CAE5D1754F565681658F6DF029A86DC9C` |
+| 0.1.32 ZIP | `1A3B066B0E771A0D5116DDFFE83776ECBC063782ED0E1F65B0B4AC693E9275FD` |
+| 0.1.33 Setup | `AE5961B4740607522067E7B20673C2595C9B9C74EB2DBB7E834937BA1B81B53E` |
+| 0.1.33 ZIP | `AA37B27571003E5F66AFDF3859F9F93F5BFC0F798FD3C29F4CA93D1657C1A922` |
+| 0.1.34 Setup | `B2279AE87BBA023D1D1725D2D5D2566A56E31E38EF4DB32F23639846B734742D` |
+| 0.1.34 ZIP | `0B85BDF6D317B88395F5D6EE7EBC413005E9990B40CD5AC31C20AB4518C57405` |
+
+**C 段結束**：本機測試交付完成，停止等待使用者「繼續」。沒有發布、推送、tag、草稿、安裝、遊戲登入、Sandboxie 設定變更或代理線路測試。實機 NOT RUN 清單及另一台電腦驗收步驟仍適用。
