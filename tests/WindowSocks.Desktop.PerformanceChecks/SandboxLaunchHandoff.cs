@@ -1,0 +1,64 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using WindowSocks.Core;
+using WindowSocks.Desktop;
+
+internal static partial class Program
+{
+    private sealed class HandoffFixture
+    {
+        public readonly SandboxInstanceProfile Profile = SandboxInstances.Create("Synthetic", @"C:\Synthetic\Launcher.exe", Guid.NewGuid());
+        public readonly SandboxInstanceProfile Second = SandboxInstances.Create("Synthetic B", @"C:\Synthetic\Launcher.exe", Guid.NewGuid());
+        public readonly CancellationTokenSource Closing = new();
+        public readonly HashSet<Guid> Started = [];
+        public bool CancelOnLaunch = true, CancelOnArm;
+        public TaskCompletionSource? Hold, Entered;
+        public int Pauses, Terminations;
+        public Task<Reply> Transport(Command command, CancellationToken ct) => Task.FromResult(command.Action switch {
+            "snapshot" => Reply.Success(new Snapshot([], [], [], [], [], new(false, false, false, false, "fixture", "", [])) {
+                SupportsSandboxInstances = true, SupportsSandboxSafety = true, SandboxInstances = [Profile, Second], SandboxStatuses = Started.Select(Status).ToArray() }),
+            "probe" => Reply.Success(new ProbeResult(Json.Read<ProxyRequest>(command.Data).ProxyId, true, true, true, true, "192.0.2.1", "192.0.2.1", 1, "", DateTimeOffset.UtcNow)),
+            "armSandbox" => Arm(Json.Read<SandboxRequest>(command.Data).Id),
+            "refreshSandboxes" => Reply.Success(Started.Select(Status).ToArray()),
+            "pauseSandbox" => Pause(),
+            _ => throw new InvalidOperationException(command.Action)
+        });
+        private SandboxInstanceStatus Status(Guid id) => new(id, "代理執行中", "arbitrary localized text", [LdPlayer.Identity(Environment.ProcessId)!.Value]) { LauncherStarted = true };
+        private Reply Arm(Guid id) { if (CancelOnArm) Closing.Cancel(); return Reply.Success(new SandboxLaunchTicket(id == Profile.Id ? Profile : Second, "synthetic-token")); }
+        private Reply Pause() { Pauses++; return Reply.Success(true); }
+    }
+    private sealed class HandoffBackend(HandoffFixture f) : Backend(Path.Combine(Output, "handoff-" + Guid.NewGuid().ToString("N")), f.Transport)
+    {
+        protected override async Task LaunchSandboxHelper(ProcessStartInfo start) {
+            f.Entered?.TrySetResult(); if (f.Hold is { } hold) await hold.Task;
+            Check(f.Started.Add(Guid.Parse(start.ArgumentList[4])), "Helper was launched twice for an already running instance.");
+            if (f.CancelOnLaunch) f.Closing.Cancel();
+        }
+        protected override Task<string> SandboxControl(string exe, string[] args, CancellationToken ct) { f.Terminations++; return Task.FromResult(""); }
+    }
+    private static async Task CheckSandboxHandoff()
+    {
+        var fixture = new HandoffFixture(); var backend = new HandoffBackend(fixture);
+        try { await backend.StartSandbox(fixture.Profile.Id, fixture.Closing.Token); }
+        catch (OperationCanceledException) { }
+        Check(fixture.Pauses == 0 && fixture.Terminations == 0, "Closing launch UI after helper handoff paused/terminated an acknowledged launcher.");
+        fixture.CancelOnLaunch = false;
+        var batch = await backend.StartSandboxes([fixture.Profile.Id, fixture.Second.Id], 1, null, default);
+        Check(batch[0].Result == SandboxStartResult.AlreadyRunning && batch[1].Result == SandboxStartResult.Started && fixture.Started.Count == 2, "Start A then batch A/B did not skip A and launch B exactly once.");
+        var concurrent = new HandoffFixture { CancelOnLaunch = false, Entered = new(TaskCreationOptions.RunContinuationsAsynchronously), Hold = new(TaskCreationOptions.RunContinuationsAsynchronously) };
+        var concurrentBackend = new HandoffBackend(concurrent);
+        var first = concurrentBackend.StartSandbox(concurrent.Profile.Id);
+        await concurrent.Entered.Task.WaitAsync(TimeSpan.FromSeconds(4)); bool duplicateRejected = false;
+        try { await concurrentBackend.StartSandbox(concurrent.Profile.Id); } catch (InvalidOperationException) { duplicateRejected = true; }
+        finally { concurrent.Hold.SetResult(); }
+        await first; Check(duplicateRejected && concurrent.Started.Count == 1, "Repeated start created a second helper.");
+        var early = new HandoffFixture { CancelOnArm = true }; var earlyBackend = new HandoffBackend(early);
+        try { await earlyBackend.StartSandbox(early.Profile.Id, early.Closing.Token); } catch (OperationCanceledException) { }
+        Check(early.Started.Count == 0 && early.Pauses == 1, "Cancellation before helper handoff did not release its own arm safely.");
+    }
+}

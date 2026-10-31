@@ -119,11 +119,43 @@ public sealed class SecondReviewSandboxTests : IDisposable
         await controller.Dispatch(command=="saveSandbox"?Command.Create(command,b):Command.Create(command,new SandboxRequest(b.Id)),default);
         Assert.True(firewall.Calls.Count>=2);Assert.Equal(new[]{"replace","allow"},firewall.Calls.Take(2));Assert.DoesNotContain("withdraw",firewall.Calls);
     }
+    [Fact] public async Task SandboxFix_NewServiceAcceptsOldHelperAndRejectsItsLateFailure()
+    {
+        Setup(); await WaitInitialization();
+        var identity = LdPlayer.Identity(Environment.ProcessId)!.Value;
+        runtime.Members = [new(identity, a.BoxName, WindowsIdentity.GetCurrent().User!.Value, 1)];
+        ((Dictionary<Guid, ProcessIdentity>)typeof(Controller).GetField("sandboxBootstraps", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(controller)!)[a.Id] = identity;
+        ((Dictionary<Guid, SandboxNetworkReport>)typeof(Controller).GetField("sandboxNetworkChecks", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(controller)!)[a.Id] = new(a.Id, "192.0.2.1", "192.0.2.1", true);
+        // Original three-field wire message, with no 0.1.35 additions.
+        var oldHelper = System.Text.Json.JsonSerializer.Deserialize<SandboxLaunchReport>(System.Text.Json.JsonSerializer.Serialize(new { id = a.Id, started = true, detail = "" }), Json.Options)!;
+        var success = await controller.Dispatch(Command.Create("reportSandboxLaunch", oldHelper), default, identity.Pid);
+        Assert.True(success.Ok, success.Error);
+        var stale = await controller.Dispatch(Command.Create("reportSandboxLaunch", new SandboxLaunchReport(a.Id, false, "monitor pipe timeout")), default, identity.Pid);
+        Assert.False(stale.Ok);
+        Assert.True(new ConfigStore(root).Load().SandboxInstances.Single(p => p.Id == a.Id).Enabled);
+        runtime.Members = [];
+    }
+    [Fact] public async Task SandboxFix_RealStartupFailureStillPausesAndExportsConcreteCause()
+    {
+        Setup(); await WaitInitialization();
+        var identity = LdPlayer.Identity(Environment.ProcessId)!.Value;
+        runtime.Members = [new(identity, a.BoxName, WindowsIdentity.GetCurrent().User!.Value, 1)];
+        ((Dictionary<Guid, ProcessIdentity>)typeof(Controller).GetField("sandboxBootstraps", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(controller)!)[a.Id] = identity;
+        var report = SandboxLaunchErrors.Report(a.Id, new InvalidOperationException("synthetic service rejection: actual cause"), "synthetic-error.txt");
+        var reply = await controller.Dispatch(Command.Create("reportSandboxLaunch", report), default, identity.Pid);
+        Assert.True(reply.Ok, reply.Error);
+        Assert.False(new ConfigStore(root).Load().SandboxInstances.Single(p => p.Id == a.Id).Enabled);
+        var diagnostic = (DiagnosticBundle)typeof(Controller).GetMethod("GetDiagnosticBundle", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(controller, [])!;
+        Assert.Contains("actual cause", Assert.Single(diagnostic.SandboxLaunchErrors).Detail);
+        Assert.Contains("actual cause", File.ReadAllText(Path.Combine(root, "service-session.log")));
+        Assert.NotNull(diagnostic.RelayPerformance); // Keep the 0.1.34 diagnostic extension.
+        runtime.Members = [];
+    }
     public void Dispose(){scanning=null;controller?.Dispose();if(Directory.Exists(root))Directory.Delete(root,true);}
     private sealed class Runtime:ISandboxRuntime{
         public bool Available=true;public bool? CheckResult;public int Checks;public SandboxProcess[] Members=[];public Action? OnList;
         public bool IdentityAvailable=>Available;public void VerifyCompatibility(){Checks++;if(CheckResult==false)throw new IOException("driver temporarily unavailable");if(CheckResult==true)Available=true;}
-        public SandboxProcess[] Processes(string box){OnList?.Invoke();return Members.Where(m=>m.BoxName==box).ToArray();}public SandboxProcess? Query(int pid)=>null;public void ValidateSettings(SandboxInstanceProfile profile){}public void TerminateOwned(SandboxInstanceProfile profile,string sid){}public void Dispose(){}
+        public SandboxProcess[] Processes(string box){OnList?.Invoke();return Members.Where(m=>m.BoxName==box).ToArray();}public SandboxProcess? Query(int pid)=>Members.FirstOrDefault(m=>m.Identity.Pid==pid);public void ValidateSettings(SandboxInstanceProfile profile){}public void TerminateOwned(SandboxInstanceProfile profile,string sid){}public void Dispose(){}
     }
     private sealed class Engine:IEngineLifecycle{
         public bool Present=>true;public bool DriverPresent=>false;public bool Compatible=>true;public bool Healthy=>true;public uint Error=>0;public bool Start(string path)=>true;public bool ReplaceCapture(string path)=>true;public void Stop(){}

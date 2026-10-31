@@ -25,6 +25,7 @@ public sealed record DiagnosticBundle(DateTimeOffset At, string Version, bool En
 {
     public DriverCompatibility? Compatibility { get; init; }
     public RelayPerformance? RelayPerformance { get; init; }
+    public SandboxLaunchDiagnostic[] SandboxLaunchErrors { get; init; } = [];
 }
 public sealed record RelayPerformance(ulong QueueSamples, ulong QueueMicroseconds, ulong QueueMaxMicroseconds, ulong WouldBlock, ulong StallTimeouts)
 {

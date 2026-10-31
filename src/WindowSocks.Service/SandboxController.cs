@@ -14,6 +14,8 @@ public sealed partial class Controller
     private readonly HashSet<ProcessIdentity> verifiedSandboxMembers = [];
     private readonly Dictionary<Guid, ProcessIdentity> sandboxBootstraps = [];
     private readonly Dictionary<Guid, string> sandboxLaunchErrors = [], sandboxStages = [];
+    private readonly Dictionary<Guid, ProcessIdentity> sandboxLaunchSucceeded = [];
+    private readonly Dictionary<Guid, SandboxLaunchDiagnostic> sandboxLaunchDiagnostics = [];
     private readonly Dictionary<Guid, SandboxNetworkReport> sandboxNetworkChecks = [];
     private readonly SemaphoreSlim sandboxPoll = new(1,1);
     private bool sandboxStopping, sandboxRecoveryRequested;
@@ -199,6 +201,7 @@ public sealed partial class Controller
         string token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
         sandboxTickets[id] = (token, DateTimeOffset.UtcNow.AddSeconds(60)); sandboxErrors.Remove(id);
         sandboxLaunchErrors.Remove(id); sandboxStages.Remove(id); sandboxBootstraps.Remove(id); sandboxNetworkChecks.Remove(id);
+        sandboxLaunchSucceeded.Remove(id);
         ApplyRules(); store.Save(config); Log($"沙盒「{profile.Name}」已保留線路，等待啟動核驗。");
         return new(profile, token);
     }
@@ -231,10 +234,19 @@ public sealed partial class Controller
             throw new InvalidOperationException("沙盒啟動回報身分不符。");
         if (report.Started) {
             if (!sandboxNetworkChecks.ContainsKey(report.Id)) throw new InvalidOperationException("尚未通過沙盒出口驗證。");
-            sandboxStages[report.Id] = "啟動器已建立，請確認遊戲畫面";
+            sandboxLaunchSucceeded[report.Id] = helper;
+            sandboxStages[report.Id] = SandboxLaunchErrors.LauncherOpened;
         }
         else {
-            sandboxLaunchErrors[report.Id] = "啟動器啟動失敗：" + report.Detail[..Math.Min(report.Detail.Length, 400)];
+            if (sandboxLaunchSucceeded.GetValueOrDefault(report.Id) == helper) throw new InvalidOperationException("此啟動程序已回報成功，拒收其後續失敗回報；連線健康仍由服務核驗。");
+            string detail = SandboxLaunchErrors.Clean(report.ErrorDetail ?? report.Detail);
+            string summary = SandboxLaunchErrors.Clean(report.Detail, 300);
+            foreach (var proxy in config.Proxies) foreach (string secret in new[] { proxy.Password, proxy.Username }.Where(s => !string.IsNullOrEmpty(s))) {
+                detail = detail.Replace(secret, "[redacted]", StringComparison.Ordinal); summary = summary.Replace(secret, "[redacted]", StringComparison.Ordinal);
+            }
+            sandboxLaunchDiagnostics[report.Id] = new(report.Id, DateTimeOffset.UtcNow, detail, SandboxLaunchErrors.Clean(report.ErrorFile, 1024));
+            Log("沙盒啟動錯誤詳情：" + detail);
+            sandboxLaunchErrors[report.Id] = "啟動器啟動失敗：" + summary;
             PauseSandbox(report.Id);
         }
         Log($"沙盒「{profile.Name}」：{(report.Started ? sandboxStages[report.Id] : sandboxLaunchErrors[report.Id])}。");
@@ -380,6 +392,7 @@ public sealed partial class Controller
         ReplaceSandboxFirewallImages(images);
         sandboxMembershipRevision++;
         config.SandboxInstances.RemoveAll(p => p.Id == id); config.Bindings.RemoveAll(b => b.TargetKey == profile.TargetKey);
+        sandboxLaunchSucceeded.Remove(id); sandboxLaunchDiagnostics.Remove(id);
         targets.Remove(profile.TargetKey); sandboxTickets.Remove(id); sandboxErrors.Remove(id); sandboxLaunchErrors.Remove(id); sandboxStages.Remove(id); sandboxBootstraps.Remove(id); sandboxNetworkChecks.Remove(id); ApplyRules(); store.Save(config);
     }
     private void ReplaceSandboxFirewallImages(string[] images)
@@ -391,6 +404,6 @@ public sealed partial class Controller
         var binding = config.Bindings.FirstOrDefault(b => b.TargetKey == p.TargetKey); var members = binding?.Processes ?? [];
         return new SandboxInstanceStatus(p.Id, p.RemovalPending ? "清理未完成 · 請重試移除" : !sandboxFirewallReady ? "正在建立 WFP 防護 · 沙盒暫停" : sandboxIdentityUnavailable.Contains(p.Id) ? "身分查詢不可用 · 已封鎖 · 自動重試" : members.Length > 0 && NativeEngine.Core_IsRunning() == 0 ? "代理核心未執行 · 請停止沙盒" : sandboxLaunchErrors.ContainsKey(p.Id) ? "啟動失敗 · 已封鎖" : sandboxErrors.ContainsKey(p.Id) ? binding?.Enabled==true ? "身分查詢重試 · 保留既有線路" : "沙盒身分查詢失敗 · 已封鎖" : sandboxTickets.ContainsKey(p.Id) ? "正在啟動" :
             members.Length == 0 ? "未啟動" : !p.Enabled ? "已暫停 · 已封鎖" : !Healthy(p.ProxyId) || DuplicateExit(p.ProxyId) ? "線路異常 · 已封鎖" : !sandboxNetworkChecks.ContainsKey(p.Id) ? "正在驗證出口" : "代理執行中",
-            sandboxLaunchErrors.GetValueOrDefault(p.Id, sandboxErrors.GetValueOrDefault(p.Id, sandboxStages.GetValueOrDefault(p.Id, p.BoxName))), members) { Network = sandboxNetworkChecks.GetValueOrDefault(p.Id) };
+            sandboxLaunchErrors.GetValueOrDefault(p.Id, sandboxErrors.GetValueOrDefault(p.Id, sandboxStages.GetValueOrDefault(p.Id, p.BoxName))), members) { Network = sandboxNetworkChecks.GetValueOrDefault(p.Id), LauncherStarted = sandboxBootstraps.TryGetValue(p.Id, out var helper) && sandboxLaunchSucceeded.GetValueOrDefault(p.Id) == helper };
     }).ToArray();
 }

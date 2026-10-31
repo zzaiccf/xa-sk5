@@ -4,10 +4,11 @@ using WindowSocks.Core;
 if (args.Length > 0 && args[0] == "sandbox-bootstrap") {
     try { await SandboxBootstrap.Run(Guid.Parse(args[1]), args[2]); }
     catch (Exception ex) {
-        try { await PipeTransport.CallAsync<bool>(Command.Create("reportSandboxLaunch", new SandboxLaunchReport(Guid.Parse(args[1]), false, ex is System.ComponentModel.Win32Exception native ? $"Windows 錯誤 {native.NativeErrorCode}" : ex.GetType().Name)), pipeName: PipeTransport.SandboxName); } catch { }
         string folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WindowSocks");
-        Directory.CreateDirectory(folder);
-        await File.WriteAllTextAsync(Path.Combine(folder, "sandbox-bootstrap-error.txt"), DateTimeOffset.Now.ToString("O") + Environment.NewLine + ex);
+        string errorFile = Path.Combine(folder, "sandbox-bootstrap-error.txt");
+        var report = SandboxLaunchErrors.Report(Guid.Parse(args[1]), ex, errorFile);
+        try { await PipeTransport.CallAsync<bool>(Command.Create("reportSandboxLaunch", report), pipeName: PipeTransport.SandboxName); } catch { }
+        try { Directory.CreateDirectory(folder); await File.WriteAllTextAsync(errorFile, DateTimeOffset.Now.ToString("O") + Environment.NewLine + report.ErrorDetail); } catch { }
         Environment.ExitCode = 1;
     }
     return;
@@ -17,6 +18,10 @@ Console.OutputEncoding = new System.Text.UTF8Encoding(false);
 if (args.Length == 0) { Console.WriteLine("WindowSocks.Tools probe | import-local | identity <pid> | pipe <action>\n代理資料從標準輸入讀取，不放在命令列參數。"); return; }
 switch (args[0])
 {
+    case "sandbox-ini-path":
+        try { using var runtime = new SandboxieRuntime(); Console.WriteLine(JsonSerializer.Serialize(runtime.ConfigurationPath())); }
+        catch (Exception ex) { Console.Error.WriteLine(ex.Message); Environment.ExitCode = 1; }
+        break;
     case "sandbox-broker":
         using (var runtime = new SandboxieRuntime()) {
             while (await Console.In.ReadLineAsync() is { } requestLine) {

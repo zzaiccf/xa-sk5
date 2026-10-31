@@ -934,7 +934,7 @@ public sealed partial class Controller : IDisposable
         }
         return new(DateTimeOffset.UtcNow, snapshot.Diagnostics.Version, snapshot.Diagnostics.EngineRunning, reports, ReadNetworkEvents(), logs.ToArray(),
             "只記錄程序、窗口與連線中繼資料，不含代理帳密、封包內容或遊戲帳密。上游 EOF／重設不能單獨證明是代理商或遊戲伺服器關閉；既有版本沒有事件的歷史無法補回。TCP 數不含已半關閉的連線。")
-        { RelayPerformance = NativeEngine.ReadRelayPerformance(), Compatibility = new("WinDivert 程序分流", NativeEngine.DriverPresent, snapshot.Diagnostics.EngineRunning, dllVersion, hash, signature,
+        { SandboxLaunchErrors = sandboxLaunchDiagnostics.Values.ToArray(), RelayPerformance = NativeEngine.ReadRelayPerformance(), Compatibility = new("WinDivert 程序分流", NativeEngine.DriverPresent, snapshot.Diagnostics.EngineRunning, dllVersion, hash, signature,
             "本模式載入封包攔截驅動，不注入遊戲或修改遊戲檔案。Socket 關閉無法證明反作弊偵測；本模式不具備不可偵測保證。無主機驅動方向為遊戲原生代理或外部網關，需另行驗證多開分流。") };
     }
     private static void ValidateConsole(string path)

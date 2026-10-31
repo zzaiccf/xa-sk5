@@ -7,7 +7,11 @@ using Microsoft.Win32;
 [assembly: InternalsVisibleTo("WindowSocks.Tests")]
 namespace WindowSocks.Core;
 
-public sealed record SandboxieSetupState(bool Ready, bool CanInstall, string Detail);
+public sealed record SandboxieSetupState(bool Ready, bool CanInstall, string Detail)
+{
+    public bool NeedsInitialization { get; init; }
+    public bool CanPrepare => Ready || NeedsInitialization;
+}
 
 public sealed class SandboxieInstaller
 {
@@ -34,7 +38,7 @@ public sealed class SandboxieInstaller
         bool ready = new[] { "SandMan.exe", "Start.exe", "SbieDll.dll", "SbieIni.exe", "SbieSvc.exe", "SbieDrv.sys" }.All(f => File.Exists(Path.Combine(root, f))) &&
             FileVersionInfo.GetVersionInfo(Path.Combine(root, "SandMan.exe")).FileVersion == "1.18.8" &&
             FileVersionInfo.GetVersionInfo(Path.Combine(root, "SbieDrv.sys")).FileVersion == "5.73.8";
-        if (ready) return new(true, false, "Sandboxie Plus 1.18.8 已安裝 · 可準備環境（啟動時另核驗驅動）");
+        if (ready) return InspectConfiguration(SandboxServiceState.IsRunning, SandboxConfiguration.ResolvePath);
         using var machine = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
         using var driver = machine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\SbieDrv");
         using var uninstall = machine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Sandboxie-Plus_is1");
@@ -44,13 +48,24 @@ public sealed class SandboxieInstaller
             new(false, true, "尚未安裝 Sandboxie · 可一鍵安裝，或按準備環境時自動安裝。");
     }
 
+    internal static SandboxieSetupState InspectConfiguration(Func<bool> serviceRunning, Func<string> resolve)
+    {
+        try {
+            if (!serviceRunning()) return new(false, false, "Sandboxie 已安裝，但 SbieSvc 未執行；請開啟官方管理器啟動服務或以官方安裝程式修復，再重新檢查。");
+            string path = resolve();
+            try { _ = SandboxIniFile.Read(path); }
+            catch (FileNotFoundException) { return new(false, false, "設定待初始化 · 可按準備環境，由官方工具建立設定。") { NeedsInitialization = true }; }
+            return new(true, false, "Sandboxie Plus 1.18.8 服務與設定可用 · 可準備環境（啟動時另核驗驅動）");
+        } catch (Exception ex) when (ex is not OutOfMemoryException) { return new(false, false, "Sandboxie 設定不可用：" + ex.Message + " 請由官方管理器確認後重新檢查。"); }
+    }
+
     public Task EnsureInstalled(IProgress<UpdateProgress>? progress, CancellationToken ct) => EnsureInstalled(
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WindowSocks", "Downloads"), progress, ct);
     internal async Task EnsureInstalled(string cacheRoot, IProgress<UpdateProgress>? progress, CancellationToken ct)
     {
         if (!await installGate.WaitAsync(0, ct).ConfigureAwait(false)) throw new InvalidOperationException("Sandboxie 正在安裝，請等待完成後再重新檢查。");
         try {
-            var initial = inspect(); if (initial.Ready) return;
+            var initial = inspect(); if (initial.CanPrepare) return;
             if (!initial.CanInstall) throw new InvalidOperationException(initial.Detail);
             string directory = Path.Combine(cacheRoot, "Sandboxie-" + Guid.NewGuid().ToString("N"));
             AppReleasePackage.RejectLinks(directory); Directory.CreateDirectory(directory);
@@ -63,7 +78,7 @@ public sealed class SandboxieInstaller
             progress?.Report(new("正在核對安裝檔 SHA-256 與數位簽章…") { CanCancel = true });
             AppReleasePackage.VerifyArchive(file, package); verifySignature(file);
             ct.ThrowIfCancellationRequested();
-            var current = inspect(); if (current.Ready) return;
+            var current = inspect(); if (current.CanPrepare) return;
             if (!current.CanInstall) throw new InvalidOperationException(current.Detail);
             progress?.Report(new("請確認 Windows 管理員授權。官方程式正在安裝；如需取消，請在安裝視窗操作。") { CanCancel = false });
             int code;
@@ -72,7 +87,7 @@ public sealed class SandboxieInstaller
             if (code == 3010) throw new IOException("Sandboxie 已安裝但需要重新啟動 Windows；請自行重開後再按重新檢查，尚未準備或啟動遊戲。");
             if (code != 0) throw new IOException($"Sandboxie 安裝未完成（退出碼 {code}）。請查看 {directory}\\setup.log，處理後重新檢查。");
             var result = inspect();
-            if (!result.Ready) throw new IOException("安裝程式已結束，但尚未通過環境檢查。" + result.Detail);
+            if (!result.CanPrepare) throw new IOException("安裝程式已結束，但尚未通過環境檢查。" + result.Detail);
             ct.ThrowIfCancellationRequested(); // Closing the window never kills an in-progress driver installer.
             progress?.Report(new("Sandboxie 安裝完成並已重新檢查，可繼續準備遊戲。") { CanCancel = true });
         } finally { installGate.Release(); }

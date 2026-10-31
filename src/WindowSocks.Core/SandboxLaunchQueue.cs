@@ -1,12 +1,17 @@
 namespace WindowSocks.Core;
 
-public sealed record SandboxLaunchOutcome(Guid Id, bool Success, string Detail);
+public enum SandboxStartResult { Started, AlreadyRunning }
+public sealed record SandboxLaunchOutcome(Guid Id, bool Success, string Detail) { public SandboxStartResult? Result { get; init; } }
 public sealed class SandboxLaunchQueue
 {
     private int running;
     public bool IsRunning => Volatile.Read(ref running) != 0;
-    public async Task<SandboxLaunchOutcome[]> RunAsync(IEnumerable<Guid> ids, int intervalSeconds,
+    public Task<SandboxLaunchOutcome[]> RunAsync(IEnumerable<Guid> ids, int intervalSeconds,
         Func<Guid, CancellationToken, Task> launch, IProgress<string>? progress, CancellationToken ct,
+        Func<TimeSpan, CancellationToken, Task>? delay = null)
+        => RunAsync(ids, intervalSeconds, async (id, token) => { await launch(id, token); return SandboxStartResult.Started; }, progress, ct, delay);
+    public async Task<SandboxLaunchOutcome[]> RunAsync(IEnumerable<Guid> ids, int intervalSeconds,
+        Func<Guid, CancellationToken, Task<SandboxStartResult>> launch, IProgress<string>? progress, CancellationToken ct,
         Func<TimeSpan, CancellationToken, Task>? delay = null)
     {
         if (intervalSeconds is < 1 or > 300) throw new InvalidOperationException("啟動間隔請輸入 1–300 秒。");
@@ -22,7 +27,7 @@ public sealed class SandboxLaunchQueue
                     await delay(TimeSpan.FromSeconds(1), ct);
                 }
                 ct.ThrowIfCancellationRequested(); progress?.Report($"正在核驗並啟動 {i + 1}/{ordered.Length}…");
-                try { await launch(ordered[i], ct); results.Add(new(ordered[i], true, "已啟動／已在執行")); }
+                try { var result = await launch(ordered[i], ct); results.Add(new(ordered[i], true, result == SandboxStartResult.AlreadyRunning ? "已在執行，略過" : SandboxLaunchErrors.LauncherOpened) { Result = result }); }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
                 catch (Exception ex) when (ex is not OutOfMemoryException) { results.Add(new(ordered[i], false, ex.Message)); }
             }

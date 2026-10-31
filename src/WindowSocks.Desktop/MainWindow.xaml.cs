@@ -63,6 +63,7 @@ public partial class MainWindow : Window
     private Guid[] contextProxyIds = [];
     private bool contextFromPointer, contextOnRow;
     private string? contextRuleKey;
+    private string[] contextRuleKeys = [];
     private bool ruleContextFromPointer, ruleContextOnRow;
     public MainWindow() : this(new Backend(), new DesktopStartupController(), true) { }
     public MainWindow(Backend backend, IDesktopStartupController? startup = null, bool integrateShell = false, IProxyServiceSession? serviceSession = null,
@@ -319,9 +320,9 @@ public partial class MainWindow : Window
     private void RenderSnapshot()
     {
         if (snapshot is null) return;
-        string? selectedRule = (RuleGrid.SelectedItem as ProxyRuleItem)?.Key;
+        var selectedRules = RuleGrid.SelectedItems.Cast<ProxyRuleItem>().Select(r => r.Key).ToHashSet();
         RuleGrid.ItemsSource = ProxyRules.List(snapshot);
-        RuleGrid.SelectedItem = RuleGrid.Items.Cast<ProxyRuleItem>().FirstOrDefault(r => r.Key == selectedRule);
+        foreach (var row in RuleGrid.Items.Cast<ProxyRuleItem>()) if (selectedRules.Contains(row.Key)) RuleGrid.SelectedItems.Add(row);
         RenderStartup();
         var selectedProxy = ProxyGrid.SelectedItems.Cast<ProxyRow>().Select(x => x.Profile.Id).ToHashSet();
         windowRows = BuildWindowRows(snapshot);
@@ -506,7 +507,7 @@ public partial class MainWindow : Window
     }).ToArray();
     private void EditRuleClick(object sender, RoutedEventArgs e)
     {
-        if (RuleGrid.SelectedItem is not ProxyRuleItem rule) return;
+        if (RuleGrid.SelectedItems.Count != 1 || RuleGrid.SelectedItem is not ProxyRuleItem rule) return;
         if (rule.Key == "vmware") VmwareClick(sender, e);
         else if (rule.Key.StartsWith("sandbox:", StringComparison.Ordinal)) SandboxClick(rule, e);
         else if (rule.Key == "automatic") AutoProxyClick(sender, e);
@@ -521,7 +522,11 @@ public partial class MainWindow : Window
         ruleContextFromPointer = true; ruleContextOnRow = false;
         for (var source = e.OriginalSource as DependencyObject; source is not null && source != RuleGrid;) {
             if (source is DataGridRow row && row.Item is ProxyRuleItem item) {
-                ruleContextOnRow = true; RuleGrid.SelectedItem = item; row.Focus(); break;
+                ruleContextOnRow = true;
+                if (!RuleGrid.SelectedItems.Contains(item)) { RuleGrid.UnselectAll(); RuleGrid.SelectedItem = item; }
+                // Prevent DataGrid's default right-button handling from collapsing
+                // an existing Ctrl/Shift selection after our preview handler.
+                e.Handled = true; break;
             }
             source = source is FrameworkContentElement content ? content.Parent :
                 source is System.Windows.Media.Visual or System.Windows.Media.Media3D.Visual3D ? System.Windows.Media.VisualTreeHelper.GetParent(source) : LogicalTreeHelper.GetParent(source);
@@ -533,19 +538,26 @@ public partial class MainWindow : Window
     }
     private void RuleContextOpening(object sender, ContextMenuEventArgs e)
     {
-        if (ruleContextFromPointer && !ruleContextOnRow || RuleGrid.SelectedItem is not ProxyRuleItem item) { contextRuleKey = null; e.Handled = true; }
+        if (ruleContextFromPointer && !ruleContextOnRow || RuleGrid.SelectedItem is not ProxyRuleItem item) { contextRuleKey = null; contextRuleKeys = []; e.Handled = true; }
         else {
-            contextRuleKey = item.Key; ContextDeleteRule.IsEnabled = !busy;
-            bool sandbox = snapshot?.SandboxInstances.Any(p => p.TargetKey == item.Key) == true;
+            contextRuleKeys = RuleGrid.Items.Cast<ProxyRuleItem>().Where(RuleGrid.SelectedItems.Contains).Select(r => r.Key).ToArray();
+            bool single = contextRuleKeys.Length == 1;
+            contextRuleKey = single ? item.Key : null;
+            ContextEditRule.IsEnabled = ContextDeleteRule.IsEnabled = single && !busy;
+            bool sandbox = contextRuleKeys.Length > 0 && contextRuleKeys.All(key => snapshot?.SandboxInstances.Any(p => p.TargetKey == key) == true);
             ContextDeleteRule.Header = sandbox ? "移除實例／清理資料…" : "刪除此規則";
-            ContextStartSandbox.Visibility = ContextStartSandboxGroup.Visibility = ContextStopSandbox.Visibility = sandbox ? Visibility.Visible : Visibility.Collapsed;
-            ContextStartSandbox.IsEnabled = ContextStartSandboxGroup.IsEnabled = ContextStopSandbox.IsEnabled = !backend.SandboxLaunchBusy;
+            ContextStartSandbox.Visibility = ContextStopSandbox.Visibility = sandbox ? Visibility.Visible : Visibility.Collapsed;
+            ContextStartSandbox.Header = single ? "啟動此實例" : $"啟動選取的 {contextRuleKeys.Length} 個實例（間隔 10 秒）";
+            ContextStopSandbox.Header = single ? "停止此實例" : $"停止選取的 {contextRuleKeys.Length} 個實例";
+            ContextStartSandbox.IsEnabled = ContextStopSandbox.IsEnabled = !backend.SandboxLaunchBusy && !busy;
         }
         ruleContextFromPointer = false;
     }
+    private void RuleSelectionChanged(object sender, SelectionChangedEventArgs e)
+    { if (EditSelectedRule is not null) EditSelectedRule.IsEnabled = RuleGrid.SelectedItems.Count == 1; }
     private async void DeleteRuleClick(object sender, RoutedEventArgs e)
     {
-        string? key = contextRuleKey; if (key is null) return;
+        string? key = contextRuleKey; if (key is null || RuleGrid.SelectedItems.Count != 1 || (RuleGrid.SelectedItem as ProxyRuleItem)?.Key != key) return;
         if (key.StartsWith("sandbox:", StringComparison.Ordinal) && Guid.TryParseExact(key[8..], "N", out var id)) {
             var dialog = new SandboxStorageWindow(backend, id) { Owner = this }; dialog.ShowDialog(); await Run("", () => Refresh(false, skipDiscovery: true), showError: false); return;
         }

@@ -77,7 +77,9 @@ public static class SandboxPreparation
         File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(result, Json.Options)); File.Move(path + ".tmp", path, true);
         return result;
     }
-    public static async Task Prepare(string sourceLauncher, SandboxInstanceProfile profile, IProgress<string>? progress, CancellationToken ct)
+    public static Task Prepare(string sourceLauncher, SandboxInstanceProfile profile, IProgress<string>? progress, CancellationToken ct) =>
+        SandboxConfiguration.Run(() => PrepareCore(sourceLauncher, profile, progress, ct), ct);
+    private static async Task PrepareCore(string sourceLauncher, SandboxInstanceProfile profile, IProgress<string>? progress, CancellationToken ct)
     {
         SandboxInstances.Validate(profile);
         string source = Path.GetDirectoryName(Path.GetFullPath(sourceLauncher))!;

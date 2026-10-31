@@ -34,8 +34,8 @@ internal static partial class Program
         int exit = 1;
         Dispatcher.CurrentDispatcher.BeginInvoke(new Action(async () => {
             try { if (Environment.GetCommandLineArgs().Contains("--sandbox-storage")) await RunSandboxStorage(); else if (Environment.GetCommandLineArgs().Contains("--sandbox-ui")) await RunSandboxUi(); else if (Environment.GetCommandLineArgs().Contains("--line-capacities")) await RunLineCapacities(); else if (Environment.GetCommandLineArgs().Contains("--unified-program-rules")) RunUnifiedProgramRules(); else if (Environment.GetCommandLineArgs().Contains("--global-duration")) await RunGlobalDuration(); else if (Environment.GetCommandLineArgs().Contains("--tray-behavior")) await RunTrayBehavior(); else if (Environment.GetCommandLineArgs().Contains("--bulk-actions")) await RunBulkActions(); else await Run(); exit = 0; }
-            catch (Exception ex) { Console.Error.WriteLine(ex); }
-            finally { Dispatcher.CurrentDispatcher.InvokeShutdown(); }
+            catch (Exception ex) { Console.Error.WriteLine(ex); File.WriteAllText(Path.Combine(Output, "failure.txt"), ex.ToString()); }
+            finally { File.WriteAllText(Path.Combine(Output, "checks.json"), JsonSerializer.Serialize(new { exit, checks })); Dispatcher.CurrentDispatcher.InvokeShutdown(); }
         }));
         Dispatcher.Run(); return exit;
     }
@@ -125,7 +125,8 @@ internal static partial class Program
         var timeout = Stopwatch.StartNew();
         while (!condition()) { if (timeout.Elapsed > TimeSpan.FromSeconds(4)) throw new TimeoutException("WPF operation did not finish while independent work was blocked."); await Task.Delay(10); }
     }
-    private static void Check(bool condition, string error) { if (!condition) throw new InvalidOperationException(error); }
+    private static int checks;
+    private static void Check(bool condition, string error) { checks++; if (!condition) throw new InvalidOperationException(error); }
     private static void SaveImage(Window window, string name) {
         var content = window.Content; window.Content = null;
         int width = (int)window.Width - 16, height = (int)window.Height - 39;
@@ -170,6 +171,7 @@ internal static partial class Program
         private readonly Fixture fixture;
         public int Snapshots;
         public readonly System.Collections.Concurrent.ConcurrentQueue<Guid> SandboxStarts = new();
+        public readonly System.Collections.Generic.HashSet<Guid> SandboxAlreadyRunning = [];
         public SandboxInstanceProfile[]? PreparedProfiles;
         public SandboxieSetupState EnvironmentStatus = new(true, false, "合成：已安裝");
         public int Installs;
@@ -192,7 +194,7 @@ internal static partial class Program
         public override Task<SandboxInstanceProfile[]> ResumeSandboxPreparation(string source, Guid[] proxies, SandboxInstanceProfile[] existing, CancellationToken ct) => Task.FromResult(SandboxPreparation.Resume(source, proxies, existing, Path.Combine(Output, "drafts")));
         public override Task<bool> SandboxInstalled(CancellationToken ct) => Task.FromResult(true);
         public override Task<bool> DetectYongOrigin(string path, CancellationToken ct) => Task.FromResult(path.Contains("SyntheticGame"));
-        public override Task StartSandbox(Guid id, CancellationToken ct = default) { SandboxStarts.Enqueue(id); return Task.CompletedTask; }
+        public override Task<SandboxStartResult> StartSandbox(Guid id, CancellationToken ct = default) { SandboxStarts.Enqueue(id); return Task.FromResult(SandboxAlreadyRunning.Contains(id) ? SandboxStartResult.AlreadyRunning : SandboxStartResult.Started); }
         public override Task PrepareSandboxes(SandboxInstanceProfile[] profiles, IProgress<string>? progress, CancellationToken ct) {
             SandboxPreparation.ValidateBatch(profiles); PreparedProfiles = profiles;
             fixture.State = fixture.State with { SandboxInstances = fixture.State.SandboxInstances.Where(p => !profiles.Any(next => next.Id == p.Id)).Concat(profiles).ToArray() };

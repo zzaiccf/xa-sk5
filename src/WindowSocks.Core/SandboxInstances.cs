@@ -27,12 +27,19 @@ public sealed record SandboxInstanceProfile
 public sealed record SandboxInstanceStatus(Guid Id, string State, string Detail, ProcessIdentity[] Processes)
 {
     public SandboxNetworkReport? Network { get; init; }
+    public bool? LauncherStarted { get; init; }
 }
 public sealed record SandboxRequest(Guid Id);
 public sealed record SandboxRemovalRequest(Guid Id, bool DeleteFiles);
 public sealed record SandboxLaunchTicket(SandboxInstanceProfile Instance, string Token);
 public sealed record SandboxRegistration(Guid Id, string Token, ProcessIdentity Process);
-public sealed record SandboxLaunchReport(Guid Id, bool Started, string Detail);
+public sealed record SandboxLaunchReport(Guid Id, bool Started, string Detail)
+{
+    // Optional additions: both older senders and older receivers retain the
+    // original Id/Started/Detail contract.
+    public string? ErrorDetail { get; init; }
+    public string? ErrorFile { get; init; }
+}
 public sealed record SandboxNetworkReport(Guid Id, string? TcpExit, string? UdpExit, bool DirectDns);
 public sealed record SandboxLaunchPermission(string LauncherPath, string WorkingDirectory, string FileRoot);
 public sealed record SandboxProcess(ProcessIdentity Identity, string BoxName, string OwnerSid, uint SessionId);

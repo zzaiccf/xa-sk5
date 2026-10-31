@@ -12,6 +12,7 @@ public partial class Backend
 {
     private readonly SandboxLaunchQueue sandboxLaunchQueue = new();
     private readonly SemaphoreSlim sandboxPreparationGate = new(1, 1);
+    private readonly SemaphoreSlim sandboxStartGate = new(1, 1);
     public bool SandboxLaunchBusy => sandboxLaunchQueue.IsRunning;
     public Task<SandboxLaunchOutcome[]> StartSandboxes(Guid[] ids, int intervalSeconds, IProgress<string>? progress, CancellationToken ct) =>
         Task.Run(() => sandboxLaunchQueue.RunAsync(ids, intervalSeconds, StartSandbox, progress, ct), ct);
@@ -66,38 +67,57 @@ public partial class Backend
         await Task.Run(() => SandboxPreparation.Prepare(profile.SourceLauncherPath, profile, progress, ct), ct);
         await Call<bool>(Command.Create("saveSandbox", profile), ct);
     }
-    public virtual async Task StartSandbox(Guid id, CancellationToken ct = default)
+    public virtual async Task<SandboxStartResult> StartSandbox(Guid id, CancellationToken ct = default)
+    {
+        if (!await sandboxStartGate.WaitAsync(0, ct).ConfigureAwait(false)) throw new InvalidOperationException("已有實例正在啟動，請等待核驗完成。");
+        try { return await StartSandboxCore(id, ct).ConfigureAwait(false); }
+        finally { sandboxStartGate.Release(); }
+    }
+    private async Task<SandboxStartResult> StartSandboxCore(Guid id, CancellationToken ct)
     {
         var state = await SandboxSnapshot(ct).ConfigureAwait(false);
         var profile = state.SandboxInstances.Single(p => p.Id == id);
         if (profile.RemovalPending) throw new InvalidOperationException("此實例正在清理，請到儲存空間頁完成移除。");
         var current = state.SandboxStatuses.FirstOrDefault(s => s.Id == id);
         if (current is { Processes.Length: > 0 }) {
-            if (current.State == "代理執行中") return;
+            if (SandboxLauncherState.IsStarted(current, profile, ProcessCatalog.ImagePath, LdPlayer.Identity)) return SandboxStartResult.AlreadyRunning;
             throw new InvalidOperationException(profile.Name + " 已有程序執行，但尚未就緒：" + current.State + "。請先停止後重試。");
         }
         var probe = await Call<ProbeResult>(Command.Create("probe", new ProxyRequest(profile.ProxyId)), ct);
         if (!probe.Ready) throw new InvalidOperationException("線路未通過 TCP／UDP 檢測：" + probe.Message);
         var ticket = await Call<SandboxLaunchTicket>(Command.Create("armSandbox", new SandboxRequest(id)), ct);
+        bool handedOff = false;
         try {
+            ct.ThrowIfCancellationRequested();
             string helper = Path.Combine(AppContext.BaseDirectory, "WindowSocks.Tools.exe");
-            if (!File.Exists(helper)) throw new IOException("找不到沙盒啟動輔助程式，請使用完整測試版目錄。");
             var start = new ProcessStartInfo(Path.Combine(SandboxieRuntime.InstallDirectory, "Start.exe")) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = profile.WorkingDirectory };
             foreach (string arg in new[] { "/box:" + profile.BoxName, "/hide_window", helper, "sandbox-bootstrap", id.ToString(), ticket.Token }) start.ArgumentList.Add(arg);
-            using var process = Process.Start(start) ?? throw new IOException("無法啟動沙盒。");
+            await LaunchSandboxHelper(start);
+            handedOff = true;
+            // Once the helper has been handed to Sandboxie, service health policy
+            // owns it. Closing a progress window cancels later queue entries only.
+            using var verification = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             for (int attempt = 0; attempt < 150; attempt++) {
-                await Task.Delay(500, ct);
-                var status = (await Call<SandboxInstanceStatus[]>(Command.Create("refreshSandboxes", new { }), ct)).Single(s => s.Id == id);
-                if (status.State == "代理執行中" && status.Detail.StartsWith("啟動器已建立", StringComparison.Ordinal)) return;
+                await Task.Delay(500, verification.Token);
+                var status = (await Call<SandboxInstanceStatus[]>(Command.Create("refreshSandboxes", new { }), verification.Token)).Single(s => s.Id == id);
+                if (SandboxLauncherState.IsStarted(status, profile, ProcessCatalog.ImagePath, LdPlayer.Identity)) return SandboxStartResult.Started;
                 if (status.State.Contains("異常") || status.State.Contains("未確認") || status.State.Contains("失敗")) throw new InvalidOperationException(status.Detail);
             }
             throw new TimeoutException("沙盒啟動核驗逾時，請查看沙盒／啟動器紀錄。");
         } catch {
+            if (!handedOff) {
             await Call<bool>(Command.Create("pauseSandbox", new SandboxRequest(id)), CancellationToken.None);
-            await SandboxieRuntime.Command("Start.exe", ["/box:" + profile.BoxName, "/terminate"], CancellationToken.None);
+            await SandboxControl("Start.exe", ["/box:" + profile.BoxName, "/terminate"], CancellationToken.None);
+            }
             throw;
         }
     }
+    protected virtual Task LaunchSandboxHelper(ProcessStartInfo start)
+    {
+        if (!File.Exists(Path.Combine(AppContext.BaseDirectory, "WindowSocks.Tools.exe"))) throw new IOException("找不到沙盒啟動輔助程式，請使用完整測試版目錄。");
+        using var process = Process.Start(start) ?? throw new IOException("無法啟動沙盒。"); return Task.CompletedTask;
+    }
+    protected virtual Task<string> SandboxControl(string exe, string[] args, CancellationToken ct) => SandboxieRuntime.Command(exe, args, ct);
     public virtual async Task StopSandbox(Guid id)
     {
         var state = await SandboxSnapshot().ConfigureAwait(false); var profile = state.SandboxInstances.Single(p => p.Id == id);

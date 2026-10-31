@@ -31,17 +31,17 @@ public partial class MainWindow
         sandboxLaunchWindow.Show();
     }
     private void StartRuleClick(object sender, RoutedEventArgs e) {
-        var profile = snapshot?.SandboxInstances.FirstOrDefault(p => p.TargetKey == contextRuleKey);
-        if (profile is not null) OpenSandboxLaunch([profile]);
+        var profiles = SelectedContextSandboxes();
+        if (profiles.Length > 0) OpenSandboxLaunch(profiles);
     }
-    private void StartRuleGroupClick(object sender, RoutedEventArgs e) {
-        var profile = snapshot?.SandboxInstances.FirstOrDefault(p => p.TargetKey == contextRuleKey);
-        if (profile is not null) OpenSandboxLaunch(snapshot!.SandboxInstances.Where(p => p.SourceLauncherPath.Equals(profile.SourceLauncherPath, StringComparison.OrdinalIgnoreCase)).OrderBy(p => p.Name, StringComparer.Ordinal).ToArray());
+    private SandboxInstanceProfile[] SelectedContextSandboxes() {
+        var profiles = contextRuleKeys.Select(key => snapshot?.SandboxInstances.FirstOrDefault(p => p.TargetKey == key)).ToArray();
+        return profiles.Length > 0 && profiles.All(p => p is not null) ? profiles.Select(p => p!).ToArray() : [];
     }
     private void StartAllSandboxesClick(object sender, RoutedEventArgs e) => OpenSandboxLaunch(snapshot?.SandboxInstances.OrderBy(p => p.Name, StringComparer.Ordinal).ToArray() ?? []);
     private async void StopSandboxRuleClick(object sender, RoutedEventArgs e) {
-        var profile = snapshot?.SandboxInstances.FirstOrDefault(p => p.TargetKey == contextRuleKey);
-        if (profile is null || backend.SandboxLaunchBusy) return;
-        await Run("正在停止 " + profile.Name + "…", async () => { await backend.StopSandbox(profile.Id); await Refresh(false, skipDiscovery: true); });
+        var profiles = SelectedContextSandboxes();
+        if (profiles.Length == 0 || backend.SandboxLaunchBusy) return;
+        await Run("正在停止選取實例…", async () => { foreach (var profile in profiles) await backend.StopSandbox(profile.Id); await Refresh(false, skipDiscovery: true); });
     }
 }
