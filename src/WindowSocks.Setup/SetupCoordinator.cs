@@ -41,7 +41,8 @@ internal static partial class Program
             SetupProgress result;
             do {
                 result = await PipeTransport.ReadAsync<SetupProgress>(pipe, CancellationToken.None);
-                progress.Report(result);
+                // A terminal failure reaches the wizard through the exception below.
+                if (result.Success != false) progress.Report(result);
             } while (result.Success is null);
             await exited;
             if (result.Success != true || worker.ExitCode != 0) throw new IOException(result.Message);

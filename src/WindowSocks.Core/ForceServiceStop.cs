@@ -10,11 +10,15 @@ public sealed record ForceStopReport(ProcessCloseOutcome[] Outcomes, string[] Re
 
 public static class ForceServiceStop
 {
-    public static async Task<Snapshot?> TrySnapshotAsync()
+    public static Task<Snapshot?> TrySnapshotAsync() => TrySnapshotAsync(WindowsProxyService.Running,
+        token => PipeTransport.CallAsync<Snapshot>(Command.Create("snapshot", new { }), token));
+
+    internal static async Task<Snapshot?> TrySnapshotAsync(Func<bool> isRunning, Func<CancellationToken, Task<Snapshot>> read)
     {
+        if (!isRunning()) return null;
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-        try { return await PipeTransport.CallAsync<Snapshot>(Command.Create("snapshot", new { }), timeout.Token); }
-        catch (Exception ex) when (ex is IOException or OperationCanceledException or InvalidOperationException) { return null; }
+        try { return await read(timeout.Token); }
+        catch (Exception ex) when (ex is IOException or TimeoutException or OperationCanceledException or InvalidOperationException) { return null; }
     }
     // Called only after the user selects the explicit force-stop option. A second
     // confirmation covers incomplete inventory and failures before SCM is touched.

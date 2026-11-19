@@ -21,7 +21,10 @@ public static class ServiceExit
         try {
             while (isRunning()) await Task.Delay(150, deadline.Token);
         } catch (OperationCanceledException) when (!ct.IsCancellationRequested) {
-            throw new IOException("背景服務尚未停止，請重試關閉。", requestError);
+            string message = requestError is TimeoutException
+                ? "無法連上背景服務的控制管道，Windows 仍回報服務執行中。請正常關閉 xa sk5 與受管程式後重試。"
+                : "Windows 尚未確認背景服務已停止，請查看服務紀錄後重試。";
+            throw new IOException(message, requestError);
         }
     }
 }

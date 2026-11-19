@@ -29,7 +29,10 @@ public static class PipeTransport
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct); timeout.CancelAfter(TimeSpan.FromSeconds(120));
         await using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-        await pipe.ConnectAsync(1500, timeout.Token);
+        // During startup the registered service can be running before its control pipe listens.
+        // Wait for a listener before sending a stop request, then send it exactly once.
+        int connectTimeoutMs = command.Action == "stopService" ? 10000 : 1500;
+        await pipe.ConnectAsync(connectTimeoutMs, timeout.Token);
         await WriteAsync(pipe, command, timeout.Token); var reply = await ReadAsync<Reply>(pipe, timeout.Token);
         if (!reply.Ok) throw new InvalidOperationException(reply.Error);
         return Json.Read<T>(reply.Data);

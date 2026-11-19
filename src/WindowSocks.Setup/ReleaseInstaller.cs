@@ -77,9 +77,8 @@ internal static partial class Program
             File.WriteAllText(Path.Combine(DataDirectory, "last-update.json"), JsonSerializer.Serialize(new { version = ProductVersion, success = true, backup = transaction.BackupDirectory, at = DateTimeOffset.Now }));
         }
         catch (Exception ex) {
-            report(95, "安裝未完成：" + ex.Message);
             if (stopped) {
-                report(95, "安裝未完成，正在回復原程式與設定…");
+                report(95, $"正在回復原程式與設定（原因：{ex.Message}）…");
                 WindowSocks.Recovery.ForceStopDialog.Stop(); WaitForServiceStop();
                 transaction?.Rollback(); foreach (var (original, backup) in settings) File.Copy(backup, original, true);
                 Run("sc.exe", ["start", "WindowSocks"], false);
