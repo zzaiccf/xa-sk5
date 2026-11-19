@@ -3,4 +3,5 @@
   <PropertyGroup><ApplicationIcon>Assets\Brand\xa-sk5.ico</ApplicationIcon></PropertyGroup>
   <ItemGroup><ProjectReference Include="../WindowSocks.Core/WindowSocks.Core.csproj" /></ItemGroup>
   <ItemGroup><Resource Include="Assets\Brand\xa-sk5.ico" /></ItemGroup>
+  <ItemGroup><Compile Include="../Shared/InstallLogDialog.cs" Link="InstallLogDialog.cs" /></ItemGroup>
 </Project>

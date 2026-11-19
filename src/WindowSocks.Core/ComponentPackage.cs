@@ -10,6 +10,27 @@ public sealed record InstallFile(string Path, string Sha256);
 
 public static class ComponentPackage
 {
+    public static string InstallLogPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "WindowSocks", "component-install.log");
+
+    internal static string ReadInstallLog(string path, DateTime? attemptStartedUtc)
+    {
+        try {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (attemptStartedUtc.HasValue && File.GetLastWriteTimeUtc(stream.SafeFileHandle) < attemptStartedUtc.Value)
+                return "這次安裝沒有留下新的元件紀錄。可在設定中查看上次的紀錄。";
+            using var reader = new StreamReader(stream);
+            var text = reader.ReadToEnd();
+            return string.IsNullOrWhiteSpace(text) ? "元件安裝紀錄目前是空的。" : text;
+        }
+        catch (FileNotFoundException) { return "尚無元件安裝紀錄。"; }
+        catch (DirectoryNotFoundException) { return "尚無元件安裝紀錄。"; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
+            return "無法讀取元件安裝紀錄。" + Environment.NewLine + ex.Message;
+        }
+    }
+
+    public static string ReadInstallLog(DateTime? attemptStartedUtc = null) => ReadInstallLog(InstallLogPath, attemptStartedUtc);
+
     public const string DriverUrl = "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip";
     public static readonly string[] DriverFiles = ["WinDivert.dll", "WinDivert64.sys"];
     public const int ArchiveLimit = 4 * 1024 * 1024;

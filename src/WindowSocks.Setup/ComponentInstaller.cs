@@ -70,7 +70,7 @@ internal static partial class Program
             DriverTrust.VerifySignature(Path.Combine(driver, "WinDivert64.sys"));
             Report("驅動簽章通過；SHA-256 " + Hash(Path.Combine(driver, "WinDivert64.sys")));
             ct.ThrowIfCancellationRequested();
-            Report("正在安裝代理元件；請勿關機或結束安裝程序…");
+            Report("正在安裝代理元件：等候背景代理服務停止…");
             await WindowSocks.Recovery.ForceStopDialog.StopAsync(); WaitForServiceStop(); serviceStopped = true;
             Directory.CreateDirectory(InstallDirectory); Protect(InstallDirectory, true);
             foreach (string entry in Directory.EnumerateFileSystemEntries(InstallDirectory, "*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint })) {
@@ -109,7 +109,8 @@ internal static partial class Program
             throw new IOException(error, ex);
         }
         finally {
-            try { if (Directory.Exists(DataDirectory)) File.WriteAllLines(Path.Combine(DataDirectory, "component-install.log"), lines, Encoding.UTF8); } catch (IOException) { }
+            try { if (Directory.Exists(DataDirectory)) File.WriteAllLines(ComponentPackage.InstallLogPath, lines, Encoding.UTF8); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { progress.Report("無法保存元件紀錄，可從此視窗複製。"); }
             if (staging is not null) {
                 // This random directory is beneath the ACL-protected application data directory.
                 string verified = ComponentPackage.ContainedPath(DataDirectory, Path.GetFileName(staging));
@@ -130,19 +131,28 @@ internal sealed class ComponentInstallerForm : Form
     private readonly TextBox log = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, BackColor = Color.White };
     private readonly Label status = new() { Text = "正在準備…", Dock = DockStyle.Top, Height = 65 };
     private readonly Button close = new() { Text = "取消準備", Dock = DockStyle.Bottom, Height = 38 };
+    private readonly Button showError = new() { Text = "查看錯誤紀錄", Dock = DockStyle.Bottom, Height = 38, Visible = false };
     private readonly CancellationTokenSource cancel = new();
     private bool finished;
     public int Result { get; private set; } = 1;
     public ComponentInstallerForm()
     {
         Text = "xa sk5 — 安裝／修復代理元件"; Width = 820; Height = 490; StartPosition = FormStartPosition.CenterScreen; Padding = new Padding(20); Font = new Font("Microsoft JhengHei UI", 10);
-        Controls.Add(log); Controls.Add(status); Controls.Add(close);
+        Controls.Add(log); Controls.Add(status); Controls.Add(showError); Controls.Add(close);
+        showError.Click += (_, _) => {
+            using var details = new WindowSocks.Recovery.InstallLogDialog("元件安裝未完成", log.Text);
+            details.ShowDialog(this);
+        };
         close.Click += (_, _) => { if (finished) Close(); else { cancel.Cancel(); close.Enabled = false; } };
         FormClosing += (_, e) => { if (!finished) e.Cancel = true; };
         Shown += async (_, _) => {
             var progress = new Progress<string>(message => { status.Text = message; log.AppendText(message + Environment.NewLine); if (message.StartsWith("正在安裝")) close.Enabled = false; });
             try { await Task.Run(() => Program.InstallComponents(progress, cancel.Token)); Result = 0; status.Text = "完成：服務已啟動、驅動可載入。可回到主程式分配代理。"; }
-            catch (Exception ex) { status.Text = "未完成：" + ex.Message; }
+            catch (Exception ex) {
+                status.Text = "未完成：" + ex.Message;
+                if (!log.Text.Contains(status.Text, StringComparison.Ordinal)) log.AppendText(status.Text + Environment.NewLine);
+                showError.Visible = true;
+            }
             finally { finished = true; close.Text = "關閉並返回 xa sk5"; close.Enabled = true; }
         };
         FormClosed += (_, _) => cancel.Dispose();

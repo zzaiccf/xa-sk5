@@ -971,22 +971,37 @@ public partial class MainWindow : Window
         string helper = Path.Combine(AppContext.BaseDirectory, "WindowSocks.Maintenance.exe");
         if (!File.Exists(helper)) { MessageBox.Show(this, "缺少安裝元件，請解壓縮完整的 0.1.1 以上可攜版，或使用新版安裝包。", "xa sk5"); return; }
         if (MessageBox.Show(this, "將要求 Windows 管理員授權，安裝／修復背景服務，並從官方 GitHub 下載 WinDivert。\n\n請先關閉受管遊戲／模擬器，修復時會重新啟動服務。\n\nWindows 安全性若阻擋驅動，流程會停止並顯示原因；管理員授權不會解除該攔截。", "安裝／修復代理元件", MessageBoxButton.OKCancel, MessageBoxImage.Information) != MessageBoxResult.OK) return;
+        DateTime? failedAttempt = null;
         await Run("請在 Windows 授權視窗按「是」，完成後關閉元件安裝視窗…", async () => {
             var start = new ProcessStartInfo(helper) { UseShellExecute = true, Verb = "runas", WorkingDirectory = AppContext.BaseDirectory };
             start.ArgumentList.Add("--install-components"); start.ArgumentList.Add("--owner-sid"); start.ArgumentList.Add(System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value);
             Process? installer;
+            var startedUtc = DateTime.UtcNow;
             try { installer = Process.Start(start); }
             catch (Win32Exception ex) when (ex.NativeErrorCode == 1223) { throw new InvalidOperationException(ComponentPackage.DriverError(1223)); }
             using (installer) {
                 if (installer is null) throw new IOException("無法啟動元件安裝程式。");
                 await installer.WaitForExitAsync();
+                if (installer.ExitCode != 0) { failedAttempt = startedUtc; return; }
                 await Refresh(true);
-                if (installer.ExitCode != 0) throw new InvalidOperationException("元件安裝未完成。請依安裝視窗的原因處理；紀錄位於 ProgramData\\WindowSocks\\component-install.log。");
                 for (int retry = 0; retry < 5 && !backend.Online; retry++) { await Task.Delay(1000); await Refresh(false); }
                 if (!backend.Online) throw new InvalidOperationException("驅動載入測試通過，但尚未連上服務。請稍後重新整理並查看診斷。");
                 if (backend.HasLocalProxies) { await backend.Migrate(); await Refresh(false); }
             }
         });
+        if (failedAttempt.HasValue) {
+            StatusText.Text = "元件安裝未完成";
+            ShowComponentLog(failedAttempt);
+        }
+    }
+    private void ComponentLogClick(object sender, RoutedEventArgs e) => ShowComponentLog(null);
+
+    private sealed record LogOwner(nint Handle) : System.Windows.Forms.IWin32Window;
+    private void ShowComponentLog(DateTime? failedAttempt)
+    {
+        using var dialog = new WindowSocks.Recovery.InstallLogDialog(failedAttempt.HasValue ? "元件安裝未完成" : "元件安裝紀錄",
+            ComponentPackage.ReadInstallLog(failedAttempt));
+        dialog.ShowDialog(new LogOwner(new System.Windows.Interop.WindowInteropHelper(this).Handle));
     }
     private void HelpClick(object sender, RoutedEventArgs e)
     {
