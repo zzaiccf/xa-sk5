@@ -25,10 +25,29 @@ public static class RemoteControlBypass
                 throw new InvalidOperationException("自訂遠端程式請選擇本機 .exe 的完整路徑，不支援萬用字元。");
         return input.Select(Path.GetFullPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
-    public static string NativeImages(IEnumerable<string> customPaths) => string.Join('\0', ExecutableNames.Concat(NormalizeCustom(customPaths))) + "\0\0";
+    private const string RdHost = "RDxaomaoHost.exe";
+    public static string NativeImages(IEnumerable<string> customPaths) =>
+        PolicyImages(new() { RemoteControlExecutables = customPaths.ToArray() });
+
+    public static string PolicyImages(GlobalProxySettings settings)
+    {
+        var paths = NormalizeCustom(settings.RemoteControlExecutables);
+        var images = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (settings.BypassRemoteControl)
+            images.UnionWith(ExecutableNames.Concat(paths).Where(p => !Path.GetFileName(p).Equals(RdHost, StringComparison.OrdinalIgnoreCase)));
+        if (settings.RdHostDirect) {
+            images.Add(RdHost);
+            // The host ships its own broker. Never exempt the Windows broker or unrelated copies.
+            var installs = paths.Where(p => Path.GetFileName(p).Equals(RdHost, StringComparison.OrdinalIgnoreCase))
+                .Select(p => Path.GetDirectoryName(p)!)
+                .Append(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "RDxaomaoHost"));
+            foreach (string dir in installs) images.Add(Path.Combine(dir, "RuntimeBroker_rustdesk.exe"));
+        }
+        return string.Join('\0', images) + "\0\0";
+    }
     public static string? PinnedAddressForPolicyChange(GlobalProxySettings previous, GlobalProxySettings next)
     {
-        bool changed = previous.BypassLan != next.BypassLan || previous.BypassRemoteControl != next.BypassRemoteControl ||
+        bool changed = previous.BypassLan != next.BypassLan || previous.BypassRemoteControl != next.BypassRemoteControl || previous.RdHostDirect != next.RdHostDirect ||
             !previous.RemoteControlExecutables.SequenceEqual(next.RemoteControlExecutables, StringComparer.OrdinalIgnoreCase);
         return previous.Enabled && previous.ProxyId == next.ProxyId && changed &&
             IPAddress.TryParse(previous.ResolvedHost, out var address) && address.AddressFamily == AddressFamily.InterNetwork ? address.ToString() : null;

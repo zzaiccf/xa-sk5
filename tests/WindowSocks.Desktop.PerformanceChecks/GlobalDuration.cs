@@ -22,7 +22,8 @@ internal static partial class Program
             Diagnostics = fixture.State.Diagnostics with { EngineRunning = true }
         };
         var backend = new FakeBackend(fixture);
-        var main = new MainWindow(backend) { ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual, Left = -5000, Top = -5000 };
+        var alerts = new System.Collections.Generic.List<string>();
+        var main = new MainWindow(backend, backgroundNotification: (_, message, _) => alerts.Add(message)) { ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual, Left = -5000, Top = -5000 };
         Task Refresh() => (Task)typeof(MainWindow).GetMethod("Refresh", Private)!.Invoke(main, [false, true])!;
         try {
             main.Show(); await Until(() => backend.Snapshots > 0 && ((TextBlock)main.FindName("GlobalDuration")).Text.StartsWith("1 天 01:02:"));
@@ -49,9 +50,27 @@ internal static partial class Program
             Check(duration.Text == "未確認", "Disconnected service kept counting cached time.");
             fixture.State = fixture.State with { GlobalProxyConnectedAt = null }; await Refresh();
             Check(duration.Text == "待服務提供", "An older service fabricated a local duration.");
+            int durationRpcCalls = backend.Snapshots - calls - 3;
+            var today = DateOnly.FromDateTime(DateTime.Today);
+            profile.ExpiresOn = today.AddDays(3);
+            fixture.State = fixture.State with { SupportsGlobalExpiryFallback = true };
+            await Refresh(); await Refresh();
+            var text = (TextBlock)main.FindName("ExpiryText");
+            Check(alerts.Count == 1 && text.Text.Contains("00:00"), "The advance warning was missing or repeated on refresh.");
+            profile.ExpiresOn = today.AddDays(1);
+            await Refresh();
+            Check(alerts.Count == 2 && text.Text.Contains("剩 1 天"), "The last-day reminder was missing.");
+            profile.ExpiresOn = today;
+            fixture.State = fixture.State with { GlobalProxy = fixture.State.GlobalProxy with { Enabled = false, ExpiryFallbackOn = today } };
+            await Refresh(); await Refresh();
+            Check(alerts.Count == 3 && text.Text.Contains("已切換本地網路"), "The local fallback confirmation was missing or repeated.");
+            var dialog = new GlobalProxyWindow([profile], new() { BypassRemoteControl = false, BypassRdHost = true });
+            Check(((CheckBox)dialog.FindName("BypassRdHost")).IsChecked == true && ((CheckBox)dialog.FindName("BypassRemoteControl")).IsChecked == false,
+                "The independent host choice was lost when the remote group was off.");
+            dialog.Close();
             File.WriteAllText(Path.Combine(output, "summary.json"), System.Text.Json.JsonSerializer.Serialize(new {
-                version = AppReleasePackage.CurrentVersion, passed = true, perSecondRpcCalls = backend.Snapshots - calls - 3,
-                checks = new[] { "service timestamp with days", "one-second ticks without RPC", "minimum window layout", "interruption and restoration", "offline state", "legacy service" },
+                version = AppReleasePackage.CurrentVersion, passed = true, perSecondRpcCalls = durationRpcCalls, expiryAlerts = alerts.Count,
+                checks = new[] { "service timestamp with days", "one-second ticks without RPC", "minimum window layout", "interruption and restoration", "offline state", "legacy service", "expiry banner and notification deduplication", "independent host checkbox" },
                 scope = "Isolated WPF with synthetic backend. No live proxy or service changes."
             }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
             Console.WriteLine("Global duration WPF verification passed: " + output);

@@ -53,6 +53,7 @@ public partial class MainWindow : Window
     private bool probeWorkerRunning;
     private bool probeStatusPending, probeStatusIncomplete;
     private readonly System.Windows.Forms.NotifyIcon tray;
+    private readonly HashSet<(Guid, DateOnly, string)> notifiedExpirations = [];
     private readonly System.Drawing.Icon trayIcon;
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(5) };
     private readonly DispatcherTimer durationTimer = new() { Interval = TimeSpan.FromSeconds(1) };
@@ -438,6 +439,7 @@ public partial class MainWindow : Window
         GlobalBadge.ToolTip = GlobalBanner.ToolTip = state.Detail;
         GlobalBanner.Visibility = state.ShowBanner ? Visibility.Visible : Visibility.Collapsed;
         System.Windows.Automation.AutomationProperties.SetName(GlobalBanner, state.Title + "。" + state.Hint);
+        RenderExpiryNotices();
         GlobalHint.Text = state.Hint; GlobalNodeName.Text = state.NodeName;
         GlobalNodeDetails.Visibility = state.ShowNode ? Visibility.Visible : Visibility.Collapsed;
         GlobalExitLabel.Text = state.ExitLabel; GlobalExitIp.Text = state.ExitIp; GlobalExitIp.ToolTip = state.ExitHint;
@@ -454,6 +456,21 @@ public partial class MainWindow : Window
         Title = state.ShowBanner ? "xa sk5 · " + state.Title : "xa sk5";
         tray.Text = "xa sk5 · " + state.Title;
         UpdateSummaryCards();
+    }
+    private void RenderExpiryNotices()
+    {
+        bool connected = snapshot is not null && backend.Online && snapshot.Diagnostics.ServiceOnline;
+        var notices = connected ? ProxyExpiryNotice.Collect(snapshot!, DateOnly.FromDateTime(DateTime.Today)) : [];
+        ExpiryText.Text = ProxyExpiryNotice.Summary(notices);
+        ExpiryBanner.Visibility = notices.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        if (!connected) return;
+        notifiedExpirations.IntersectWith(notices.Select(n => (n.Id, n.Date, n.Stage)));
+        var fresh = notices.Where(n => notifiedExpirations.Add((n.Id, n.Date, n.Stage))).ToArray();
+        if (fresh.Length == 0) return;
+        const string title = "xa sk5 線路到期提醒";
+        string text = ProxyExpiryNotice.Summary(fresh);
+        if (backgroundNotification is not null) backgroundNotification(title, text, 8000);
+        else if (integrateShell) tray.ShowBalloonTip(8000, title, text, System.Windows.Forms.ToolTipIcon.Warning);
     }
     private void UpdateGlobalDuration() => GlobalDuration.Text = GlobalProxyDisplay.Duration(snapshot, backend.Online, DateTimeOffset.UtcNow);
     private void WorkspaceSizeChanged(object sender, SizeChangedEventArgs e) => UpdateSummaryCards();
@@ -1065,7 +1082,7 @@ public partial class MainWindow : Window
         public ProxyNodeDisplay Node => new(Profile, Probe);
         public string AccountPort => Node.AccountPort;
         public string EntryIp => Node.EntryIp;
-        public string Expiration => Profile.ExpiresOn?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture) ?? "";
+        public string Expiration => ProxyExpiryNotice.DateLabel(Profile.ExpiresOn, DateOnly.FromDateTime(DateTime.Today));
         public string Reachable => Probe is null ? "—" : Probe.Reachable ? "通過" : "失敗";
         public string Auth => Probe is null ? "—" : Probe.Authenticated ? "通過" : "未通過";
         public string UdpExit => Probe?.UdpExit ?? "未驗證";

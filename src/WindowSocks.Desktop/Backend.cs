@@ -48,6 +48,15 @@ public partial class Backend
             var snapshot = await Call<Snapshot>(Command.Create("snapshot", new { }));
             if (!Online) StopProbes();
             Online = true; supportsTcpFirst = snapshot.SupportsTcpFirstProbes;
+            if (snapshot.SupportsGlobalExpiryFallback && config.ServiceProxyExpirations.Count > 0) {
+                var dates = new Dictionary<Guid,DateOnly>(config.ServiceProxyExpirations);
+                await Call<bool>(Command.Create("restoreMissingProxyDates", dates));
+                foreach (var pair in dates)
+                    if (config.ServiceProxyExpirations.TryGetValue(pair.Key, out var date) && date == pair.Value)
+                        config.ServiceProxyExpirations.Remove(pair.Key);
+                store.Save(config);
+                snapshot = await Call<Snapshot>(Command.Create("snapshot", new { }));
+            }
             await Call<bool>(Command.Create("syncTargets", snapshot.SupportsFixedEmulators ? targets : targets.Where(t => t.Kind != "MuMu").ToArray()));
             if (snapshot.Vmware is { } vmware && System.Text.Json.JsonSerializer.Serialize(config.Vmware, Json.Options) != System.Text.Json.JsonSerializer.Serialize(vmware.Settings, Json.Options)) {
                 config.Vmware = vmware.Settings; store.Save(config);
@@ -265,9 +274,14 @@ public partial class Backend
             if (action == "unbind" && data is TargetRequest target) { config.Bindings.RemoveAll(b => b.TargetKey == target.TargetKey); store.Save(config); return; }
             throw new InvalidOperationException("背景服務未連線。分配可以先儲存；啟用代理需先安裝背景服務及官方驅動。");
         }
-        if (action == "setGlobalProxy" && data is GlobalProxySettings { Enabled: true, BypassRemoteControl: true } &&
-            !(await Call<Snapshot>(Command.Create("snapshot", new { }))).SupportsRemoteControlBypass)
-            throw new InvalidOperationException("遠端控制直連需要 0.1.11 背景服務與原生核心。請先更新元件，再啟用全局代理，以保留遠端連線。");
+        if (action == "setGlobalProxy" && data is GlobalProxySettings { Enabled: true } g) {
+            var state = await Call<Snapshot>(Command.Create("snapshot", new { }));
+            if ((g.BypassRemoteControl || g.RdHostDirect) && !state.SupportsRemoteControlBypass)
+                throw new InvalidOperationException("遠端控制直連需要 0.1.11 以上背景服務與原生核心，請先更新元件。");
+            if (!state.SupportsGlobalExpiryFallback && (g.RdHostDirect != g.BypassRemoteControl ||
+                state.Proxies.Any(p => p.Id == g.ProxyId && p.ExpiresOn.HasValue) || config.ServiceProxyExpirations.ContainsKey(g.ProxyId)))
+                throw new InvalidOperationException("到期切換本地網路與獨立 Host 直連需要 0.1.38 以上背景服務，請先更新元件。");
+        }
         await Call<bool>(Command.Create(action, data));
     }
     public Task<VmwareAdapter[]> VmwareAdapters(CancellationToken ct = default) => Call<VmwareAdapter[]>(Command.Create("vmwareAdapters", new { }), ct);

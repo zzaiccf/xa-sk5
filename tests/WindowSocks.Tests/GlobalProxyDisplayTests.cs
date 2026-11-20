@@ -54,4 +54,24 @@ public sealed class GlobalProxyDisplayTests
         Assert.Contains("待更新核心", GlobalProxyDisplay.From(State() with { SupportsRemoteControlBypass = false }, true).RemotePolicy);
         Assert.Contains("關閉", GlobalProxyDisplay.From(State() with { GlobalProxy = new() { Enabled = true, ProxyId = profile.Id, BypassRemoteControl = false } }, true).RemotePolicy);
     }
+    [Fact] public void WarningsEscalateAtThreeDaysTomorrowAndExpiryAndOnlyConfirmLocalAfterServiceCutover()
+    {
+        var date = new DateOnly(2030, 4, 8);
+        profile.ExpiresOn = date;
+        var state = State() with { SupportsGlobalExpiryFallback = true };
+        ProxyExpiryNotice Notice(int remaining) => Assert.Single(ProxyExpiryNotice.Collect(state, date.AddDays(-remaining)));
+        Assert.Empty(ProxyExpiryNotice.Collect(state, date.AddDays(-4)));
+        Assert.Equal(Notice(3).Stage, Notice(2).Stage);
+        Assert.NotEqual(Notice(1).Stage, Notice(2).Stage);
+        Assert.Contains("00:00", Notice(1).Message);
+        Assert.Contains("等候", Notice(0).Message);
+        state = state with { SupportsGlobalExpiryFallback = false };
+        Assert.Contains("請停用", Notice(0).Message);
+        state = state with { GlobalProxy = state.GlobalProxy with { Enabled = false, ExpiryFallbackOn = date } };
+        Assert.Contains("已切換本地網路", Notice(0).Message);
+        state = state with { GlobalProxy = new() };
+        Assert.DoesNotContain("切換本地網路", Notice(0).Message);
+        profile.ExpiresOn = null;
+        Assert.Empty(ProxyExpiryNotice.Collect(state, date));
+    }
 }

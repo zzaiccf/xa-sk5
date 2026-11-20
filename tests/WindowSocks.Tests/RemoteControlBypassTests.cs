@@ -85,6 +85,27 @@ public sealed class RemoteControlBypassTests : IDisposable
         Assert.Equal(1, Apply(images: RemoteControlBypass.NativeImages([Path.Combine(directory, "custom", "RDxaomaoExperimental.exe")])));
         Assert.Equal(3, Route(custom)); Assert.Equal(3, Route(custom, true)); Assert.Equal(1, Route(other));
     }
+    [Fact] public void RdHostCanUseLocalWithoutExemptingOtherRemotePrograms()
+    {
+        var host = Start("RDxaomaoHost.exe");
+        var helper = Start("RuntimeBroker_rustdesk.exe");
+        var other = Start("AnyDesk.exe");
+        var unrelated = Start("RuntimeBroker_rustdesk.exe", "elsewhere");
+        var profile = new ProxyProfile { Host = "127.0.0.1", Port = 1080 };
+        var settings = JsonSerializer.Deserialize<GlobalProxySettings>("""{"bypassRemoteControl":false,"bypassRdHost":true}""", Json.Options)!;
+        File.WriteAllText(Path.Combine(directory, "owner.sid"), WindowsIdentity.GetCurrent().User!.Value);
+        new ConfigStore(directory).Save(new() { Proxies = [profile], GlobalProxy = settings with {
+            Enabled = true, ProxyId = profile.Id, ResolvedHost = profile.Host,
+            RemoteControlExecutables = [Path.Combine(directory, "RDxaomaoHost.exe")] } });
+        using var service = new Controller(directory);
+        Assert.Equal(3, Route(host));
+        Assert.Equal(3, Route(helper, ipv6: true));
+        Assert.Equal(2, Route(other));
+        Assert.Equal(2, Route(unrelated));
+        Assert.Equal(1, Apply(images: RemoteControlBypass.PolicyImages(settings with { BypassRdHost = false, BypassRemoteControl = true })));
+        Assert.Equal(1, Route(host));
+        Assert.Equal(3, Route(other));
+    }
     [Fact] public void ExactCustomPathDoesNotExemptSameFilenameElsewhereOrPartialNames()
     {
         var remote = Start("renamed-support.exe", "remote"); var unrelated = Start("renamed-support.exe", "other"); var partial = Start("NotAnyDesk.exe");

@@ -19,6 +19,7 @@ public partial class GlobalProxyWindow : Window
         Proxy.SelectedValue = profiles.Any(p => p.Id == settings.ProxyId) ? settings.ProxyId : profiles.FirstOrDefault()?.Id;
         BypassLan.IsChecked = settings.BypassLan;
         BypassRemoteControl.IsChecked = settings.BypassRemoteControl;
+        BypassRdHost.IsChecked = settings.RdHostDirect;
         foreach (var path in settings.RemoteControlExecutables) remotePrograms.Add(new(path));
         RemotePrograms.ItemsSource = remotePrograms;
     }
@@ -35,8 +36,11 @@ public partial class GlobalProxyWindow : Window
     private void Confirm(object sender, RoutedEventArgs e)
     {
         if (Proxy.SelectedItem is not ProxyNodeDisplay p) { Error.Text = "請先選擇代理節點。"; return; }
+        if (p.Profile.ExpiresOn is { } day && day <= DateOnly.FromDateTime(DateTime.Today)) {
+            Error.Text = $"此線路已於 {day:yyyy-MM-dd} 到期，請選擇有效線路。"; return;
+        }
         Settings = new() { Enabled = true, ProxyId = p.Id, BypassLan = BypassLan.IsChecked == true, BypassRemoteControl = BypassRemoteControl.IsChecked == true,
-            RemoteControlExecutables = RemoteControlBypass.NormalizeCustom(remotePrograms.Select(program => program.Path)) };
+            BypassRdHost = BypassRdHost.IsChecked == true, RemoteControlExecutables = RemoteControlBypass.NormalizeCustom(remotePrograms.Select(program => program.Path)) };
         DialogResult = true;
     }
     public sealed record RemoteProgram(string Path) { public string Name => System.IO.Path.GetFileName(Path); }

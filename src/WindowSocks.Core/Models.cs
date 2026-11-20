@@ -74,6 +74,7 @@ public sealed record Snapshot(ProxyProfile[] Proxies, InstanceBinding[] Bindings
     public bool SupportsFixedEmulators { get; init; }
     public bool SupportsSequentialEmulators { get; init; }
     public bool SupportsRemoteControlBypass { get; init; }
+    public bool SupportsGlobalExpiryFallback { get; init; }
     public bool SupportsLowFrequencyProbes { get; init; }
     public bool SupportsTcpFirstProbes { get; init; }
     public bool SupportsProxyEditing { get; init; }
@@ -150,6 +151,9 @@ public sealed record GlobalProxySettings
     public Guid ProxyId { get; init; }
     public bool BypassLan { get; init; } = true;
     public bool BypassRemoteControl { get; init; } = true;
+    public bool? BypassRdHost { get; init; }
+    [JsonIgnore] public bool RdHostDirect => BypassRdHost ?? BypassRemoteControl;
+    public DateOnly? ExpiryFallbackOn { get; init; }
     public string[] RemoteControlExecutables { get; init; } = [];
     // Pinned by the service before interception starts, preventing recursive DNS when bootstrapping SOCKS.
     public string ResolvedHost { get; init; } = "";

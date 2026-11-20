@@ -365,17 +365,19 @@ static bool remoteControlProcess(uint32_t pid,uint64_t birth) {
     const auto key=std::make_pair(pid,birth);
     {std::lock_guard lk(remoteCacheMutex);auto it=remoteCache.find(key);if(it!=remoteCache.end()&&it->second.first==generation)return it->second.second;}
     {std::shared_lock lk(stateMutex);images=remoteImages;generation=remoteGeneration;}
-    bool match=false;HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
+    bool match=false,identified=false;HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
     if(process) {
         FILETIME c,e,k,u;wchar_t path[32768];DWORD length=32768;
         if(GetProcessTimes(process,&c,&e,&k,&u)&&(((uint64_t)c.dwHighDateTime<<32)|c.dwLowDateTime)==birth&&QueryFullProcessImageNameW(process,0,path,&length)) {
+            identified=true;
             const wchar_t* name=wcsrchr(path,L'\\');name=name?name+1:path;
             for(const auto& image:images)if(_wcsicmp(wcspbrk(image.c_str(),L"\\/")?path:name,image.c_str())==0){match=true;break;}
         }
         CloseHandle(process);
     }
     {std::shared_lock lk(stateMutex);if(!globalState||!globalBypassRemote||remoteGeneration!=generation)return false;}
-    {std::lock_guard lk(remoteCacheMutex);if(remoteCache.size()>=4096)remoteCache.clear();remoteCache[key]={generation,match};}
+    // A transient lookup failure does not prove that this process is unrelated.
+    if(identified){std::lock_guard lk(remoteCacheMutex);if(remoteCache.size()>=4096)remoteCache.clear();remoteCache[key]={generation,match};}
     return match;
 }
 static bool remoteRdpListener(uint32_t pid,uint64_t birth,uint16_t localPort) {

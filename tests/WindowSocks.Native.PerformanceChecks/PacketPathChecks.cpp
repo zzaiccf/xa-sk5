@@ -99,6 +99,11 @@ static void sendFailureChecks(){
     reset();active=false;
 }
 static void policyChecks(uint32_t pid,uint64_t birth){
+    reset();
+    require(Core_ReplacePolicyEx2(nullptr,0,L"\0",19,2,1,1,L"RDxaomaoHost.exe\0",0,0,0)==1,"remote direct policy during quarantine");
+    const auto stale=std::make_pair(pid,birth+1);
+    require(!remoteControlProcess(stale.first,stale.second),"unconfirmed identity must not receive a direct exception");
+    require(remoteCache.find(stale)==remoteCache.end(),"a failed identity check must be retried on the next packet");
     reset();Core_SetProxy(910,"127.0.0.1",1080,"","");RouteRule rule{pid,910,birth,1,0};Core_ReplacePolicy(&rule,1,L"\0");
     auto p=packet();WINDIVERT_ADDRESS addr{};addr.IPChecksum=addr.TCPChecksum=1;PassThroughBatch out;auto ownerTable=tcpOwner(pid,p);
     require(processPacket(p,addr,ownerTable,&out),"known blocked owner is classified");

@@ -178,6 +178,59 @@ public sealed class GlobalProxyTests : IDisposable
         Assert.True(result.Ready, result.Message); Assert.Equal(host, fixture.LastUdpDomain);
         Assert.Equal("198.51.100.7", result.UdpExit);
     }
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ExpiredGlobalNodeRestoresLocalOnStartupOrMidnightAndStaysOff(bool expiredAtStartup)
+    {
+        var directory = TempDirectory();
+        var deadline = new DateTime(2030, 4, 8, 0, 0, 0, DateTimeKind.Local);
+        DateTimeOffset now = expiredAtStartup ? deadline : deadline.AddSeconds(-1);
+        var profile = new ProxyProfile { Host = "127.0.0.1", Port = 1080, ExpiresOn = DateOnly.FromDateTime(deadline) };
+        var store = new ConfigStore(directory);
+        store.Save(new() { Proxies = [profile], GlobalProxy = new() { Enabled = true, ProxyId = profile.Id, ResolvedHost = profile.Host } });
+        try {
+            using (var service = new Controller(directory, handoffClock: () => now)) {
+                if (!expiredAtStartup) {
+                    Assert.Equal(2, NativeEngine.Core_RouteForTest(123004, 100, 0, out _));
+                    now = deadline;
+                    await service.Tick(default);
+                }
+                Assert.Equal(0, NativeEngine.Core_RouteForTest(123004, 100, 0, out _));
+                Assert.False(store.Load().GlobalProxy.Enabled);
+                var reply = await service.Dispatch(Command.Create("setGlobalProxy", new GlobalProxySettings { Enabled = true, ProxyId = profile.Id }), default);
+                Assert.False(reply.Ok);
+                Assert.Contains("到期", reply.Error);
+            }
+            using var restarted = new Controller(directory, handoffClock: () => now);
+            var state = Json.Read<Snapshot>((await restarted.Dispatch(Command.Create("snapshot", new { }), default)).Data);
+            Assert.Contains("本地網路", state.GlobalProxyStatus);
+        } finally { Directory.Delete(directory, true); }
+    }
+    [Fact] public async Task RestoringLegacyDateCutsOverOnlyTheGlobalPolicyAndRenewalRequiresOptIn()
+    {
+        string directory = TempDirectory();
+        using var child = StartPing();
+        var identity = LdPlayer.Identity(child.Id)!.Value;
+        var global = new ProxyProfile { Host = "127.0.0.1", Port = 1080 };
+        var bound = new ProxyProfile { Host = "127.0.0.1", Port = 1081, ExpiresOn = new(2035, 1, 1) };
+        var store = new ConfigStore(directory);
+        store.Save(new() { Proxies = [global, bound], GlobalProxy = new() { Enabled = true, ProxyId = global.Id, ResolvedHost = global.Host },
+            Bindings = [new() { TargetKey = "fixture", Kind = "Process", Processes = [identity], ProxyId = bound.Id }] });
+        try {
+            using var service = new Controller(directory);
+            var today = DateOnly.FromDateTime(DateTime.Today);
+            var reply = await service.Dispatch(Command.Create("restoreMissingProxyDates", new Dictionary<Guid,DateOnly> { [global.Id] = today, [bound.Id] = today }), default);
+            Assert.True(reply.Ok, reply.Error);
+            Assert.Equal(0, NativeEngine.Core_RouteForTest(123004, 100, 0, out _));
+            Assert.Equal(2, NativeEngine.Core_RouteForTest((uint)child.Id, (ulong)identity.CreatedFileTime, 0, out _));
+            Assert.Equal(bound.ExpiresOn, store.Load().Proxies.Single(p => p.Id == bound.Id).ExpiresOn);
+            var renew = await service.Dispatch(Command.Create("import", new ImportRequest($"127.0.0.1/1080///{today.AddDays(30):yyyy-MM-dd}")), default);
+            Assert.True(renew.Ok, renew.Error);
+            Assert.False(store.Load().GlobalProxy.Enabled);
+            Assert.Null(store.Load().GlobalProxy.ExpiryFallbackOn);
+        } finally { Stop(child); Directory.Delete(directory, true); }
+    }
     private static Process StartPing() => Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "ping.exe")) { Arguments = "-n 30 127.0.0.1", UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true })!;
     private static void Stop(Process process) { if (!process.HasExited) process.Kill(entireProcessTree: true); process.WaitForExit(); }
     private static string TempDirectory()

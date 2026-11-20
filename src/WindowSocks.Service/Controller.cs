@@ -89,6 +89,7 @@ public sealed partial class Controller : IDisposable
         config.AutoProxy = ProcessHandoffPolicy.Automatic(config.AutoProxy);
         foreach (var binding in config.Bindings.Where(b => b.AutoManaged && b.Kind == "Process")) binding.IncludeChildren = true;
         ConfigureProxies();
+        ReconcileGlobalExpiry();
         ApplyRules();
         gameObserver = new(config.AutoProxy, config.GameGroups, IsOwned);
         if ((config.GlobalProxy.Enabled || config.AutoProxy.Enabled || config.Bindings.Count > 0 || config.Vmware.Enabled) && NativeEngine.DriverPresent) {
@@ -179,7 +180,14 @@ public sealed partial class Controller : IDisposable
                 case "import":
                     var imported = ProxyImport.Parse(Json.Read<ImportRequest>(cmd.Data).Text);
                     ProxyImport.ApplyTo(config.Proxies, imported);
+                    ReconcileGlobalExpiry();
                     ConfigureProxies(); store.Save(config); Log($"已處理 {imported.Count} 筆代理匯入。"); return Reply.Success(imported.Count);
+                case "restoreMissingProxyDates":
+                    var dates = Json.Read<Dictionary<Guid,DateOnly>>(cmd.Data);
+                    var restored = ProxyExpirationMetadata.Apply(config.Proxies, dates).ToList();
+                    store.Save(config with { Proxies = restored });
+                    config.Proxies = restored;
+                    ReconcileGlobalExpiry(); return Reply.Success(true);
                 case "export": return Reply.Success(ProxyImport.Export(config.Proxies));
                 case "editProxy": return Reply.Success(await EditProxy(Json.Read<EditProxyRequest>(cmd.Data), ct));
                 case "backup": return Reply.Success(Convert.ToBase64String(store.Backup(config)));
@@ -313,21 +321,51 @@ public sealed partial class Controller : IDisposable
         started = true;engineFailureSince=null; engineError = "核心執行中（實機相容性須驗收）";
         sandboxFirewall?.AllowWhileHealthy();
     }
+    private DateOnly LocalToday => DateOnly.FromDateTime(handoffClock().LocalDateTime);
+    private void ReconcileGlobalExpiry()
+    {
+        var global = config.GlobalProxy;
+        if (!global.Enabled && global.ExpiryFallbackOn is null) return;
+        var date = config.Proxies.FirstOrDefault(p => p.Id == global.ProxyId)?.ExpiresOn;
+        if (!global.Enabled) {
+            if (global.ExpiryFallbackOn != date) {
+                config.GlobalProxy = global with { ExpiryFallbackOn = null };
+                childrenDirty = true;
+            }
+            return;
+        }
+        if (date is not { } expiry || expiry > LocalToday) return;
+        config.GlobalProxy = global with { Enabled = false, ExpiryFallbackOn = expiry };
+        try { ApplyRules(); }
+        catch { config.GlobalProxy = global; throw; }
+        Log(GlobalStatus());
+        try { store.Save(config); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
+            childrenDirty = true;
+            Log("已切換本地網路，將重試儲存到期狀態：" + ex.Message);
+        }
+    }
+    private void RequireUnexpiredGlobal(ProxyProfile profile)
+    {
+        if (profile.ExpiresOn is { } expiry && expiry <= LocalToday)
+            throw new InvalidOperationException($"此全局線路已於 {expiry:yyyy-MM-dd} 到期。請選擇有效線路或更新到期日。");
+    }
     private async Task SetGlobalProxy(GlobalProxySettings settings, CancellationToken ct)
     {
         if (!settings.Enabled) {
-            config.GlobalProxy = config.GlobalProxy with { Enabled = false };
+            config.GlobalProxy = config.GlobalProxy with { Enabled = false, ExpiryFallbackOn = null };
             ApplyRules(); store.Save(config); Log("已停用全局代理；指定程序綁定繼續依原規則執行。"); return;
         }
         settings = settings with { RemoteControlExecutables = RemoteControlBypass.NormalizeCustom(settings.RemoteControlExecutables) };
+        var profile = FindProxy(settings.ProxyId);
+        RequireUnexpiredGlobal(profile);
         ProxyOwnershipLedger.From(config,vmwareRuntime).Require(settings.ProxyId,"global","Global");
         RejectGlobalExitConflict(settings.ProxyId);
         // Availability is a read-only preflight. A missing driver must not start
         // network probes, and must not open capture before the exit is validated.
         if(!engineLifecycle.Present||!engineLifecycle.DriverPresent||!engineLifecycle.Compatible)
             throw new InvalidOperationException("缺少相容的 WinDivert 代理元件，請先安裝／修復元件。");
-        if (settings.BypassRemoteControl && !NativeEngine.SupportsRemoteControlBypass) throw new InvalidOperationException("遠端控制直連需要 0.1.11 以上背景服務與原生核心，請先更新元件。");
-        var profile = FindProxy(settings.ProxyId);
+        if ((settings.BypassRemoteControl || settings.RdHostDirect) && !NativeEngine.SupportsRemoteControlBypass) throw new InvalidOperationException("遠端控制直連需要相容的背景服務與原生核心，請先更新元件。");
         // Resolve before interception, then retain this numeric address across service restarts.
         string resolved;
         if (RemoteControlBypass.PinnedAddressForPolicyChange(config.GlobalProxy, settings) is { } pinned) resolved = pinned;
@@ -340,9 +378,10 @@ public sealed partial class Controller : IDisposable
         var measured = await measureProxy(profile with { Host = resolved }, true, ct);
         RecordProbe(profile, measured);
         RejectGlobalExitConflict(profile.Id);
+        RequireUnexpiredGlobal(profile);
         EnsureEngine();
         var previous = config.GlobalProxy;
-        config.GlobalProxy = settings with { ResolvedHost = resolved };
+        config.GlobalProxy = settings with { ResolvedHost = resolved, ExpiryFallbackOn = null };
         try { ConfigureProxies(); ApplyRules(); store.Save(config); }
         catch { config.GlobalProxy = previous; ConfigureProxies(); ApplyRules(); throw; }
         Log(GlobalStatus());
@@ -579,6 +618,7 @@ public sealed partial class Controller : IDisposable
         }
         var oldGlobal = config.GlobalProxy; config.Proxies[index] = next; config.GlobalProxy = global;
         try { store.Save(config); } catch { config.Proxies[index] = previous; config.GlobalProxy = oldGlobal; throw; }
+        ReconcileGlobalExpiry();
         if (changed) {
             epochs[next.Id] = ++epoch; activeProbes.Remove(next.Id); tcpProbes.Remove(next.Id);
             activeChecks.Remove((next.Id, false)); activeChecks.Remove((next.Id, true));
@@ -752,7 +792,7 @@ public sealed partial class Controller : IDisposable
         if (NativeEngine.SupportsRemoteControlBypass) {
             var rdp = global.Enabled && global.BypassRemoteControl ? remoteDesktop.Read() : default;
             applied = NativeEngine.Core_ReplacePolicyEx2(rows.ToArray(), (uint)rows.Count, guards, globalId, globalState, global.BypassLan ? 1u : 0u,
-                global.BypassRemoteControl ? 1u : 0u, RemoteControlBypass.NativeImages(global.RemoteControlExecutables), rdp.Pid, rdp.Created, rdp.Port);
+                global.BypassRemoteControl || global.RdHostDirect ? 1u : 0u, RemoteControlBypass.PolicyImages(global), rdp.Pid, rdp.Created, rdp.Port);
         } else applied = NativeEngine.Core_ReplacePolicyEx(rows.ToArray(), (uint)rows.Count, guards, globalId, globalState, global.BypassLan ? 1u : 0u);
         if (applied == 0) throw new InvalidOperationException("程序規則有衝突，核心拒絕更新。");
         if(started&&engineLifecycle.Healthy)sandboxFirewall?.AllowWhileHealthy();
@@ -776,6 +816,9 @@ public sealed partial class Controller : IDisposable
     public async Task Tick(CancellationToken ct)
     {
         Guid due = Guid.Empty;
+        await Gate.WaitAsync(ct);
+        try { if (!stopping) ReconcileGlobalExpiry(); }
+        finally { Gate.Release(); }
         await TickSandboxes(ct);
         await Gate.WaitAsync(ct);
         try
@@ -880,13 +923,13 @@ public sealed partial class Controller : IDisposable
         var visibleProbes = probes.Values.Where(p => !probeViews.ContainsKey(p.ProxyId)).Concat(probeViews.Values).ToArray();
         return new(config.Proxies.Select(p => p.Redacted()).ToArray(), config.Bindings.ToArray(), visibleTargets, visibleProbes, statuses,
             new(true, NativeEngine.DriverPresent, NativeEngine.Present, running, AppReleasePackage.CurrentVersion + " 預覽版", NativeEngine.DriverPresent ? engineError : "缺少 WinDivert 驅動，未啟用攔截。", logs.ToArray()))
-            { SupportsSandboxInstances = NativeEngine.SupportsSandboxGuards, SupportsSandboxSafety = NativeEngine.SupportsP0RoutingSafety, SupportsSandboxExperience = true, SupportsSandboxRemoval = true, SupportsSandboxLocalNetwork = NativeEngine.SupportsP0RoutingSafety, SandboxInstances = config.SandboxInstances.ToArray(), SandboxStatuses = SandboxStatuses(), SupportsBulkActions = true, SupportsProxyCapacities = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyConnectedAt = globalSession.ConnectedAt, GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
+            { SupportsGlobalExpiryFallback = true, SupportsSandboxInstances = NativeEngine.SupportsSandboxGuards, SupportsSandboxSafety = NativeEngine.SupportsP0RoutingSafety, SupportsSandboxExperience = true, SupportsSandboxRemoval = true, SupportsSandboxLocalNetwork = NativeEngine.SupportsP0RoutingSafety, SandboxInstances = config.SandboxInstances.ToArray(), SandboxStatuses = SandboxStatuses(), SupportsBulkActions = true, SupportsProxyCapacities = true, SupportsProcessHandoffs = NativeEngine.SupportsProcessHandoffs, SupportsVmware = NativeEngine.SupportsVmwareGateway, SupportsVmwareQuickSetup = true, SupportsVmwareLocalNetwork = NativeEngine.SupportsVmwareLocalNetwork, SupportsRuleManagement = true, Vmware = VmwareSnapshot(), SupportsProxyEditing = true, SupportsProxyExpiration = true, SupportsFixedEmulators = true, SupportsSequentialEmulators = true, SupportsRemoteControlBypass = NativeEngine.SupportsRemoteControlBypass, SupportsLowFrequencyProbes = true, SupportsTcpFirstProbes = true, AutoProxy = config.AutoProxy, AutoProxyStatus = autoStatus, GlobalProxy = config.GlobalProxy, GlobalProxyStatus = GlobalStatus(), GlobalProxyConnectedAt = globalSession.ConnectedAt, GlobalProxyRouting = config.GlobalProxy.Enabled && running && Healthy(config.GlobalProxy.ProxyId), FlowEvents = ReadNetworkEvents().TakeLast(64).ToArray() };
     }
     private uint GlobalPolicyState() => !config.GlobalProxy.Enabled ? 0u : Healthy(config.GlobalProxy.ProxyId) ? 1u : 2u;
     private string GlobalStatus()
     {
         var g = config.GlobalProxy;
-        if (!g.Enabled) return "全局代理未啟用";
+        if (!g.Enabled) return g.ExpiryFallbackOn is { } day ? $"全局線路已於 {day:yyyy-MM-dd} 到期，已切換本地網路。" : "全局代理未啟用";
         string name = config.Proxies.FirstOrDefault(p => p.Id == g.ProxyId)?.Name ?? "未知節點";
         string state = !started || NativeEngine.Core_IsRunning() == 0 ? "核心未啟用" : Healthy(g.ProxyId) ? "代理執行中" : "代理未通過檢測，外網保持封鎖";
         string remote = !g.BypassRemoteControl ? "" : NativeEngine.SupportsRemoteControlBypass ? "遠端控制直連 · 其餘" : "遠端直連待更新核心 · ";

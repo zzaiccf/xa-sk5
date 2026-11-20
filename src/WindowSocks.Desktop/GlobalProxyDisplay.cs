@@ -50,13 +50,17 @@ public sealed record GlobalProxyDisplay
             RemotePolicy = enabled ? $"遠控直連：上次{(settings!.BypassRemoteControl ? "開啟" : "關閉")}" : "遠控直連：未確認",
             LanPolicy = enabled ? $"區網直連：上次{(settings!.BypassLan ? "開啟" : "關閉")}" : "區網直連：未確認"
         });
-        if (!enabled) return result;
+        if (!enabled) return settings?.ExpiryFallbackOn.HasValue == true ? result with { Title = "全局已切回本地" } : result;
         result = result with {
             RemotePolicy = !settings!.BypassRemoteControl ? "遠控直連：關閉"
                 : !current.SupportsRemoteControlBypass ? "遠控直連：待更新核心"
                 : !engine ? "遠控直連：待核心啟用" : "遠控直連：開啟",
             LanPolicy = $"區網直連：{(settings.BypassLan ? "開啟" : "關閉")}"
         };
+        if (current.SupportsGlobalExpiryFallback && settings.RdHostDirect != settings.BypassRemoteControl) {
+            string host = !settings.RdHostDirect ? "隨全局" : !current.SupportsRemoteControlBypass ? "待更新核心" : !engine ? "待核心啟用" : "直連";
+            result = result with { RemotePolicy = $"{result.RemotePolicy} · Host {host}" };
+        }
         if (!engine) return Warning(result with { Title = "全局尚未生效", Hint = "全局設定已開啟，代理核心尚未執行。" });
         if (profile is null) return Warning(result with { Title = "全局代理受阻", Hint = "找不到指定節點，請重新選擇線路。" });
 
